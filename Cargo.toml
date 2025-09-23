@@ -2,6 +2,15 @@
 name = "ignix"
 version = "0.1.0"
 edition = "2021"
+description = "High-performance Redis-compatible key-value store built with Rust"
+license = "MIT"
+authors = ["CycleChain.io <hello@cyclechain.io> (https://cyclechain.io)","Fatih Mert Doğancan <fatih.dogancan@cyclechain.io> (https://github.com/fatihmert)"]
+homepage = "https://github.com/CycleChain/ignix"
+repository = "https://github.com/CycleChain/ignix"
+documentation = "https://docs.rs/ignix"
+readme = "README.md"
+keywords = ["redis", "database", "key-value", "cache", "server"]
+categories = ["database", "caching", "network-programming"]
 
 
 [lib]
