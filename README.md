@@ -35,7 +35,7 @@ Ignix uses a simple but efficient architecture:
 ### Installation
 
 ```bash
-git clone https://github.com/cyclechain/ignix.git
+git clone https://github.com/CycleChain/ignix.git
 cd ignix
 cargo build --release
 ```
@@ -326,8 +326,8 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📞 Support
 
-- **Issues**: [GitHub Issues](https://github.com/cyclechain/ignix/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/cyclechain/ignix/discussions)
+- **Issues**: [GitHub Issues](https://github.com/CycleChain/ignix/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/CycleChain/ignix/discussions)
 
 ---
 
