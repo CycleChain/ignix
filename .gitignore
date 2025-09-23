@@ -76,3 +76,9 @@ yarn-error.log*
 
 # Docker volumes
 .docker/
+
+.qodo
+
+devnotes
+
+benchmark_results

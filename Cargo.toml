@@ -3,6 +3,41 @@ name = "ignix"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+name = "ignix"
+path = "src/lib.rs"
+
+
+[[bin]]
+name = "ignix"
+path = "src/bin/ignix.rs"
+
 
 [dependencies]
+anyhow = "1"
+thiserror = "1"
+bytes = "1"
+mio = { version = "0.8", features = ["net", "os-poll"] }
+parking_lot = "0.12"
+ahash = "0.8"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+crossbeam = "0.8"
+log = "0.4"
+env_logger = "0.11"
+socket2 = { version = "0.5", features = ["all"] }
+
+
+[dev-dependencies]
+criterion = { version = "0.5", features = ["html_reports"] }
+rand = "0.8"
+
+
+[[bench]]
+name = "exec"
+harness = false
+
+
+[[bench]]
+name = "resp"
+harness = false

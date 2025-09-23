@@ -1,0 +1,25 @@
+{
+  "name": "ignix-nodejs-examples",
+  "version": "1.0.0",
+  "description": "Node.js client examples for Ignix Redis-compatible server",
+  "main": "nodejs_client.js",
+  "scripts": {
+    "start": "node nodejs_client.js",
+    "example": "node nodejs_client.js"
+  },
+  "dependencies": {
+    "redis": "^4.6.0"
+  },
+  "keywords": [
+    "ignix",
+    "redis",
+    "client",
+    "example",
+    "nodejs"
+  ],
+  "author": "CycleChain.io",
+  "license": "MIT",
+  "engines": {
+    "node": ">=14.0.0"
+  }
+}

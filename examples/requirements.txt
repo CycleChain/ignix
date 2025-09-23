@@ -1,0 +1,2 @@
+# Python dependencies for Ignix client examples
+redis>=5.0.0
