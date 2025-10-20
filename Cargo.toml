@@ -35,6 +35,7 @@ crossbeam = "0.8"
 log = "0.4"
 env_logger = "0.11"
 socket2 = { version = "0.5", features = ["all"] }
+hashbrown = "0.14"
 
 
 [dev-dependencies]

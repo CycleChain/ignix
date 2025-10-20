@@ -10,9 +10,9 @@ use crate::protocol::{parse_many, resp_simple};
 use crate::shard::Shard;
 use anyhow::*;
 use bytes::BytesMut;
+use hashbrown::HashMap;
 use mio::net::{TcpListener, TcpStream};
 use mio::{Events, Interest, Poll, Token};
-use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::result::Result::{Ok, Err};
@@ -64,6 +64,7 @@ pub fn run_shard(_shard_id: usize, addr: SocketAddr, mut shard: Shard) -> Result
         .register(&mut listener, Token(0), Interest::READABLE)?;
 
     // Client connection storage: token -> (socket, read_buffer, write_buffer)
+    // Using SwissTable for better performance than std HashMap
     let mut clients: HashMap<usize, (TcpStream, BytesMut, BytesMut)> = HashMap::new();
     let mut next_tok: usize = 1;
 

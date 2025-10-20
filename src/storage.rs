@@ -6,7 +6,7 @@
  */
 
 use crate::protocol::Value;
-use std::collections::HashMap;
+use hashbrown::HashMap;
 use std::hash::BuildHasherDefault;
 
 // Use AHash for better performance than default hasher
@@ -17,10 +17,10 @@ type AHash = BuildHasherDefault<ahash::AHasher>;
 /// High-performance in-memory dictionary
 /// 
 /// The core storage structure that holds all key-value pairs in memory.
-/// Uses AHash for fast lookups and supports all Redis-compatible operations.
+/// Uses SwissTable (hashbrown) with AHash for fast lookups and supports all Redis-compatible operations.
 #[derive(Default)]
 pub struct Dict {
-    /// Internal HashMap with AHash for optimal performance
+    /// Internal SwissTable HashMap with AHash for optimal performance
     pub(crate) inner: HashMap<Vec<u8>, Value, AHash>,
 }
 
