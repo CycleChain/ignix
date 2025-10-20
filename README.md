@@ -22,7 +22,7 @@ Ignix uses a simple but efficient architecture:
 
 - **RESP Protocol**: Full Redis Serialization Protocol support
 - **Event-Driven Networking**: mio-based async I/O for handling thousands of connections
-- **In-Memory Storage**: Lightning-fast hash map-based storage
+- **In-Memory Storage**: SwissTable-based hash map storage for optimal performance
 - **AOF Persistence**: Optional append-only file logging for durability
 
 ## 🚀 Quick Start
@@ -146,45 +146,53 @@ print(r.get('hello'))  # Output: world
 
 > **⚠️ Note**: Ignix is currently in **early development stage**. Performance characteristics are actively being optimized and may change significantly in future releases.
 
-Ignix shows excellent performance characteristics, especially for small data operations:
+Ignix shows excellent performance characteristics, especially for small data operations and high-concurrency scenarios. **Latest benchmark results (v0.1.1 with SwissTable):**
 
-### 🚀 Small Data Operations (64 bytes)
+### 🚀 Small Data Operations (64 bytes, 1 connection)
 *Optimized for low-latency, high-frequency operations*
 
 | Operation | Ignix | Redis | Ignix Advantage |
 |-----------|-------|-------|-----------------|
-| **SET** | 28,409 ops/sec | 9,897 ops/sec | **2.87x faster** |
-| **GET** | 26,117 ops/sec | 21,192 ops/sec | **1.23x faster** |
-| **Average Latency** | 0.03 ms | 0.07 ms | **2.3x lower** |
+| **SET** | 35,488 ops/sec | 8,893 ops/sec | **3.99x faster** |
+| **GET** | 31,993 ops/sec | 31,879 ops/sec | **~Equal performance** |
+| **Average Latency** | 0.03 ms | 0.03 ms | **~Equal latency** |
 
-### 📈 Large Data Operations (6.4KB)
-*Optimized for throughput-intensive workloads*
+### 📈 Medium Data Operations (256 bytes, 1 connection)
+*Balanced performance across different payload sizes*
 
 | Operation | Ignix | Redis | Performance |
 |-----------|-------|-------|-------------|
-| **SET** | 24,984 ops/sec | 27,607 ops/sec | Redis 1.11x faster |
-| **GET** | 26,982 ops/sec | 27,156 ops/sec | ~Equal performance |
-| **Average Latency** | 0.04 ms | 0.04 ms | ~Equal latency |
+| **SET** | 30,768 ops/sec | 32,789 ops/sec | Redis 1.07x faster |
+| **GET** | 30,935 ops/sec | 30,708 ops/sec | **~Equal performance** |
+
+### 🔥 Large Data Operations (4KB, 1 connection)
+*Throughput-intensive workloads*
+
+| Operation | Ignix | Redis | Performance |
+|-----------|-------|-------|-------------|
+| **SET** | 23,623 ops/sec | 29,907 ops/sec | Redis 1.27x faster |
+| **GET** | 27,968 ops/sec | 29,157 ops/sec | Redis 1.04x faster |
+| **Average Latency** | 0.04 ms | 0.03 ms | Redis 1.33x better |
 
 ### 🎯 Performance Characteristics
 
 **Ignix Excels At:**
-- ✅ **Small, frequent operations** (cache-like workloads)
-- ✅ **Low-latency responses** (sub-millisecond)
-- ✅ **High-frequency SET operations**
-- ✅ **Minimal connection overhead**
+- ✅ **Small data SET operations**: Up to 4x faster than Redis (64 bytes)
+- ✅ **Low-latency responses**: Sub-millisecond latency consistently
+- ✅ **High-concurrency scenarios**: Maintains performance under load
+- ✅ **SwissTable optimization**: Enhanced hash table performance in v0.1.1
 
 **Redis Excels At:**
-- ✅ **Large data transfers** (mature buffer management)
-- ✅ **Memory-intensive operations** (15+ years of optimization)
-- ✅ **Complex data structures** (extensive command set)
+- ✅ **Large data transfers**: More mature buffer management (4KB+)
+- ✅ **Memory-intensive operations**: 15+ years of optimization
+- ✅ **Complex data structures**: Extensive command set and data types
 
 ### 🔬 Why This Performance Profile?
 
-1. **Small Data Advantage**: Ignix's Rust-based architecture minimizes overhead for small operations
-2. **Large Data Trade-off**: Redis's mature memory management shines with larger payloads
-3. **Early Stage**: Ignix is optimized for core use cases, with room for improvement in others
-4. **Development Focus**: Current optimization targets low-latency, high-frequency scenarios
+1. **SwissTable Enhancement**: v0.1.1 introduced hashbrown's SwissTable implementation for improved hash performance
+2. **Small Data Advantage**: Ignix's Rust-based architecture minimizes overhead for small operations (64 bytes)
+3. **Large Data Trade-off**: Redis's mature memory management and optimizations shine with larger payloads (4KB+)
+4. **Early Stage**: Ignix is optimized for core use cases with SwissTable improvements, with room for enhancement in large data scenarios
 
 ### 📊 Benchmark Your Own Workload
 
@@ -304,9 +312,9 @@ tail -f ignix.aof
 - **AOF-only persistence** (no RDB snapshots) - *RDB support planned*
 
 ### Performance Notes
-- **Excellent for small data** (< 1KB): 2-3x faster than Redis
-- **Competitive for medium data** (1-10KB): Similar to Redis performance  
-- **Room for improvement** on very large payloads (> 10KB)
+- **Excellent for small data** (64 bytes): Up to 4x faster SET operations than Redis
+- **Competitive for medium data** (256 bytes - 1KB): Similar to Redis performance  
+- **Room for improvement** on large payloads (4KB+): Redis shows maturity in large data handling
 
 These characteristics make Ignix ideal for:
 - ✅ **Caching layers** with small objects
