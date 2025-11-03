@@ -6,17 +6,19 @@
  * using mio for async I/O operations.
  */
 
-use crate::protocol::{parse_many, resp_simple};
+use crate::protocol::{parse_many, resp_simple, Cmd};
 use crate::shard::Shard;
 use anyhow::*;
 use bytes::BytesMut;
+use crossbeam::channel::{bounded, Receiver, Sender, TryRecvError};
 use hashbrown::HashMap;
 use mio::net::{TcpListener, TcpStream};
-use mio::{Events, Interest, Poll, Token};
+use mio::{Events, Interest, Poll, Token, Waker};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::result::Result::{Ok, Err};
 use std::time::Duration;
+use std::sync::Arc;
 
 /// Size of read buffer for incoming data
 const READ_BUF: usize = 4096;
@@ -53,15 +55,45 @@ pub fn bind_reuseport(addr: SocketAddr) -> Result<TcpListener> {
 /// * Each client gets a unique token starting from 1
 /// * Maintains read/write buffers for each client
 /// * Processes commands immediately when complete
-pub fn run_shard(_shard_id: usize, addr: SocketAddr, mut shard: Shard) -> Result<()> {
+pub fn run_shard(_shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> {
     // Create the main event loop components
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(1024);
     let mut listener = bind_reuseport(addr)?;
+    const LISTENER: Token = Token(0);
+    const WAKER_TOKEN: Token = Token(usize::MAX - 1);
     
     // Register the listener socket for accepting new connections
     poll.registry()
-        .register(&mut listener, Token(0), Interest::READABLE)?;
+        .register(&mut listener, LISTENER, Interest::READABLE)?;
+
+    // Channels for offloading command execution to worker threads
+    let (tx_task, rx_task): (Sender<(usize, Cmd)>, Receiver<(usize, Cmd)>) = bounded(1024);
+    let (tx_resp, rx_resp): (Sender<(usize, Vec<u8>)>, Receiver<(usize, Vec<u8>)>) = bounded(1024);
+
+    // Waker to notify reactor when responses are ready
+    let waker = Arc::new(Waker::new(poll.registry(), WAKER_TOKEN)?);
+
+    // Shared shard for workers (thread-safe storage inside)
+    let shard = Arc::new(shard);
+
+    // Spawn worker threads
+    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    for _ in 0..workers {
+        let rx_task_cl = rx_task.clone();
+        let tx_resp_cl = tx_resp.clone();
+        let shard_cl = Arc::clone(&shard);
+        let waker_cl = Arc::clone(&waker);
+        std::thread::spawn(move || {
+            while let Ok((tok, cmd)) = rx_task_cl.recv() {
+                let resp = shard_cl.exec(cmd);
+                // Best-effort send back response
+                if tx_resp_cl.send((tok, resp)).is_ok() {
+                    let _ = waker_cl.wake();
+                }
+            }
+        });
+    }
 
     // Client connection storage: token -> (socket, read_buffer, write_buffer)
     // Using SwissTable for better performance than std HashMap
@@ -75,8 +107,8 @@ pub fn run_shard(_shard_id: usize, addr: SocketAddr, mut shard: Shard) -> Result
         
         for ev in events.iter() {
             match ev.token() {
-                // Token(0) = listening socket, accept new connections
-                Token(0) => loop {
+                // Listener socket, accept new connections
+                LISTENER => loop {
                     match listener.accept() {
                         Ok((mut sock, _)) => {
                             // Enable TCP_NODELAY for lower latency
@@ -108,6 +140,22 @@ pub fn run_shard(_shard_id: usize, addr: SocketAddr, mut shard: Shard) -> Result
                     }
                 },
                 
+                // Waker notifications from workers
+                WAKER_TOKEN => {
+                    // Drain all available responses
+                    loop {
+                        match rx_resp.try_recv() {
+                            Ok((token_usize, out)) => {
+                                if let Some((_s, _r, w)) = clients.get_mut(&token_usize) {
+                                    w.extend_from_slice(&out);
+                                }
+                            }
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => break,
+                        }
+                    }
+                }
+
                 // Client socket events
                 Token(t) => {
                     let mut should_remove = false;
@@ -148,10 +196,15 @@ pub fn run_shard(_shard_id: usize, addr: SocketAddr, mut shard: Shard) -> Result
                                     // Protocol error, send error response
                                     wbuf.extend_from_slice(&resp_simple(&format!("ERR {}", e)));
                                 } else {
-                                    // Execute each parsed command
+                                    // Offload each parsed command to workers
                                     for c in cmds {
-                                        let resp = shard.exec(c);
-                                        wbuf.extend_from_slice(&resp);
+                                        match tx_task.try_send((t, c)) {
+                                            Ok(_) => {}
+                                            Err(_) => {
+                                                // Backpressure: queue a busy error
+                                                wbuf.extend_from_slice(b"-ERR server busy\r\n");
+                                            }
+                                        }
                                     }
                                 }
                                 

@@ -6,8 +6,8 @@ fn bench_exec_set_get(c: &mut Criterion) {
     group.bench_function("set_get", |b| {
         b.iter_batched(
             || Shard::new(0, None),
-            |mut shard| {
-                for i in 0..1000u32 {
+            |shard| {
+                for i in 0..1_000_000u32 {
                     let k = format!("k{}", i).into_bytes();
                     let v = format!("v{}", i).into_bytes();
                     let _ = shard.exec(Cmd::Set(k.clone(), v));

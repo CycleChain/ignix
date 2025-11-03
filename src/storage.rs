@@ -1,18 +1,12 @@
 /*!
  * In-Memory Storage Implementation
- * 
+ *
  * This module provides the core storage layer for Ignix, implementing
- * a high-performance in-memory dictionary using AHash for fast lookups.
+ * a concurrent in-memory dictionary using DashMap with a fast hasher.
  */
 
 use crate::protocol::Value;
-use hashbrown::HashMap;
-use std::hash::BuildHasherDefault;
-
-// Use AHash for better performance than default hasher
-// AHash is specifically designed for hash tables and provides
-// better performance and security than the default SipHash
-type AHash = BuildHasherDefault<ahash::AHasher>;
+use dashmap::DashMap;
 
 /// High-performance in-memory dictionary
 /// 
@@ -20,8 +14,8 @@ type AHash = BuildHasherDefault<ahash::AHasher>;
 /// Uses SwissTable (hashbrown) with AHash for fast lookups and supports all Redis-compatible operations.
 #[derive(Default)]
 pub struct Dict {
-    /// Internal SwissTable HashMap with AHash for optimal performance
-    pub(crate) inner: HashMap<Vec<u8>, Value, AHash>,
+    /// Concurrent DashMap for optimal performance (sharded locking)
+    pub(crate) inner: DashMap<Vec<u8>, Value>,
 }
 
 impl Dict {
@@ -34,25 +28,11 @@ impl Dict {
     /// * `Some(&Value)` if key exists
     /// * `None` if key doesn't exist
     #[inline]
-    pub fn get(&self, k: &[u8]) -> Option<&Value> {
-        self.inner.get(k)
+    pub fn get(&self, k: &[u8]) -> Option<Value> {
+        self.inner.get(k).map(|v| v.clone())
     }
     
-    /// Get a mutable value by key
-    /// 
-    /// Used for operations that need to modify values in-place,
-    /// such as INCR operations.
-    /// 
-    /// # Arguments
-    /// * `k` - Key to lookup as byte slice
-    /// 
-    /// # Returns
-    /// * `Some(&mut Value)` if key exists
-    /// * `None` if key doesn't exist
-    #[inline]
-    pub fn get_mut(&mut self, k: &[u8]) -> Option<&mut Value> {
-        self.inner.get_mut(k)
-    }
+    // note: Direct mutable references are not exposed; use entry APIs for atomic updates.
     
     /// Set a key-value pair
     /// 
@@ -63,7 +43,7 @@ impl Dict {
     /// * `k` - Key as owned byte vector
     /// * `v` - Value to store
     #[inline]
-    pub fn set(&mut self, k: Vec<u8>, v: Value) {
+    pub fn set(&self, k: Vec<u8>, v: Value) {
         self.inner.insert(k, v);
     }
     
@@ -78,7 +58,7 @@ impl Dict {
     /// * `true` if key existed and was deleted
     /// * `false` if key didn't exist
     #[inline]
-    pub fn del(&mut self, k: &[u8]) -> bool {
+    pub fn del(&self, k: &[u8]) -> bool {
         self.inner.remove(k).is_some()
     }
     
@@ -95,19 +75,17 @@ impl Dict {
     /// * `true` if rename was successful
     /// * `false` if source key didn't exist
     #[inline]
-    pub fn rename(&mut self, from: Vec<u8>, to: Vec<u8>) -> bool {
+    pub fn rename(&self, from: Vec<u8>, to: Vec<u8>) -> bool {
         // Handle edge case where source and destination are the same
         if from == to {
             return true;
         }
         
-        // Try to remove the source key and get its value
-        if let Some(v) = self.inner.remove(&from) {
-            // Insert the value with the new key
+        // Simple remove-then-insert; note this is not atomic across shards
+        if let Some((_, v)) = self.inner.remove(&from) {
             self.inner.insert(to, v);
             true
         } else {
-            // Source key didn't exist
             false
         }
     }
@@ -125,5 +103,32 @@ impl Dict {
     #[inline]
     pub fn exists(&self, k: &[u8]) -> bool {
         self.inner.contains_key(k)
+    }
+
+    /// Atomically increment an integer-like value stored under key, creating it if missing
+    pub fn incr(&self, k: &[u8]) -> i64 {
+        use dashmap::mapref::entry::Entry;
+        match self.inner.entry(k.to_vec()) {
+            Entry::Occupied(mut e) => match e.get_mut() {
+                Value::Int(i) => {
+                    *i += 1;
+                    *i
+                }
+                Value::Str(s) => {
+                    let mut n = std::str::from_utf8(s)
+                        .ok()
+                        .and_then(|x| x.parse::<i64>().ok())
+                        .unwrap_or(0);
+                    n += 1;
+                    *s = n.to_string().into_bytes();
+                    n
+                }
+                _ => 0,
+            },
+            Entry::Vacant(v) => {
+                v.insert(Value::Int(1));
+                1
+            }
+        }
     }
 }

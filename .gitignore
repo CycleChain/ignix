@@ -82,3 +82,4 @@ yarn-error.log*
 devnotes
 
 benchmark_results
+flamegraph.svg
