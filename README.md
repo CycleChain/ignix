@@ -9,21 +9,22 @@ Ignix (from "Ignite" + "Index") is a blazing-fast, Redis-protocol compatible key
 
 ## ✨ Features
 
-- 🚀 **High Performance**: Built with Rust for maximum speed and safety
+- 🚀 **High Performance**: Rust + reactor/worker model for parallel execution
 - 🔌 **Redis Protocol Compatible**: Drop-in replacement for Redis clients
-- 🧵 **Async I/O**: Non-blocking networking with mio for high concurrency
-- 💾 **AOF Persistence**: Append-only file for data durability
-- 🎯 **Zero Dependencies**: Minimal external dependencies for security
-- 📊 **Built-in Benchmarks**: Performance testing included
+- 🧵 **Async I/O (mio)**: Non-blocking reactor + `mio::Waker` response path
+- 💾 **AOF Persistence**: Background writer with bounded backpressure
+- 🧠 **Concurrent Storage**: `DashMap` (sharded locking) in hot path
+- 📊 **Benchmarks Included**: Scripts and criterion benches
 
 ## 🏗️ Architecture
 
-Ignix uses a simple but efficient architecture:
+Ignix v0.2.0 architecture:
 
 - **RESP Protocol**: Full Redis Serialization Protocol support
-- **Event-Driven Networking**: mio-based async I/O for handling thousands of connections
-- **In-Memory Storage**: SwissTable-based hash map storage for optimal performance
-- **AOF Persistence**: Optional append-only file logging for durability
+- **Reactor + Workers**: mio reactor handles I/O; workers execute commands
+- **Immediate Wakeups**: Workers signal the reactor via `mio::Waker` for writes
+- **Concurrent Storage**: `DashMap<Vec<u8>, Value>` (sharded locking)
+- **AOF Persistence**: Dedicated thread, bounded channel, periodic fsync
 
 ## 🚀 Quick Start
 
@@ -108,10 +109,7 @@ cargo bench --bench resp
 
 ### Example Benchmark Results
 
-```
-exec/set_get            time:   [396.62 µs 403.23 µs 413.05 µs]
-resp/parse_many_1k      time:   [296.51 µs 298.00 µs 299.44 µs]
-```
+See the Performance section and `benchmark_results/benchmark_results.json`.
 
 ## 🔌 Client Usage
 
@@ -144,7 +142,7 @@ print(r.get('hello'))  # Output: world
 
 ## 📊 Performance
 
-> Benchmarks reflect Ignix v0.2.0 (reactor/worker split + DashMap). Full raw results are in `benchmark_results/benchmark_results.json`.
+Benchmarks reflect Ignix v0.2.0. Full raw results are in `benchmark_results/benchmark_results.json`.
 
 ### SET Throughput (ops/sec)
 
@@ -181,8 +179,8 @@ print(r.get('hello'))  # Output: world
 | 4KB  | 50    | 13,035 | 16,354 | 1.25x |
 
 Notes:
-- Values are rounded from `benchmark_results/benchmark_results.json`.
-- All runs showed 0 errors and 100% success rate in the dataset provided.
+- Values rounded from `benchmark_results/benchmark_results.json`.
+- All runs showed 0 errors, 100% success.
 
 ### 📊 Benchmark Your Own Workload
 
@@ -206,8 +204,6 @@ python3 benchmark_redis_vs_ignix.py --data-sizes 64 256 1024 --connections 1 10 
 - **Minimal allocations** in hot paths
 
 ## 🏗️ Development
-
-> **🚧 Early Development Stage**: Ignix is actively under development. APIs may change, and new features are being added regularly. We welcome contributions and feedback!
 
 ### Project Structure
 
@@ -253,64 +249,20 @@ benches/
 
 ## 🔍 Debugging
 
-### Enable Debug Logging
+Enable debug logging: `RUST_LOG=debug cargo run --release`
+Monitor AOF: `tail -f ignix.aof`
 
-```bash
-RUST_LOG=debug cargo run --release
-```
+## 🚧 Roadmap (Short)
 
-### Monitor AOF File
-
-```bash
-tail -f ignix.aof
-```
-
-## 🚧 Roadmap
-
-**Current Development Phase**: Core optimization and stability
-
-### 🎯 Short Term (Next Release)
-- [ ] **Performance optimization** for large data operations
-- [ ] **Memory management** improvements
-- [ ] **Connection pooling** enhancements
-- [ ] **Comprehensive benchmarking** suite expansion
-
-### 🚀 Medium Term
-- [ ] **More Redis commands** (HASH, LIST, SET operations)
-- [ ] **Multi-threading** support for better concurrency
-- [ ] **RDB snapshots** for faster restarts
-- [ ] **Metrics and monitoring** endpoints
-
-### 🌟 Long Term Vision
-- [ ] **Clustering support** for horizontal scaling
-- [ ] **Replication** for high availability
-- [ ] **Lua scripting support** for complex operations
-- [ ] **Advanced data structures** and algorithms
-- [ ] **Plugin architecture** for extensibility
-
-> **📈 Performance Goals**: Our primary focus is achieving consistently high performance across all data sizes while maintaining the simplicity and reliability that makes Ignix special.
+- More Redis commands (HASH/LIST/SET)
+- RDB snapshots, metrics/monitoring
+- Clustering and replication
 
 ## 🐛 Known Limitations
 
-> **Development Status**: These limitations are actively being addressed as part of our development roadmap.
-
-### Current Limitations
-- **Single-threaded execution** (one shard) - *Multi-threading planned*
-- **Limited command set** compared to full Redis - *Expanding gradually*
-- **Large data performance** can be slower than Redis - *Optimization in progress*
-- **No clustering or replication** yet - *Future releases*
-- **AOF-only persistence** (no RDB snapshots) - *RDB support planned*
-
-### Performance Notes
-- **Excellent for small data** (64 bytes): Up to 4x faster SET operations than Redis
-- **Competitive for medium data** (256 bytes - 1KB): Similar to Redis performance  
-- **Room for improvement** on large payloads (4KB+): Redis shows maturity in large data handling
-
-These characteristics make Ignix ideal for:
-- ✅ **Caching layers** with small objects
-- ✅ **Session storage** with quick access patterns
-- ✅ **Real-time applications** requiring low latency
-- ✅ **Microservices** with high-frequency, small data operations
+- Limited command set vs Redis (expanding)
+- No clustering or replication yet
+- RDB snapshots not yet available
 
 ## 📄 License
 
