@@ -2,7 +2,7 @@ use ignix::*;
 
 #[test]
 fn set_get_del_cycle() {
-    let mut shard = Shard::new(0, None);
+    let shard = Shard::new(0, None);
     assert_eq!(
         String::from_utf8_lossy(&shard.exec(Cmd::Set(b"a".to_vec(), b"1".to_vec()))),
         "+OK\r\n"
@@ -23,7 +23,7 @@ fn set_get_del_cycle() {
 
 #[test]
 fn rename_exists_incr() {
-    let mut s = Shard::new(0, None);
+    let s = Shard::new(0, None);
     s.exec(Cmd::Set(b"x".to_vec(), b"41".to_vec()));
     assert_eq!(
         s.exec(Cmd::Exists(b"x".to_vec())),

@@ -5,7 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.1.1] - 2025-11-20
+## [0.2.0] - 2025-11-03
+
+### Changed
+- Networking (`src/net.rs`): Decoupled reactor from command execution via bounded task/response channels and integrated `mio::Waker` to wake the reactor when worker responses are ready. Reactor no longer blocks on storage or disk I/O.
+- Storage (`src/storage.rs`): Replaced single-threaded `HashMap` with concurrent `DashMap<Vec<u8>, Value>` (sharded locking) for improved parallel writes/reads. Introduced atomic `incr` using `entry` API.
+- Shard (`src/shard.rs`): Made `Shard::exec` take `&self` to enable invocation from multiple worker threads; adapted to new `Dict` API.
+- AOF (`src/aof.rs`): Switched to a bounded channel for backpressure; on shutdown performs a final flush and sync for graceful exit.
+- Benches/Tests: Updated to `&self` for `Shard::exec`.
+- Cargo: Added `dashmap` and `rustc-hash` dependencies; version bumped to `0.2.0`.
+
+### Performance
+- Eliminated reactor thread stalls by offloading command execution to a worker pool and using a waker-based response path.
+- Reduced lock contention by moving to `DashMap` (sharded concurrency) in the hot path.
+- Added bounded channels to prevent unbounded memory growth under load and to enforce backpressure.
+
+### Migration Notes
+- `Shard::exec` now takes `&self` instead of `&mut self`. Most callers do not require code changes beyond removing `mut`.
+
+## [0.1.1] - 2025-10-20
 
 ### Changed
 - Migrated from standard `std::collections::HashMap` to SwissTable implementation via `hashbrown::HashMap`
@@ -18,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Better memory efficiency and faster lookups compared to standard HashMap
 - Maintained full API compatibility - no breaking changes
 
-## [0.1.0] - 2025-10-22
+## [0.1.0] - 2025-09-22
 
 ### Added
 - Initial release of Ignix Redis-compatible key-value store

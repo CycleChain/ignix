@@ -49,7 +49,7 @@ impl Shard {
     /// 
     /// # Returns
     /// * RESP-formatted response as byte vector
-    pub fn exec(&mut self, cmd: Cmd) -> Vec<u8> {
+    pub fn exec(&self, cmd: Cmd) -> Vec<u8> {
         match cmd {
             // PING command - simple connectivity test
             Cmd::Ping => resp_simple("PONG"),
@@ -57,9 +57,9 @@ impl Shard {
             // GET key - retrieve value for key
             Cmd::Get(k) => match self.dict.get(&k) {
                 // Return string/blob values as bulk strings
-                Some(Value::Str(v)) | Some(Value::Blob(v)) => resp_bulk(v),
+                Some(Value::Str(v)) | Some(Value::Blob(v)) => resp_bulk(&v),
                 // Return integer values as RESP integers
-                Some(Value::Int(i)) => resp_integer(*i),
+                Some(Value::Int(i)) => resp_integer(i),
                 // Return null if key doesn't exist
                 None => resp_null(),
             },
@@ -104,31 +104,7 @@ impl Shard {
             
             // INCR key - increment numeric value
             Cmd::Incr(k) => {
-                let v = match self.dict.get_mut(&k) {
-                    // If key exists and is an integer, increment it
-                    Some(Value::Int(i)) => {
-                        *i += 1;
-                        *i
-                    }
-                    // If key exists and is a string, try to parse as number
-                    Some(Value::Str(s)) => {
-                        let mut n = std::str::from_utf8(s)
-                            .ok()
-                            .and_then(|x| x.parse::<i64>().ok())
-                            .unwrap_or(0);
-                        n += 1;
-                        // Update the string representation
-                        *s = n.to_string().into_bytes();
-                        n
-                    }
-                    // If key exists but is not a valid type, return 0
-                    Some(_) => 0,
-                    // If key doesn't exist, create it with value 1
-                    None => {
-                        self.dict.set(k.clone(), Value::Int(1));
-                        1
-                    }
-                };
+                let v = self.dict.incr(&k);
                 
                 // Log increment to AOF
                 if let Some(a) = &self.aof {
@@ -146,8 +122,8 @@ impl Shard {
                 // Get each key and format as RESP
                 for k in keys {
                     let b = match self.dict.get(&k) {
-                        Some(Value::Str(v)) | Some(Value::Blob(v)) => resp_bulk(v),
-                        Some(Value::Int(i)) => resp_integer(*i),
+                        Some(Value::Str(v)) | Some(Value::Blob(v)) => resp_bulk(&v),
+                        Some(Value::Int(i)) => resp_integer(i),
                         None => resp_null(),
                     };
                     items.push(b);

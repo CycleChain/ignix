@@ -144,55 +144,27 @@ print(r.get('hello'))  # Output: world
 
 ## 📊 Performance
 
-> **⚠️ Note**: Ignix is currently in **early development stage**. Performance characteristics are actively being optimized and may change significantly in future releases.
+> Benchmarks reflect Ignix v0.2.0 (reactor/worker split + DashMap). See `benchmark_results/benchmark_results.json` for full data.
 
-Ignix shows excellent performance characteristics, especially for small data operations and high-concurrency scenarios. **Latest benchmark results (v0.1.1 with SwissTable):**
+![Redis vs Ignix comparison](benchmark_results/redis_vs_ignix_comparison.png)
 
-### 🚀 Small Data Operations (64 bytes, 1 connection)
-*Optimized for low-latency, high-frequency operations*
+![Performance ratio](benchmark_results/performance_ratio.png)
 
-| Operation | Ignix | Redis | Ignix Advantage |
-|-----------|-------|-------|-----------------|
-| **SET** | 35,488 ops/sec | 8,893 ops/sec | **3.99x faster** |
-| **GET** | 31,993 ops/sec | 31,879 ops/sec | **~Equal performance** |
-| **Average Latency** | 0.03 ms | 0.03 ms | **~Equal latency** |
+### Highlights (from latest results)
 
-### 📈 Medium Data Operations (256 bytes, 1 connection)
-*Balanced performance across different payload sizes*
+- **SET 64B (10 conns)**: Ignix 21.5k ops/s vs Redis 17.6k → **~1.22x**
+- **SET 256B (10 conns)**: Ignix 28.0k vs 17.9k → **~1.57x**
+- **SET 4KB (10 conns)**: Ignix 28.1k vs 17.2k → **~1.63x**
+- **GET 64B (10 conns)**: Ignix 28.9k vs 16.8k → **~1.72x**
+- **GET 4KB (50 conns)**: Ignix 16.4k vs 13.0k → **~1.25x**
 
-| Operation | Ignix | Redis | Performance |
-|-----------|-------|-------|-------------|
-| **SET** | 30,768 ops/sec | 32,789 ops/sec | Redis 1.07x faster |
-| **GET** | 30,935 ops/sec | 30,708 ops/sec | **~Equal performance** |
+Latency remains sub-millisecond across small and medium payloads in both systems, with Ignix sustaining higher throughput under concurrency.
 
-### 🔥 Large Data Operations (4KB, 1 connection)
-*Throughput-intensive workloads*
+### What changed in v0.2.0?
 
-| Operation | Ignix | Redis | Performance |
-|-----------|-------|-------|-------------|
-| **SET** | 23,623 ops/sec | 29,907 ops/sec | Redis 1.27x faster |
-| **GET** | 27,968 ops/sec | 29,157 ops/sec | Redis 1.04x faster |
-| **Average Latency** | 0.04 ms | 0.03 ms | Redis 1.33x better |
-
-### 🎯 Performance Characteristics
-
-**Ignix Excels At:**
-- ✅ **Small data SET operations**: Up to 4x faster than Redis (64 bytes)
-- ✅ **Low-latency responses**: Sub-millisecond latency consistently
-- ✅ **High-concurrency scenarios**: Maintains performance under load
-- ✅ **SwissTable optimization**: Enhanced hash table performance in v0.1.1
-
-**Redis Excels At:**
-- ✅ **Large data transfers**: More mature buffer management (4KB+)
-- ✅ **Memory-intensive operations**: 15+ years of optimization
-- ✅ **Complex data structures**: Extensive command set and data types
-
-### 🔬 Why This Performance Profile?
-
-1. **SwissTable Enhancement**: v0.1.1 introduced hashbrown's SwissTable implementation for improved hash performance
-2. **Small Data Advantage**: Ignix's Rust-based architecture minimizes overhead for small operations (64 bytes)
-3. **Large Data Trade-off**: Redis's mature memory management and optimizations shine with larger payloads (4KB+)
-4. **Early Stage**: Ignix is optimized for core use cases with SwissTable improvements, with room for enhancement in large data scenarios
+- **Reactor decoupled** from storage/disk via worker pool + `mio::Waker` → no blocking on hot path.
+- **DashMap storage** with sharded locking → significantly less contention under writes.
+- **Bounded channels** (tasks/AOF) → backpressure and better stability under load.
 
 ### 📊 Benchmark Your Own Workload
 

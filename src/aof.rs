@@ -7,7 +7,7 @@
  */
 
 use anyhow::*;
-use crossbeam::channel::{unbounded, Sender};
+use crossbeam::channel::{bounded, Sender};
 use std::io::Write;
 use std::time::{Duration, Instant};
 use std::result::Result::{Ok, Err};
@@ -38,7 +38,8 @@ pub struct AofHandle {
 /// * File is flushed and synced every 1000ms for durability
 /// * Thread continues until the handle is dropped
 pub fn spawn_aof_writer(path: &str) -> Result<AofHandle> {
-    let (tx, rx) = unbounded::<Vec<u8>>();
+    // Bounded channel to provide backpressure under heavy write load
+    let (tx, rx) = bounded::<Vec<u8>>(4096);
     let path = path.to_string();
     
     // Spawn dedicated AOF writer thread
@@ -58,18 +59,19 @@ pub fn spawn_aof_writer(path: &str) -> Result<AofHandle> {
             loop {
                 match rx.recv() {
                     Ok(buf) => {
-                        // Write command to file (may be buffered by OS)
                         let _ = f.write_all(&buf);
-                        
-                        // Flush and sync to disk every second for durability
                         if last.elapsed() >= Duration::from_millis(1000) {
-                            let _ = f.flush();     // Flush to OS buffers
-                            let _ = f.sync_data(); // Force write to disk
+                            let _ = f.flush();
+                            let _ = f.sync_data();
                             last = Instant::now();
                         }
                     }
-                    // Channel closed, exit thread
-                    Err(_) => break,
+                    // Channel closed: drain finished; perform final flush and exit
+                    Err(_) => {
+                        let _ = f.flush();
+                        let _ = f.sync_data();
+                        break;
+                    }
                 }
             }
         })?;

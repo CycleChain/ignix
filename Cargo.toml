@@ -1,6 +1,6 @@
 [package]
 name = "ignix"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 description = "High-performance Redis-compatible key-value store built with Rust"
 license = "MIT"
@@ -36,6 +36,8 @@ log = "0.4"
 env_logger = "0.11"
 socket2 = { version = "0.5", features = ["all"] }
 hashbrown = "0.14"
+dashmap = "6"
+rustc-hash = "1"
 
 
 [dev-dependencies]
