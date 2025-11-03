@@ -144,27 +144,45 @@ print(r.get('hello'))  # Output: world
 
 ## 📊 Performance
 
-> Benchmarks reflect Ignix v0.2.0 (reactor/worker split + DashMap). See `benchmark_results/benchmark_results.json` for full data.
+> Benchmarks reflect Ignix v0.2.0 (reactor/worker split + DashMap). Full raw results are in `benchmark_results/benchmark_results.json`.
 
-![Redis vs Ignix comparison](benchmark_results/redis_vs_ignix_comparison.png)
+### SET Throughput (ops/sec)
 
-![Performance ratio](benchmark_results/performance_ratio.png)
+| Data | Conns | Redis | Ignix | Ratio (Ignix/Redis) |
+|------|-------|-------|-------|----------------------|
+| 64B  | 1     | 9,249 | 9,116 | 0.99x |
+| 64B  | 10    | 17,628 | 21,545 | 1.22x |
+| 64B  | 50    | 18,236 | 15,515 | 0.85x |
+| 256B | 1     | 14,615 | 12,032 | 0.82x |
+| 256B | 10    | 17,880 | 28,032 | 1.57x |
+| 256B | 50    | 16,898 | 19,306 | 1.14x |
+| 1KB  | 1     | 16,300 | 11,083 | 0.68x |
+| 1KB  | 10    | 16,936 | 20,644 | 1.22x |
+| 1KB  | 50    | 17,155 | 20,663 | 1.20x |
+| 4KB  | 1     | 11,286 | 8,581 | 0.76x |
+| 4KB  | 10    | 17,232 | 28,136 | 1.63x |
+| 4KB  | 50    | 16,343 | 17,131 | 1.05x |
 
-### Highlights (from latest results)
+### GET Throughput (ops/sec)
 
-- **SET 64B (10 conns)**: Ignix 21.5k ops/s vs Redis 17.6k → **~1.22x**
-- **SET 256B (10 conns)**: Ignix 28.0k vs 17.9k → **~1.57x**
-- **SET 4KB (10 conns)**: Ignix 28.1k vs 17.2k → **~1.63x**
-- **GET 64B (10 conns)**: Ignix 28.9k vs 16.8k → **~1.72x**
-- **GET 4KB (50 conns)**: Ignix 16.4k vs 13.0k → **~1.25x**
+| Data | Conns | Redis | Ignix | Ratio (Ignix/Redis) |
+|------|-------|-------|-------|----------------------|
+| 64B  | 1     | 19,612 | 11,129 | 0.57x |
+| 64B  | 10    | 16,780 | 28,873 | 1.72x |
+| 64B  | 50    | 14,948 | 19,609 | 1.31x |
+| 256B | 1     | 20,035 | 11,961 | 0.60x |
+| 256B | 10    | 15,164 | 26,699 | 1.76x |
+| 256B | 50    | 15,619 | 18,508 | 1.18x |
+| 1KB  | 1     | 17,525 | 10,436 | 0.60x |
+| 1KB  | 10    | 11,930 | 23,184 | 1.94x |
+| 1KB  | 50    | 8,138 | 15,321 | 1.88x |
+| 4KB  | 1     | 16,600 | 12,159 | 0.73x |
+| 4KB  | 10    | 7,532 | 13,937 | 1.85x |
+| 4KB  | 50    | 13,035 | 16,354 | 1.25x |
 
-Latency remains sub-millisecond across small and medium payloads in both systems, with Ignix sustaining higher throughput under concurrency.
-
-### What changed in v0.2.0?
-
-- **Reactor decoupled** from storage/disk via worker pool + `mio::Waker` → no blocking on hot path.
-- **DashMap storage** with sharded locking → significantly less contention under writes.
-- **Bounded channels** (tasks/AOF) → backpressure and better stability under load.
+Notes:
+- Values are rounded from `benchmark_results/benchmark_results.json`.
+- All runs showed 0 errors and 100% success rate in the dataset provided.
 
 ### 📊 Benchmark Your Own Workload
 
