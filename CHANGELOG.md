@@ -23,7 +23,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Migration Notes
 - `Shard::exec` now takes `&self` instead of `&mut self`. Most callers do not require code changes beyond removing `mut`.
 
-## [0.1.1] - 2025-11-20
+## [0.1.1] - 2025-10-20
 
 ### Changed
 - Migrated from standard `std::collections::HashMap` to SwissTable implementation via `hashbrown::HashMap`
@@ -36,7 +36,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Better memory efficiency and faster lookups compared to standard HashMap
 - Maintained full API compatibility - no breaking changes
 
-## [0.1.0] - 2025-10-22
+## [0.1.0] - 2025-09-22
 
 ### Added
 - Initial release of Ignix Redis-compatible key-value store
