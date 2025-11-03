@@ -142,12 +142,23 @@ pub fn run_shard(_shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()>
                 
                 // Waker notifications from workers
                 WAKER_TOKEN => {
-                    // Drain all available responses
+                    // Drain all available responses and try to flush immediately
                     loop {
                         match rx_resp.try_recv() {
                             Ok((token_usize, out)) => {
-                                if let Some((_s, _r, w)) = clients.get_mut(&token_usize) {
+                                if let Some((sock, _r, w)) = clients.get_mut(&token_usize) {
                                     w.extend_from_slice(&out);
+                                    if !w.is_empty() {
+                                        match sock.write(&w) {
+                                            Ok(n) => {
+                                                let _ = w.split_to(n);
+                                            }
+                                            Err(ref e) if would_block(e) => {}
+                                            Err(_) => {
+                                                // ignore here; regular writable path will clean up
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             Err(TryRecvError::Empty) => break,
