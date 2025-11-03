@@ -78,46 +78,6 @@ python3 benchmark_redis_vs_ignix.py \
 
 ## 📈 Output Examples
 
-### Summary Tables (from benchmark_results/benchmark_results.json)
-
-#### SET Throughput (ops/sec)
-
-| Data | Conns | Redis | Ignix | Ratio (Ignix/Redis) |
-|------|-------|-------|-------|----------------------|
-| 64B  | 1     | 9,249 | 9,116 | 0.99x |
-| 64B  | 10    | 17,628 | 21,545 | 1.22x |
-| 64B  | 50    | 18,236 | 15,515 | 0.85x |
-| 256B | 1     | 14,615 | 12,032 | 0.82x |
-| 256B | 10    | 17,880 | 28,032 | 1.57x |
-| 256B | 50    | 16,898 | 19,306 | 1.14x |
-| 1KB  | 1     | 16,300 | 11,083 | 0.68x |
-| 1KB  | 10    | 16,936 | 20,644 | 1.22x |
-| 1KB  | 50    | 17,155 | 20,663 | 1.20x |
-| 4KB  | 1     | 11,286 | 8,581 | 0.76x |
-| 4KB  | 10    | 17,232 | 28,136 | 1.63x |
-| 4KB  | 50    | 16,343 | 17,131 | 1.05x |
-
-#### GET Throughput (ops/sec)
-
-| Data | Conns | Redis | Ignix | Ratio (Ignix/Redis) |
-|------|-------|-------|-------|----------------------|
-| 64B  | 1     | 19,612 | 11,129 | 0.57x |
-| 64B  | 10    | 16,780 | 28,873 | 1.72x |
-| 64B  | 50    | 14,948 | 19,609 | 1.31x |
-| 256B | 1     | 20,035 | 11,961 | 0.60x |
-| 256B | 10    | 15,164 | 26,699 | 1.76x |
-| 256B | 50    | 15,619 | 18,508 | 1.18x |
-| 1KB  | 1     | 17,525 | 10,436 | 0.60x |
-| 1KB  | 10    | 11,930 | 23,184 | 1.94x |
-| 1KB  | 50    | 8,138 | 15,321 | 1.88x |
-| 4KB  | 1     | 16,600 | 12,159 | 0.73x |
-| 4KB  | 10    | 7,532 | 13,937 | 1.85x |
-| 4KB  | 50    | 13,035 | 16,354 | 1.25x |
-
-Notes:
-- Values rounded from `benchmark_results/benchmark_results.json`.
-- All runs in this dataset reported 0 errors (100% success).
-
 ### Console Output
 ```
 🚀 Redis vs Ignix Performance Benchmark
