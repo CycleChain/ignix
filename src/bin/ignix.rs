@@ -10,6 +10,9 @@ use anyhow::*;
 use ignix::*;
 use std::net::ToSocketAddrs;
 
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 /// Main function - entry point for Ignix server
 /// 
 /// Initializes the server components and starts the main event loop:

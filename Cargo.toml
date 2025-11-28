@@ -38,6 +38,7 @@ socket2 = { version = "0.5", features = ["all"] }
 hashbrown = "0.14"
 dashmap = "6"
 rustc-hash = "1"
+mimalloc = { version = "0.1", default-features = false }
 
 
 [dev-dependencies]
@@ -53,3 +54,10 @@ harness = false
 [[bench]]
 name = "resp"
 harness = false
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+opt-level = 3

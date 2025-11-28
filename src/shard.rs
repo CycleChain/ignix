@@ -66,13 +66,15 @@ impl Shard {
             
             // SET key value - store key-value pair
             Cmd::Set(k, v) => {
-                // Store the value as a string
-                self.dict.set(k.clone(), Value::Str(v.clone()));
-                
                 // Log to AOF if persistence is enabled
+                // We do this before moving k and v into the dictionary
                 if let Some(a) = &self.aof {
                     a.write(&emit_aof_set(&k, &v));
                 }
+
+                // Store the value as a string
+                // Move k and v directly into the dictionary to avoid cloning
+                self.dict.set(k, Value::Str(v));
                 
                 resp_simple("OK")
             }
@@ -86,16 +88,36 @@ impl Shard {
             
             // RENAME oldkey newkey - rename a key
             Cmd::Rename(from, to) => {
-                let ok = self.dict.rename(from.clone(), to.clone());
-                if ok {
-                    // Log successful rename to AOF
-                    if let Some(a) = &self.aof {
-                        a.write(&emit_aof_rename(&from, &to));
+                // Log successful rename to AOF
+                // We do this before moving from and to
+                // Note: We only log if rename is successful, but we need to check existence first
+                // However, checking existence is racy if we don't hold a lock.
+                // For now, let's keep the logic simple and consistent with previous implementation
+                // but we need to clone for AOF if we want to move into rename.
+                
+                // Actually, dict.rename takes ownership.
+                // Let's check if we can optimize this.
+                // If we want to avoid clone, we have to do AOF after, but we lost the keys.
+                // So we probably still need to clone for AOF if enabled.
+                
+                if self.aof.is_some() {
+                    let ok = self.dict.rename(from.clone(), to.clone());
+                    if ok {
+                         if let Some(a) = &self.aof {
+                            a.write(&emit_aof_rename(&from, &to));
+                        }
+                        resp_simple("OK")
+                    } else {
+                        resp_simple("ERR no such key")
                     }
-                    resp_simple("OK")
                 } else {
-                    // Return error if source key doesn't exist
-                    resp_simple("ERR no such key")
+                    // No AOF, we can move directly
+                    let ok = self.dict.rename(from, to);
+                    if ok {
+                        resp_simple("OK")
+                    } else {
+                        resp_simple("ERR no such key")
+                    }
                 }
             }
             
@@ -135,14 +157,14 @@ impl Shard {
             
             // MSET key1 value1 key2 value2 ... - set multiple key-value pairs
             Cmd::MSet(pairs) => {
-                // Set all key-value pairs
-                for (k, v) in pairs.iter() {
-                    self.dict.set(k.clone(), Value::Str(v.clone()));
-                }
-                
                 // Log all sets to AOF as a single operation
                 if let Some(a) = &self.aof {
                     a.write(&emit_aof_mset(&pairs));
+                }
+
+                // Set all key-value pairs
+                for (k, v) in pairs {
+                    self.dict.set(k, Value::Str(v));
                 }
                 
                 resp_simple("OK")

@@ -95,9 +95,9 @@ pub fn run_shard(_shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()>
         });
     }
 
-    // Client connection storage: token -> (socket, read_buffer, write_buffer)
+    // Client connection storage: token -> (socket, read_buffer, write_buffer, cmd_buffer)
     // Using SwissTable for better performance than std HashMap
-    let mut clients: HashMap<usize, (TcpStream, BytesMut, BytesMut)> = HashMap::new();
+    let mut clients: HashMap<usize, (TcpStream, BytesMut, BytesMut, Vec<Cmd>)> = HashMap::new();
     let mut next_tok: usize = 1;
 
     // Main event loop
@@ -128,7 +128,7 @@ pub fn run_shard(_shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()>
                             // Store client with read/write buffers
                             clients.insert(
                                 tok,
-                                (sock, BytesMut::with_capacity(READ_BUF), BytesMut::new()),
+                                (sock, BytesMut::with_capacity(READ_BUF), BytesMut::new(), Vec::with_capacity(32)),
                             );
                         }
                         // No more connections to accept right now
@@ -146,7 +146,7 @@ pub fn run_shard(_shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()>
                     loop {
                         match rx_resp.try_recv() {
                             Ok((token_usize, out)) => {
-                                if let Some((sock, _r, w)) = clients.get_mut(&token_usize) {
+                                if let Some((sock, _r, w, _)) = clients.get_mut(&token_usize) {
                                     w.extend_from_slice(&out);
                                     if !w.is_empty() {
                                         match sock.write(&w) {
@@ -171,7 +171,7 @@ pub fn run_shard(_shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()>
                 Token(t) => {
                     let mut should_remove = false;
                     
-                    if let Some((sock, rbuf, wbuf)) = clients.get_mut(&t) {
+                    if let Some((sock, rbuf, wbuf, cmds)) = clients.get_mut(&t) {
                         // Handle readable events (incoming data)
                         if ev.is_readable() {
                             let mut tmp = [0u8; READ_BUF];
@@ -200,15 +200,16 @@ pub fn run_shard(_shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()>
                             
                             // Process any complete commands in the read buffer
                             if !should_remove {
-                                let mut cmds = Vec::new();
+                                // Reuse the command vector
+                                cmds.clear();
                                 
                                 // Try to parse RESP commands from buffer
-                                if let Err(e) = parse_many(rbuf, &mut cmds) {
+                                if let Err(e) = parse_many(rbuf, cmds) {
                                     // Protocol error, send error response
                                     wbuf.extend_from_slice(&resp_simple(&format!("ERR {}", e)));
                                 } else {
                                     // Offload each parsed command to workers
-                                    for c in cmds {
+                                    for c in cmds.drain(..) {
                                         match tx_task.try_send((t, c)) {
                                             Ok(_) => {}
                                             Err(_) => {

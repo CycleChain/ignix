@@ -114,32 +114,35 @@ pub fn parse_one(data: &[u8]) -> Result<Option<(usize, Cmd)>> {
         bail!("empty array body");
     }
     
-    // Convert command name to uppercase for case-insensitive matching
-    let cmd_name = upper_ascii(&items[0]);
-    
     // Match command names and validate argument counts
-    let cmd = match &cmd_name[..] {
-        b"PING" => Cmd::Ping,
-        b"GET" if items.len() >= 2 => Cmd::Get(items[1].clone()),
-        b"SET" if items.len() >= 3 => Cmd::Set(items[1].clone(), items[2].clone()),
-        b"DEL" if items.len() >= 2 => Cmd::Del(items[1].clone()),
-        b"RENAME" if items.len() >= 3 => Cmd::Rename(items[1].clone(), items[2].clone()),
-        b"EXISTS" if items.len() >= 2 => Cmd::Exists(items[1].clone()),
-        b"INCR" if items.len() >= 2 => Cmd::Incr(items[1].clone()),
-        b"MGET" if items.len() >= 2 => Cmd::MGet(items[1..].to_vec()),
-        b"MSET" if items.len() >= 3 && items.len() % 2 == 1 => {
-            // MSET requires odd number of args (command + key-value pairs)
-            let mut v = Vec::new();
-            for pair in items[1..].chunks(2) {
-                if pair.len() == 2 {
-                    v.push((pair[0].clone(), pair[1].clone()));
-                }
+    // Using case-insensitive comparison without allocation
+    let cmd = if items[0].eq_ignore_ascii_case(b"PING") {
+        Cmd::Ping
+    } else if items[0].eq_ignore_ascii_case(b"GET") && items.len() >= 2 {
+        Cmd::Get(items[1].clone())
+    } else if items[0].eq_ignore_ascii_case(b"SET") && items.len() >= 3 {
+        Cmd::Set(items[1].clone(), items[2].clone())
+    } else if items[0].eq_ignore_ascii_case(b"DEL") && items.len() >= 2 {
+        Cmd::Del(items[1].clone())
+    } else if items[0].eq_ignore_ascii_case(b"RENAME") && items.len() >= 3 {
+        Cmd::Rename(items[1].clone(), items[2].clone())
+    } else if items[0].eq_ignore_ascii_case(b"EXISTS") && items.len() >= 2 {
+        Cmd::Exists(items[1].clone())
+    } else if items[0].eq_ignore_ascii_case(b"INCR") && items.len() >= 2 {
+        Cmd::Incr(items[1].clone())
+    } else if items[0].eq_ignore_ascii_case(b"MGET") && items.len() >= 2 {
+        Cmd::MGet(items[1..].to_vec())
+    } else if items[0].eq_ignore_ascii_case(b"MSET") && items.len() >= 3 && items.len() % 2 == 1 {
+        // MSET requires odd number of args (command + key-value pairs)
+        let mut v = Vec::with_capacity((items.len() - 1) / 2);
+        for pair in items[1..].chunks(2) {
+            if pair.len() == 2 {
+                v.push((pair[0].clone(), pair[1].clone()));
             }
-            Cmd::MSet(v)
         }
-        _ => {
-            bail!("unknown/invalid command");
-        }
+        Cmd::MSet(v)
+    } else {
+        bail!("unknown/invalid command");
     };
     
     Ok(Some((cursor, cmd)))
@@ -176,28 +179,36 @@ pub fn parse_many(buf: &mut bytes::BytesMut, out: &mut Vec<Cmd>) -> Result<()> {
 /// * `(bytes_consumed, parsed_number)`
 fn read_decimal_line(s: &[u8]) -> Result<(usize, i64)> {
     let mut i = 0;
-    
-    // Find the end of the line (\r\n)
-    while i + 1 < s.len() && !(s[i] == b'\r' && s[i + 1] == b'\n') {
+    let mut num: i64 = 0;
+    let mut sign: i64 = 1;
+
+    if i < s.len() && s[i] == b'-' {
+        sign = -1;
         i += 1;
     }
-    
-    // Check if we found a complete line
-    if i + 1 >= s.len() {
-        return Ok((0, 0)); // Incomplete line
-    }
-    
-    // Parse the number
-    let num = std::str::from_utf8(&s[..i])?.parse::<i64>()?;
-    Ok((i + 2, num)) // +2 for \r\n
-}
 
-/// Convert byte slice to uppercase ASCII
-/// 
-/// Used for case-insensitive command matching
-#[inline]
-fn upper_ascii(s: &[u8]) -> Vec<u8> {
-    s.iter().map(|c| c.to_ascii_uppercase()).collect()
+    // Parse digits
+    let start = i;
+    while i < s.len() && s[i].is_ascii_digit() {
+        num = num.checked_mul(10).ok_or_else(|| anyhow!("number too large"))?;
+        num = num.checked_add((s[i] - b'0') as i64).ok_or_else(|| anyhow!("number too large"))?;
+        i += 1;
+    }
+
+    if i == start {
+        // No digits found, but we need to check if we just ran out of data or if it's invalid
+        // If we hit \r\n immediately, it's invalid format for a number usually, but let's check end
+    }
+
+    // Check for \r\n
+    if i + 1 < s.len() && s[i] == b'\r' && s[i + 1] == b'\n' {
+        Ok((i + 2, num * sign))
+    } else if i + 1 >= s.len() {
+        // Incomplete
+        Ok((0, 0))
+    } else {
+        bail!("expected CRLF");
+    }
 }
 
 //
@@ -211,15 +222,22 @@ fn upper_ascii(s: &[u8]) -> Vec<u8> {
 /// 
 /// Used for status responses like "OK", "PONG", etc.
 pub fn resp_simple(s: &str) -> Vec<u8> {
-    format!("+{}\r\n", s).into_bytes()
+    let mut v = Vec::with_capacity(s.len() + 3);
+    v.push(b'+');
+    v.extend_from_slice(s.as_bytes());
+    v.extend_from_slice(b"\r\n");
+    v
 }
 
 /// Encode a bulk string response ($<len>\r\n<data>\r\n)
 /// 
 /// Used for returning string/binary data
 pub fn resp_bulk(b: &[u8]) -> Vec<u8> {
-    let mut v = Vec::new();
-    v.extend_from_slice(format!("${}\r\n", b.len()).as_bytes());
+    let len_str = b.len().to_string();
+    let mut v = Vec::with_capacity(1 + len_str.len() + 2 + b.len() + 2);
+    v.push(b'$');
+    v.extend_from_slice(len_str.as_bytes());
+    v.extend_from_slice(b"\r\n");
     v.extend_from_slice(b);
     v.extend_from_slice(b"\r\n");
     v
@@ -236,15 +254,25 @@ pub fn resp_null() -> Vec<u8> {
 /// 
 /// Used for numeric results like counters, exists checks, etc.
 pub fn resp_integer(i: i64) -> Vec<u8> {
-    format!(":{}\r\n", i).into_bytes()
+    let i_str = i.to_string();
+    let mut v = Vec::with_capacity(1 + i_str.len() + 2);
+    v.push(b':');
+    v.extend_from_slice(i_str.as_bytes());
+    v.extend_from_slice(b"\r\n");
+    v
 }
 
 /// Encode an array response (*<count>\r\n<item1><item2>...)
 /// 
 /// Used for multi-value responses like MGET results
 pub fn resp_array(items: Vec<Vec<u8>>) -> Vec<u8> {
-    let mut out = Vec::new();
-    out.extend_from_slice(format!("*{}\r\n", items.len()).as_bytes());
+    let len_str = items.len().to_string();
+    // Estimate capacity: * + len + \r\n + (items)
+    // A rough estimate is better than nothing
+    let mut out = Vec::with_capacity(1 + len_str.len() + 2 + items.iter().map(|i| i.len()).sum::<usize>());
+    out.push(b'*');
+    out.extend_from_slice(len_str.as_bytes());
+    out.extend_from_slice(b"\r\n");
     for it in items {
         out.extend_from_slice(&it);
     }
