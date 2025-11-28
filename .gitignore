@@ -81,5 +81,5 @@ yarn-error.log*
 
 devnotes
 
-benchmark_results
-flamegraph.svg
+# Benchmark results (new structure)
+benchmarks/results/
