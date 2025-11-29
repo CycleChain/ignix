@@ -5,6 +5,25 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0] - 2025-11-29
+
+### Changed
+- **Architecture**: Shifted to a **Multi-Reactor (Thread-per-Core)** architecture using `SO_REUSEPORT`. Each thread now runs its own event loop and handles connections independently, eliminating the worker pool bottleneck.
+- **Networking**: Implemented `bind_reuseport` in `src/net.rs` using `socket2` to allow multiple threads to bind to the same port.
+- **Protocol**: Optimized `read_decimal_line` in `src/protocol.rs` using **SWAR (SIMD Within A Register)** techniques for faster integer parsing.
+- **I/O**: Implemented response batching in workers (before removal) and non-blocking I/O fixes for high concurrency.
+- **Data Structures**: Migrated `Cmd` and `Value` to use `bytes::Bytes` for zero-copy string handling.
+- **Build**: Optimized `Cargo.toml` profile (LTO, codegen-units=1, strip=true, panic=abort) and switched to `mimalloc` allocator.
+
+### Added
+- **Large Payload Support**: Verified support for 100KB, 1MB, and 10MB payloads with new tests.
+- **Benchmarks**: Added comprehensive and real-world benchmark scripts (`benchmarks/`) with graphical reporting.
+
+### Performance
+- **Real-World**: Ignix now outperforms Redis by **~25%** in mixed read/write session store scenarios (3,996 vs 3,201 ops/sec).
+- **Write Throughput**: Achieved **2.2x** higher throughput than Redis for 1KB SET operations (7,314 vs 3,313 ops/sec).
+- **Concurrency**: Significantly improved scaling with concurrent connections due to lock-free/sharded architecture.
+
 ## [0.2.0] - 2025-11-03
 
 ### Changed
