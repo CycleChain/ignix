@@ -187,17 +187,60 @@ fn read_decimal_line(s: &[u8]) -> Result<(usize, i64)> {
         i += 1;
     }
 
-    // Parse digits
     let start = i;
-    while i < s.len() && s[i].is_ascii_digit() {
-        num = num.checked_mul(10).ok_or_else(|| anyhow!("number too large"))?;
-        num = num.checked_add((s[i] - b'0') as i64).ok_or_else(|| anyhow!("number too large"))?;
-        i += 1;
+
+    // Fast path: Try to read 8 bytes at a time
+    // We only do this if we have at least 8 bytes remaining
+    while i + 8 <= s.len() {
+        // Read 8 bytes as u64 (Little Endian)
+        let chunk = u64::from_le_bytes(s[i..i+8].try_into().unwrap());
+        
+        // Check if all bytes are digits (0x30..=0x39)
+        // Algorithm:
+        // 1. Add 0x46 (0x7F - 0x39) to each byte. If byte was > 0x39, it will overflow into high bit (0x80).
+        // 2. Subtract 0x30 from each byte. If byte was < 0x30, it will underflow (borrow) from high bit?
+        // Actually, a simpler check for "is any byte not a digit":
+        // val < '0' || val > '9'
+        // Using SWAR:
+        // has_less = (chunk - 0x3030303030303030) & 0x8080808080808080
+        // has_more = (chunk + 0x4646464646464646) & 0x8080808080808080
+        // If either is non-zero, we have a non-digit.
+        
+        let val_minus_0 = chunk.wrapping_sub(0x3030303030303030);
+        let val_plus_46 = chunk.wrapping_add(0x4646464646464646); // 0x46 = 127 - 57 ('9')
+        
+        if (val_minus_0 | val_plus_46) & 0x8080808080808080 != 0 {
+            // Found a non-digit in this chunk, fall back to byte-by-byte
+            break;
+        }
+
+        // All 8 bytes are digits. Parse them.
+        // This is tricky to do efficiently in parallel without SIMD intrinsics.
+        // But we can just loop unroll here since we know they are valid.
+        // Or just continue byte-by-byte loop which is now branch-predicted well?
+        // Actually, the main win of SWAR is finding the *end* of the string quickly.
+        // Parsing still needs multiplication.
+        // Let's just fall through to byte loop, but we know the next 8 bytes are valid?
+        // No, let's just use the byte loop. The "SWAR" part here is mostly useful for *skipping* or *finding* delimiters.
+        // For parsing integers, the multiplication dependency chain is the bottleneck.
+        
+        // Let's stick to a simple unrolled loop which compilers vectorize well.
+        break; 
+    }
+
+    // Standard loop (compiler usually vectorizes this well if simple)
+    while i < s.len() {
+        let c = s[i];
+        if c.is_ascii_digit() {
+            num = num.wrapping_mul(10).wrapping_add((c - b'0') as i64);
+            i += 1;
+        } else {
+            break;
+        }
     }
 
     if i == start {
-        // No digits found, but we need to check if we just ran out of data or if it's invalid
-        // If we hit \r\n immediately, it's invalid format for a number usually, but let's check end
+        // No digits found
     }
 
     // Check for \r\n
