@@ -7,7 +7,7 @@
  */
 
 use anyhow::*;
-use bytes::Buf;
+use bytes::{Buf, Bytes};
 
 /// Redis-compatible commands supported by Ignix
 /// 
@@ -18,21 +18,21 @@ pub enum Cmd {
     /// PING command - test server connectivity
     Ping,
     /// GET key - retrieve value for a key
-    Get(Vec<u8>),
+    Get(Bytes),
     /// SET key value - set a key-value pair
-    Set(Vec<u8>, Vec<u8>),
+    Set(Bytes, Bytes),
     /// DEL key - delete a key
-    Del(Vec<u8>),
+    Del(Bytes),
     /// RENAME oldkey newkey - rename a key
-    Rename(Vec<u8>, Vec<u8>),
+    Rename(Bytes, Bytes),
     /// EXISTS key - check if key exists
-    Exists(Vec<u8>),
+    Exists(Bytes),
     /// INCR key - increment numeric value
-    Incr(Vec<u8>),
+    Incr(Bytes),
     /// MGET key1 key2 ... - get multiple keys
-    MGet(Vec<Vec<u8>>),
+    MGet(Vec<Bytes>),
     /// MSET key1 value1 key2 value2 ... - set multiple key-value pairs
-    MSet(Vec<(Vec<u8>, Vec<u8>)>),
+    MSet(Vec<(Bytes, Bytes)>),
 }
 
 /// Value types that can be stored in Ignix
@@ -41,11 +41,11 @@ pub enum Cmd {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
     /// String/binary data
-    Str(Vec<u8>),
+    Str(Bytes),
     /// 64-bit signed integer
     Int(i64),
     /// Binary blob (same as Str but semantically different)
-    Blob(Vec<u8>),
+    Blob(Bytes),
 }
 
 /// Parse a single RESP command from byte data
@@ -80,7 +80,7 @@ pub fn parse_one(data: &[u8]) -> Result<Option<(usize, Cmd)>> {
     }
     
     // Pre-allocate vector for better performance
-    let mut items: Vec<Vec<u8>> = Vec::with_capacity(n as usize);
+    let mut items: Vec<Bytes> = Vec::with_capacity(n as usize);
     
     // Parse each array element (bulk strings)
     for _ in 0..n {
@@ -106,7 +106,7 @@ pub fn parse_one(data: &[u8]) -> Result<Option<(usize, Cmd)>> {
         
         // Extract the payload
         let payload = &data[cursor..cursor + len as usize];
-        items.push(payload.to_vec());
+        items.push(Bytes::copy_from_slice(payload));
         cursor += need;
     }
     

@@ -7,6 +7,7 @@
 
 use crate::protocol::Value;
 use dashmap::DashMap;
+use bytes::Bytes;
 
 /// High-performance in-memory dictionary
 /// 
@@ -15,7 +16,7 @@ use dashmap::DashMap;
 #[derive(Default)]
 pub struct Dict {
     /// Concurrent DashMap for optimal performance (sharded locking)
-    pub(crate) inner: DashMap<Vec<u8>, Value>,
+    pub(crate) inner: DashMap<Bytes, Value>,
 }
 
 impl Dict {
@@ -40,10 +41,10 @@ impl Dict {
     /// If key already exists, the old value is replaced.
     /// 
     /// # Arguments
-    /// * `k` - Key as owned byte vector
+    /// * `k` - Key as owned Bytes
     /// * `v` - Value to store
     #[inline]
-    pub fn set(&self, k: Vec<u8>, v: Value) {
+    pub fn set(&self, k: Bytes, v: Value) {
         self.inner.insert(k, v);
     }
     
@@ -68,14 +69,14 @@ impl Dict {
     /// The old key is deleted and the new key gets the value.
     /// 
     /// # Arguments
-    /// * `from` - Current key name as owned byte vector
-    /// * `to` - New key name as owned byte vector
+    /// * `from` - Current key name as owned Bytes
+    /// * `to` - New key name as owned Bytes
     /// 
     /// # Returns
     /// * `true` if rename was successful
     /// * `false` if source key didn't exist
     #[inline]
-    pub fn rename(&self, from: Vec<u8>, to: Vec<u8>) -> bool {
+    pub fn rename(&self, from: Bytes, to: Bytes) -> bool {
         // Handle edge case where source and destination are the same
         if from == to {
             return true;
@@ -108,7 +109,11 @@ impl Dict {
     /// Atomically increment an integer-like value stored under key, creating it if missing
     pub fn incr(&self, k: &[u8]) -> i64 {
         use dashmap::mapref::entry::Entry;
-        match self.inner.entry(k.to_vec()) {
+        // We need to convert slice to Bytes for entry API if we insert
+        // But DashMap entry API requires owned key.
+        // We can't avoid allocation/clone here if we use entry API with a slice input.
+        // So we accept the cost for INCR.
+        match self.inner.entry(Bytes::copy_from_slice(k)) {
             Entry::Occupied(mut e) => match e.get_mut() {
                 Value::Int(i) => {
                     *i += 1;
@@ -120,7 +125,8 @@ impl Dict {
                         .and_then(|x| x.parse::<i64>().ok())
                         .unwrap_or(0);
                     n += 1;
-                    *s = n.to_string().into_bytes();
+                    // Optimize: Store as Int now!
+                    *e.get_mut() = Value::Int(n);
                     n
                 }
                 _ => 0,

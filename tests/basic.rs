@@ -1,22 +1,23 @@
 use ignix::*;
+use bytes::Bytes;
 
 #[test]
 fn set_get_del_cycle() {
     let shard = Shard::new(0, None);
     assert_eq!(
-        String::from_utf8_lossy(&shard.exec(Cmd::Set(b"a".to_vec(), b"1".to_vec()))),
+        String::from_utf8_lossy(&shard.exec(Cmd::Set(Bytes::from_static(b"a"), Bytes::from_static(b"1")))),
         "+OK\r\n"
     );
     assert_eq!(
-        String::from_utf8_lossy(&shard.exec(Cmd::Get(b"a".to_vec()))),
+        String::from_utf8_lossy(&shard.exec(Cmd::Get(Bytes::from_static(b"a")))),
         "$1\r\n1\r\n"
     );
     assert_eq!(
-        String::from_utf8_lossy(&shard.exec(Cmd::Del(b"a".to_vec()))),
+        String::from_utf8_lossy(&shard.exec(Cmd::Del(Bytes::from_static(b"a")))),
         ":1\r\n"
     );
     assert_eq!(
-        String::from_utf8_lossy(&shard.exec(Cmd::Get(b"a".to_vec()))),
+        String::from_utf8_lossy(&shard.exec(Cmd::Get(Bytes::from_static(b"a")))),
         "$-1\r\n"
     );
 }
@@ -24,15 +25,15 @@ fn set_get_del_cycle() {
 #[test]
 fn rename_exists_incr() {
     let s = Shard::new(0, None);
-    s.exec(Cmd::Set(b"x".to_vec(), b"41".to_vec()));
+    s.exec(Cmd::Set(Bytes::from_static(b"x"), Bytes::from_static(b"41")));
     assert_eq!(
-        s.exec(Cmd::Exists(b"x".to_vec())),
+        s.exec(Cmd::Exists(Bytes::from_static(b"x"))),
         protocol::resp_integer(1)
     );
-    assert_eq!(s.exec(Cmd::Incr(b"x".to_vec())), protocol::resp_integer(42));
+    assert_eq!(s.exec(Cmd::Incr(Bytes::from_static(b"x"))), protocol::resp_integer(42));
     assert_eq!(
-        s.exec(Cmd::Rename(b"x".to_vec(), b"y".to_vec())),
+        s.exec(Cmd::Rename(Bytes::from_static(b"x"), Bytes::from_static(b"y"))),
         protocol::resp_simple("OK")
     );
-    assert_eq!(s.exec(Cmd::Get(b"y".to_vec())), protocol::resp_bulk(b"42"));
+    assert_eq!(s.exec(Cmd::Get(Bytes::from_static(b"y"))), protocol::resp_bulk(b"42"));
 }

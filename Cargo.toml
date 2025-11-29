@@ -39,6 +39,7 @@ hashbrown = "0.14"
 dashmap = "6"
 rustc-hash = "1"
 mimalloc = { version = "0.1", default-features = false }
+smol_str = "0.3.4"
 
 
 [dev-dependencies]

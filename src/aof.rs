@@ -153,6 +153,8 @@ pub fn emit_aof_incr(k: &[u8]) -> Vec<u8> {
     .into_bytes()
 }
 
+use bytes::Bytes;
+
 /// Generate AOF entry for MSET command
 /// 
 /// Creates a RESP-formatted MSET command for AOF logging.
@@ -160,7 +162,7 @@ pub fn emit_aof_incr(k: &[u8]) -> Vec<u8> {
 /// 
 /// # Arguments
 /// * `pairs` - Vector of (key, value) byte pairs
-pub fn emit_aof_mset(pairs: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+pub fn emit_aof_mset(pairs: &[(Bytes, Bytes)]) -> Vec<u8> {
     // Calculate total arguments: command + (key + value) * pairs
     let mut s = format!("*{}\r\n$4\r\nMSET\r\n", 1 + pairs.len() * 2);
     

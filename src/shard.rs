@@ -58,8 +58,8 @@ impl Shard {
             Cmd::Get(k) => match self.dict.get(&k) {
                 // Return string/blob values as bulk strings
                 Some(Value::Str(v)) | Some(Value::Blob(v)) => resp_bulk(&v),
-                // Return integer values as RESP integers
-                Some(Value::Int(i)) => resp_integer(i),
+                // Return integer values as Bulk Strings (Redis protocol requirement for GET)
+                Some(Value::Int(i)) => resp_bulk(i.to_string().as_bytes()),
                 // Return null if key doesn't exist
                 None => resp_null(),
             },
@@ -72,9 +72,23 @@ impl Shard {
                     a.write(&emit_aof_set(&k, &v));
                 }
 
-                // Store the value as a string
-                // Move k and v directly into the dictionary to avoid cloning
-                self.dict.set(k, Value::Str(v));
+                // Optimization: Try to store as integer if possible
+                // Fast fail: Integers fit in 20 chars and start with digit or '-'
+                let val = if v.len() <= 20 && !v.is_empty() && (v[0].is_ascii_digit() || v[0] == b'-') {
+                     if let Ok(s) = std::str::from_utf8(&v) {
+                        if let Ok(i) = s.parse::<i64>() {
+                            Value::Int(i)
+                        } else {
+                            Value::Str(v)
+                        }
+                    } else {
+                        Value::Str(v)
+                    }
+                } else {
+                    Value::Str(v)
+                };
+
+                self.dict.set(k, val);
                 
                 resp_simple("OK")
             }
@@ -145,7 +159,7 @@ impl Shard {
                 for k in keys {
                     let b = match self.dict.get(&k) {
                         Some(Value::Str(v)) | Some(Value::Blob(v)) => resp_bulk(&v),
-                        Some(Value::Int(i)) => resp_integer(i),
+                        Some(Value::Int(i)) => resp_bulk(i.to_string().as_bytes()),
                         None => resp_null(),
                     };
                     items.push(b);
@@ -164,7 +178,22 @@ impl Shard {
 
                 // Set all key-value pairs
                 for (k, v) in pairs {
-                    self.dict.set(k, Value::Str(v));
+                    // Optimization: Try to store as integer if possible
+                    // Fast fail: Integers fit in 20 chars and start with digit or '-'
+                    let val = if v.len() <= 20 && !v.is_empty() && (v[0].is_ascii_digit() || v[0] == b'-') {
+                        if let Ok(s) = std::str::from_utf8(&v) {
+                            if let Ok(i) = s.parse::<i64>() {
+                                Value::Int(i)
+                            } else {
+                                Value::Str(v)
+                            }
+                        } else {
+                            Value::Str(v)
+                        }
+                    } else {
+                        Value::Str(v)
+                    };
+                    self.dict.set(k, val);
                 }
                 
                 resp_simple("OK")
