@@ -261,7 +261,7 @@ def plot_comparison(results: List[BenchmarkResult], output_dir: str):
     
     df = pd.DataFrame(data)
     sns.barplot(data=df, x="Server", y="Throughput", palette="viridis")
-    plt.title("Real-World Scenario Throughput (Session Store)")
+    plt.title("Real-World Scenario Throughput (Session Store) - Higher is Better")
     plt.ylabel("Requests / Second")
     plt.savefig(f"{output_dir}/real_world_throughput.png")
     plt.close()
@@ -280,7 +280,7 @@ def plot_comparison(results: List[BenchmarkResult], output_dir: str):
             
     df_lat = pd.DataFrame(lat_data)
     sns.boxplot(data=df_lat, x="Type", y="Latency", hue="Server", palette="viridis", showfliers=False)
-    plt.title("Latency Distribution by Operation Type")
+    plt.title("Latency Distribution by Operation Type (Lower is Better)")
     plt.ylabel("Latency (ms)")
     plt.savefig(f"{output_dir}/real_world_latency.png")
     plt.close()

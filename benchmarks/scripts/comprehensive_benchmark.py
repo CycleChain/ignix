@@ -237,7 +237,7 @@ def plot_results(results: List[BenchmarkResult], output_dir: str):
     
     df = pd.DataFrame(data)
     sns.barplot(data=df, x="Operation", y="Throughput", hue="Server", palette="viridis")
-    plt.title("Throughput Comparison (Ops/Sec)")
+    plt.title("Throughput Comparison (Ops/Sec) - Higher is Better")
     plt.ylabel("Operations / Second")
     plt.savefig(f"{output_dir}/throughput.png")
     plt.close()
@@ -287,7 +287,7 @@ def plot_results(results: List[BenchmarkResult], output_dir: str):
         subset = [d for d in p_data if d["Scenario"] == sc]
         subset_df = pd.DataFrame(subset)
         sns.lineplot(data=subset_df, x="Percentile", y="Latency (ms)", hue="Server", marker="o")
-        plt.title(f"Tail Latency - {sc}")
+        plt.title(f"Tail Latency - {sc} (Lower is Better)")
         plt.yscale("log")
         plt.savefig(f"{output_dir}/tail_latency_{sc.replace(' ', '_')}.png")
         plt.close()

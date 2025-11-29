@@ -85,12 +85,37 @@ pub fn run_shard(_shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()>
         let shard_cl = Arc::clone(&shard);
         let waker_cl = Arc::clone(&waker);
         std::thread::spawn(move || {
-            while let Ok((tok, cmd)) = rx_task_cl.recv() {
+            loop {
+                // Block waiting for the first task
+                let (tok, cmd) = match rx_task_cl.recv() {
+                    Ok(x) => x,
+                    Err(_) => break, // Channel closed
+                };
+
+                // Execute the first command
                 let resp = shard_cl.exec(cmd);
-                // Best-effort send back response
-                if tx_resp_cl.send((tok, resp)).is_ok() {
-                    let _ = waker_cl.wake();
+                if tx_resp_cl.send((tok, resp)).is_err() {
+                    break;
                 }
+
+                // Opportunistically process more tasks (batching) to amortize wake cost
+                // This significantly reduces syscalls under load
+                let mut count = 0;
+                while count < 16 {
+                    match rx_task_cl.try_recv() {
+                        Ok((t, c)) => {
+                            let r = shard_cl.exec(c);
+                            if tx_resp_cl.send((t, r)).is_err() {
+                                return;
+                            }
+                            count += 1;
+                        }
+                        Err(_) => break, // Empty or disconnected
+                    }
+                }
+
+                // Wake the main thread only once per batch
+                let _ = waker_cl.wake();
             }
         });
     }
