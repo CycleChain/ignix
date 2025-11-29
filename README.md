@@ -18,13 +18,14 @@ Ignix (from "Ignite" + "Index") is a blazing-fast, Redis-protocol compatible key
 
 ## 🏗️ Architecture
 
-Ignix v0.2.0 architecture:
+Ignix v0.3.0 architecture:
 
-- **RESP Protocol**: Full Redis Serialization Protocol support
-- **Reactor + Workers**: mio reactor handles I/O; workers execute commands
-- **Immediate Wakeups**: Workers signal the reactor via `mio::Waker` for writes
-- **Concurrent Storage**: `DashMap<Vec<u8>, Value>` (sharded locking)
-- **AOF Persistence**: Dedicated thread, bounded channel, periodic fsync
+- **Multi-Reactor (Thread-per-Core)**: Uses `SO_REUSEPORT` to spawn N independent worker threads (one per CPU core).
+- **Shared Nothing**: Each thread has its own event loop (`mio::Poll`) and handles connections independently.
+- **Zero-Lock Networking**: No shared listener lock; kernel distributes incoming connections.
+- **RESP Protocol**: Full Redis Serialization Protocol support with optimized SWAR parsing.
+- **Concurrent Storage**: `DashMap<Bytes, Value>` (sharded locking) for high-concurrency data access.
+- **AOF Persistence**: Dedicated thread, bounded channel, periodic fsync.
 
 ## 🚀 Quick Start
 
@@ -142,7 +143,7 @@ print(r.get('hello'))  # Output: world
 
 ## 📊 Performance
 
-Benchmarks reflect Ignix v0.2.0. Full raw results are in `benchmark_results/benchmark_results.json`.
+Benchmarks reflect Ignix v0.3.0. Full raw results are in `benchmarks/results/`.
 
 ### SET Throughput (ops/sec)
 
