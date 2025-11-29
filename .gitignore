@@ -83,3 +83,4 @@ devnotes
 
 # Benchmark results (new structure)
 benchmarks/results/
+*.txt

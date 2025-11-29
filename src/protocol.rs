@@ -73,6 +73,9 @@ pub fn parse_one(data: &[u8]) -> Result<Option<(usize, Cmd)>> {
     
     // Read the number of array elements
     let (i, n) = read_decimal_line(&data[1..])?;
+    if i == 0 {
+        return Ok(None);
+    }
     let mut cursor = 1 + i;
     
     if n <= 0 {
@@ -96,6 +99,9 @@ pub fn parse_one(data: &[u8]) -> Result<Option<(usize, Cmd)>> {
         
         // Read the length of this bulk string
         let (i2, len) = read_decimal_line(&data[cursor + 1..])?;
+        if i2 == 0 {
+            return Ok(None);
+        }
         cursor += 1 + i2;
         
         // Calculate total bytes needed (length + \r\n)

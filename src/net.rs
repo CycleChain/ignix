@@ -10,279 +10,185 @@ use crate::protocol::{parse_many, resp_simple, Cmd};
 use crate::shard::Shard;
 use anyhow::*;
 use bytes::BytesMut;
-use crossbeam::channel::{bounded, Receiver, Sender, TryRecvError};
 use hashbrown::HashMap;
 use mio::net::{TcpListener, TcpStream};
-use mio::{Events, Interest, Poll, Token, Waker};
+use mio::{Events, Interest, Poll, Token};
 use std::io::{Read, Write};
 use std::net::SocketAddr;
 use std::result::Result::{Ok, Err};
-use std::time::Duration;
 use std::sync::Arc;
 
 /// Size of read buffer for incoming data
 const READ_BUF: usize = 4096;
 
-/// Bind a TCP listener with potential SO_REUSEPORT support
+use socket2::{Socket, Domain, Type, Protocol};
+
+/// Bind a TCP listener with SO_REUSEPORT support
 /// 
-/// Currently uses standard mio TcpListener binding. SO_REUSEPORT
-/// support can be added later for better multi-process scaling.
-/// 
-/// # Arguments
-/// * `addr` - Socket address to bind to
-/// 
-/// # Returns
-/// * Bound TcpListener ready for accepting connections
+/// Uses socket2 to set SO_REUSEPORT, allowing multiple threads to bind
+/// to the same port and share the incoming connection load (kernel load balancing).
 pub fn bind_reuseport(addr: SocketAddr) -> Result<TcpListener> {
-    // For now, let's use the simpler mio TcpListener::bind
-    // TODO: Add SO_REUSEPORT support for better scaling
-    Ok(TcpListener::bind(addr)?)
+    let domain = match addr {
+        SocketAddr::V4(_) => Domain::IPV4,
+        SocketAddr::V6(_) => Domain::IPV6,
+    };
+    
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    
+    #[cfg(unix)]
+    {
+        socket.set_reuse_address(true)?;
+        socket.set_reuse_port(true)?;
+    }
+    
+    socket.set_nonblocking(true)?;
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    
+    Ok(TcpListener::from_std(socket.into()))
 }
 
-/// Run the main server event loop for a shard
+/// Run the main server with Multi-Reactor architecture
 /// 
-/// This is the core of the Ignix server - an async event loop that handles
-/// all client connections, command parsing, and response writing using mio
-/// for high-performance non-blocking I/O.
-/// 
-/// # Arguments
-/// * `shard_id` - Identifier for this shard (currently unused)
-/// * `addr` - Address to bind the server to
-/// * `shard` - Shard instance to execute commands on
-/// 
-/// # Architecture
-/// * Uses Token(0) for the listening socket
-/// * Each client gets a unique token starting from 1
-/// * Maintains read/write buffers for each client
-/// * Processes commands immediately when complete
+/// Spawns one thread per CPU core. Each thread runs its own event loop
+/// and accepts connections on the shared port (via SO_REUSEPORT).
 pub fn run_shard(_shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> {
-    // Create the main event loop components
+    let shard = Arc::new(shard);
+    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
+    
+    println!("🚀 Starting Ignix with {} worker threads (Multi-Reactor)", threads);
+    
+    let mut handles = Vec::new();
+    
+    for id in 0..threads {
+        let shard = shard.clone();
+        let addr = addr;
+        handles.push(std::thread::spawn(move || {
+            if let Err(e) = run_worker_loop(id, addr, shard) {
+                eprintln!("Worker {} failed: {}", id, e);
+            }
+        }));
+    }
+    
+    // Wait for all threads (they should run forever)
+    for h in handles {
+        h.join().unwrap();
+    }
+    
+    Ok(())
+}
+
+/// Main event loop for a single worker thread
+fn run_worker_loop(id: usize, addr: SocketAddr, shard: Arc<Shard>) -> Result<()> {
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(1024);
-    let mut listener = bind_reuseport(addr)?;
-    const LISTENER: Token = Token(0);
-    const WAKER_TOKEN: Token = Token(usize::MAX - 1);
     
-    // Register the listener socket for accepting new connections
-    poll.registry()
-        .register(&mut listener, LISTENER, Interest::READABLE)?;
-
-    // Channels for offloading command execution to worker threads
-    let (tx_task, rx_task): (Sender<(usize, Cmd)>, Receiver<(usize, Cmd)>) = bounded(1024);
-    let (tx_resp, rx_resp): (Sender<(usize, Vec<u8>)>, Receiver<(usize, Vec<u8>)>) = bounded(1024);
-
-    // Waker to notify reactor when responses are ready
-    let waker = Arc::new(Waker::new(poll.registry(), WAKER_TOKEN)?);
-
-    // Shared shard for workers (thread-safe storage inside)
-    let shard = Arc::new(shard);
-
-    // Spawn worker threads
-    let workers = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4);
-    for _ in 0..workers {
-        let rx_task_cl = rx_task.clone();
-        let tx_resp_cl = tx_resp.clone();
-        let shard_cl = Arc::clone(&shard);
-        let waker_cl = Arc::clone(&waker);
-        std::thread::spawn(move || {
-            loop {
-                // Block waiting for the first task
-                let (tok, cmd) = match rx_task_cl.recv() {
-                    Ok(x) => x,
-                    Err(_) => break, // Channel closed
-                };
-
-                // Execute the first command
-                let resp = shard_cl.exec(cmd);
-                if tx_resp_cl.send((tok, resp)).is_err() {
-                    break;
-                }
-
-                // Opportunistically process more tasks (batching) to amortize wake cost
-                // This significantly reduces syscalls under load
-                let mut count = 0;
-                while count < 16 {
-                    match rx_task_cl.try_recv() {
-                        Ok((t, c)) => {
-                            let r = shard_cl.exec(c);
-                            if tx_resp_cl.send((t, r)).is_err() {
-                                return;
-                            }
-                            count += 1;
-                        }
-                        Err(_) => break, // Empty or disconnected
-                    }
-                }
-
-                // Wake the main thread only once per batch
-                let _ = waker_cl.wake();
-            }
-        });
-    }
-
-    // Client connection storage: token -> (socket, read_buffer, write_buffer, cmd_buffer)
-    // Using SwissTable for better performance than std HashMap
+    // Each worker binds its own listener to the same port (SO_REUSEPORT)
+    let mut listener = bind_reuseport(addr)?;
+    
+    const LISTENER: Token = Token(0);
+    poll.registry().register(&mut listener, LISTENER, Interest::READABLE)?;
+    
+    // Client state: (socket, read_buf, write_buf, cmd_buf)
     let mut clients: HashMap<usize, (TcpStream, BytesMut, BytesMut, Vec<Cmd>)> = HashMap::new();
     let mut next_tok: usize = 1;
+    
+    // Buffer for reading from socket
+    let mut tmp_buf = [0u8; READ_BUF];
 
-    // Main event loop
     loop {
-        // Poll for events with 200ms timeout
-        poll.poll(&mut events, Some(Duration::from_millis(200)))?;
+        poll.poll(&mut events, None)?;
         
         for ev in events.iter() {
             match ev.token() {
-                // Listener socket, accept new connections
                 LISTENER => loop {
                     match listener.accept() {
                         Ok((mut sock, _)) => {
-                            // Enable TCP_NODELAY for lower latency
                             sock.set_nodelay(true).ok();
-                            
-                            // Assign unique token to this client
                             let tok = next_tok;
-                            next_tok += 1;
-                            
-                            // Register client socket for read/write events
+                            next_tok = next_tok.wrapping_add(1);
+                            if next_tok == 0 { next_tok = 1; } // Skip 0 (LISTENER)
+
+                            // Register client socket for READABLE only initially
                             poll.registry().register(
                                 &mut sock,
                                 Token(tok),
-                                Interest::READABLE | Interest::WRITABLE,
+                                Interest::READABLE,
                             )?;
                             
-                            // Store client with read/write buffers
-                            clients.insert(
-                                tok,
-                                (sock, BytesMut::with_capacity(READ_BUF), BytesMut::new(), Vec::with_capacity(32)),
-                            );
+                            // println!("Worker {} accepted connection {}", id, tok);
+                            clients.insert(tok, (sock, BytesMut::with_capacity(READ_BUF), BytesMut::new(), Vec::with_capacity(32)));
                         }
-                        // No more connections to accept right now
                         Err(ref e) if would_block(e) => break,
                         Err(e) => {
-                            eprintln!("accept err: {e}");
+                            eprintln!("Worker {} accept err: {}", id, e);
                             break;
                         }
                     }
                 },
-                
-                // Waker notifications from workers
-                WAKER_TOKEN => {
-                    // Drain all available responses and try to flush immediately
-                    loop {
-                        match rx_resp.try_recv() {
-                            Ok((token_usize, out)) => {
-                                if let Some((sock, _r, w, _)) = clients.get_mut(&token_usize) {
-                                    w.extend_from_slice(&out);
-                                    if !w.is_empty() {
-                                        match sock.write(&w) {
-                                            Ok(n) => {
-                                                let _ = w.split_to(n);
-                                            }
-                                            Err(ref e) if would_block(e) => {}
-                                            Err(_) => {
-                                                // ignore here; regular writable path will clean up
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Err(TryRecvError::Empty) => break,
-                            Err(TryRecvError::Disconnected) => break,
-                        }
-                    }
-                }
-
-                // Client socket events
                 Token(t) => {
                     let mut should_remove = false;
-                    
                     if let Some((sock, rbuf, wbuf, cmds)) = clients.get_mut(&t) {
-                        // Handle readable events (incoming data)
+                        // READ
                         if ev.is_readable() {
-                            let mut tmp = [0u8; READ_BUF];
-                            
-                            // Read all available data
                             loop {
-                                match sock.read(&mut tmp) {
-                                    // Connection closed by client
-                                    Ok(0) => {
-                                        should_remove = true;
-                                        break;
-                                    }
-                                    // Data received, add to read buffer
+                                match sock.read(&mut tmp_buf) {
+                                    Ok(0) => { should_remove = true; break; }
                                     Ok(n) => {
-                                        rbuf.extend_from_slice(&tmp[..n]);
+                                        // println!("Worker {} read {} bytes from {}", id, n, t);
+                                        rbuf.extend_from_slice(&tmp_buf[..n]);
                                     }
-                                    // No more data available right now
                                     Err(ref e) if would_block(e) => break,
-                                    // Connection error
-                                    Err(_) => {
-                                        should_remove = true;
-                                        break;
-                                    }
+                                    Err(_) => { should_remove = true; break; }
                                 }
                             }
                             
-                            // Process any complete commands in the read buffer
+                            // PARSE & EXECUTE (Inline)
                             if !should_remove {
-                                // Reuse the command vector
                                 cmds.clear();
-                                
-                                // Try to parse RESP commands from buffer
                                 if let Err(e) = parse_many(rbuf, cmds) {
-                                    // Protocol error, send error response
                                     wbuf.extend_from_slice(&resp_simple(&format!("ERR {}", e)));
                                 } else {
-                                    // Offload each parsed command to workers
-                                    for c in cmds.drain(..) {
-                                        match tx_task.try_send((t, c)) {
-                                            Ok(_) => {}
-                                            Err(_) => {
-                                                // Backpressure: queue a busy error
-                                                wbuf.extend_from_slice(b"-ERR server busy\r\n");
-                                            }
-                                        }
+                                    for cmd in cmds.drain(..) {
+                                        let resp = shard.exec(cmd);
+                                        wbuf.extend_from_slice(&resp);
                                     }
                                 }
                                 
-                                // Try to write response immediately if we have data
+                                // Try to write immediately
                                 if !wbuf.is_empty() {
-                                    match sock.write(&wbuf) {
-                                        Ok(n) => {
-                                            // Remove written bytes from buffer
-                                            let _ = wbuf.split_to(n);
-                                        }
-                                        // Socket not ready for writing, will retry later
-                                        Err(ref e) if would_block(e) => {
-                                            // Will retry on writable event
-                                        }
-                                        // Write error
-                                        Err(_) => {
-                                            should_remove = true;
-                                        }
+                                    match sock.write(wbuf) {
+                                        Ok(n) => { let _ = wbuf.split_to(n); }
+                                        Err(ref e) if would_block(e) => {}
+                                        Err(_) => { should_remove = true; }
                                     }
                                 }
                             }
                         }
                         
-                        // Handle writable events (can send more data)
+                        // WRITE
                         if !should_remove && ev.is_writable() && !wbuf.is_empty() {
-                            match sock.write(&wbuf) {
-                                Ok(n) => {
-                                    // Remove written bytes from buffer
-                                    let _ = wbuf.split_to(n);
-                                }
-                                // Socket not ready, will retry later
+                            match sock.write(wbuf) {
+                                Ok(n) => { let _ = wbuf.split_to(n); }
                                 Err(ref e) if would_block(e) => {}
-                                // Write error
-                                Err(_) => {
-                                    should_remove = true;
-                                }
+                                Err(_) => { should_remove = true; }
+                            }
+                        }
+                        
+                        // Update Interest based on wbuf state
+                        if !should_remove {
+                            let interest = if wbuf.is_empty() {
+                                Interest::READABLE
+                            } else {
+                                Interest::READABLE | Interest::WRITABLE
+                            };
+                            
+                            if let Err(_) = poll.registry().reregister(sock, Token(t), interest) {
+                                should_remove = true;
                             }
                         }
                     }
                     
-                    // Clean up disconnected clients
                     if should_remove {
                         clients.remove(&t);
                     }
@@ -293,9 +199,6 @@ pub fn run_shard(_shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()>
 }
 
 /// Check if an I/O error indicates the operation would block
-/// 
-/// Helper function to identify non-blocking I/O conditions that
-/// should be retried later rather than treated as errors.
 #[inline]
 fn would_block(e: &std::io::Error) -> bool {
     matches!(
