@@ -26,6 +26,10 @@ fn main() -> Result<()> {
     // Example: RUST_LOG=debug cargo run --release
     env_logger::init();
     
+    // Parse arguments
+    let args: Vec<String> = std::env::args().collect();
+    let use_uring = args.iter().any(|a| a == "--backend=uring");
+
     // Parse the default server address (0.0.0.0:7379)
     let addr = DEFAULT_ADDR.to_socket_addrs()?.next().unwrap();
     
@@ -40,6 +44,15 @@ fn main() -> Result<()> {
     // Print startup message
     println!("ignix running on {}", addr);
     
+    #[cfg(target_os = "linux")]
+    if use_uring {
+        return net_uring::run_shard(0, addr, shard);
+    }
+
+    if use_uring {
+        eprintln!("Warning: io_uring backend is only available on Linux. Falling back to mio/epoll.");
+    }
+
     // Start the main server event loop
     // This call blocks until the server is shut down
     net::run_shard(0, addr, shard)

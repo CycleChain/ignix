@@ -1,4 +1,5 @@
 // Core modules for Ignix key-value store
+pub mod net_uring;
 pub mod protocol; // RESP parser + encoders + Cmd enum
 pub mod storage; // Dict + Value types for in-memory storage
 pub mod aof; // AOF writer + emit helpers for persistence

@@ -18,10 +18,11 @@ Ignix (from "Ignite" + "Index") is a blazing-fast, Redis-protocol compatible key
 
 ## 🏗️ Architecture
 
-Ignix v0.3.1 architecture:
+Ignix v0.3.2 architecture:
 
 - **Multi-Reactor (Thread-per-Core)**: Uses `SO_REUSEPORT` to spawn N independent worker threads (one per CPU core).
-- **Shared Nothing**: Each thread has its own event loop (`mio::Poll`) and handles connections independently.
+- **Pluggable Backend**: Supports both `mio` (epoll/kqueue) and `io_uring` (Linux only) backends.
+- **Shared Nothing**: Each thread has its own event loop and handles connections independently.
 - **Zero-Lock Networking**: No shared listener lock; kernel distributes incoming connections.
 - **Zero-Copy Response**: Responses are written directly to the network buffer, avoiding intermediate allocations.
 - **RESP Protocol**: Full Redis Serialization Protocol support with optimized SWAR parsing.
@@ -47,6 +48,8 @@ cargo build --release
 
 ```bash
 cargo run --release
+# Or enable io_uring backend (Linux only)
+cargo run --release -- --backend=uring
 ```
 
 The server will start on `0.0.0.0:7379` by default.
