@@ -305,12 +305,23 @@ def main():
     
     configs = []
     # Test Cases
+    # Small sizes: High ops count
     for size in [64, 1024]:
         for op in ["SET", "GET"]:
-            # Redis
             configs.append(BenchmarkConfig("localhost", 6379, "Redis", 1000, 10000, 50, size, op))
-            # Ignix
             configs.append(BenchmarkConfig("localhost", 7379, "Ignix", 1000, 10000, 50, size, op))
+
+    # Medium sizes: Moderate ops count
+    for size in [32 * 1024, 256 * 1024]: # 32KB, 256KB
+        for op in ["SET", "GET"]:
+            configs.append(BenchmarkConfig("localhost", 6379, "Redis", 500, 5000, 20, size, op))
+            configs.append(BenchmarkConfig("localhost", 7379, "Ignix", 500, 5000, 20, size, op))
+
+    # Large sizes: Low ops count
+    for size in [2 * 1024 * 1024]: # 2MB
+        for op in ["SET", "GET"]:
+            configs.append(BenchmarkConfig("localhost", 6379, "Redis", 100, 1000, 10, size, op))
+            configs.append(BenchmarkConfig("localhost", 7379, "Ignix", 100, 1000, 10, size, op))
 
     results = []
     for conf in configs:
