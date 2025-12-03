@@ -220,7 +220,13 @@ def benchmark(config: BenchmarkConfig) -> BenchmarkResult:
     return result
 
 def plot_results(results: List[BenchmarkResult], output_dir: str):
-    if not HAS_PLOTTING: return
+    if not HAS_PLOTTING:
+        print("⚠️  Skipping plot generation: matplotlib/seaborn/pandas not found.")
+        return
+
+    if not results:
+        print("⚠️  Skipping plot generation: No benchmark results to plot.")
+        return
     os.makedirs(output_dir, exist_ok=True)
     
     sns.set_theme(style="whitegrid")

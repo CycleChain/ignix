@@ -83,5 +83,6 @@ devnotes
 
 # Benchmark results (new structure)
 benchmarks/results/
+benchmarks/test_results/
 *.txt
 *.svg

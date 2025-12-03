@@ -41,6 +41,16 @@ def main():
     
     print_header("Ignix Unified Benchmark Runner")
     
+    # Check for plotting dependencies
+    try:
+        import matplotlib
+        import pandas
+        import seaborn
+        import numpy
+    except ImportError as e:
+        print(f"\n⚠️  Warning: Missing dependency for plotting: {e.name}")
+        print("   Graphs will NOT be generated. To fix: pip install matplotlib pandas seaborn numpy")
+    
     # 1. Check Prerequisites
     print("\n🔍 Checking prerequisites...")
     redis_ok = check_server("localhost", 6379, "Redis")

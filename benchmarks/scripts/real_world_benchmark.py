@@ -249,7 +249,13 @@ def benchmark(config: WorkloadConfig) -> BenchmarkResult:
     return result
 
 def plot_comparison(results: List[BenchmarkResult], output_dir: str):
-    if not HAS_DEPS: return
+    if not HAS_DEPS:
+        print("⚠️  Skipping plot generation: numpy/pandas/matplotlib/seaborn not found.")
+        return
+
+    if not results:
+        print("⚠️  Skipping plot generation: No benchmark results to plot.")
+        return
     os.makedirs(output_dir, exist_ok=True)
     sns.set_theme(style="whitegrid")
     

@@ -15,6 +15,7 @@ use crate::storage::Dict;
 /// Each shard has its own storage dictionary and optional AOF handle
 /// for persistence. In the current implementation, Ignix uses a single
 /// shard, but the architecture supports multiple shards for future scaling.
+#[repr(align(64))]
 pub struct Shard {
     /// Unique identifier for this shard
     pub id: usize,
@@ -199,5 +200,15 @@ impl Shard {
                 resp_simple("OK")
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_shard_alignment() {
+        assert_eq!(std::mem::align_of::<Shard>(), 64, "Shard struct should be aligned to 64 bytes");
     }
 }
