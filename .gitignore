@@ -82,6 +82,7 @@ yarn-error.log*
 devnotes
 
 # Benchmark results (new structure)
+benchmark_results
 benchmarks/results/
 benchmarks/test_results/
 *.txt

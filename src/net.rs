@@ -6,7 +6,7 @@
  * using mio for async I/O operations.
  */
 
-use crate::protocol::{parse_many, resp_simple, Cmd};
+use crate::protocol::{parse_many, write_simple, Cmd};
 use crate::shard::Shard;
 use anyhow::*;
 use bytes::BytesMut;
@@ -147,11 +147,10 @@ fn run_worker_loop(id: usize, addr: SocketAddr, shard: Arc<Shard>) -> Result<()>
                             if !should_remove {
                                 cmds.clear();
                                 if let Err(e) = parse_many(rbuf, cmds) {
-                                    wbuf.extend_from_slice(&resp_simple(&format!("ERR {}", e)));
+                                    write_simple(&format!("ERR {}", e), wbuf);
                                 } else {
                                     for cmd in cmds.drain(..) {
-                                        let resp = shard.exec(cmd);
-                                        wbuf.extend_from_slice(&resp);
+                                        shard.exec(cmd, wbuf);
                                     }
                                 }
                                 

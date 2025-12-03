@@ -7,8 +7,9 @@
  */
 
 use crate::aof::{emit_aof_incr, emit_aof_mset, emit_aof_rename, emit_aof_set, AofHandle};
-use crate::protocol::{resp_array, resp_bulk, resp_integer, resp_null, resp_simple, Cmd, Value};
+use crate::protocol::{write_array_len, write_bulk, write_integer, write_null, write_simple, Cmd, Value};
 use crate::storage::Dict;
+use bytes::BytesMut;
 
 /// A shard represents a single execution unit
 /// 
@@ -50,19 +51,28 @@ impl Shard {
     /// 
     /// # Returns
     /// * RESP-formatted response as byte vector
-    pub fn exec(&self, cmd: Cmd) -> Vec<u8> {
+    /// Execute a Redis command and write response directly to buffer
+    /// 
+    /// This is the main entry point for command execution. It handles
+    /// all supported Redis commands, updates the storage, logs to AOF
+    /// if enabled, and writes the RESP response directly to the output buffer.
+    /// 
+    /// # Arguments
+    /// * `cmd` - Parsed Redis command to execute
+    /// * `out` - Buffer to write response to
+    pub fn exec(&self, cmd: Cmd, out: &mut BytesMut) {
         match cmd {
             // PING command - simple connectivity test
-            Cmd::Ping => resp_simple("PONG"),
+            Cmd::Ping => write_simple("PONG", out),
             
             // GET key - retrieve value for key
             Cmd::Get(k) => match self.dict.get(&k) {
                 // Return string/blob values as bulk strings
-                Some(Value::Str(v)) | Some(Value::Blob(v)) => resp_bulk(&v),
+                Some(Value::Str(v)) | Some(Value::Blob(v)) => write_bulk(&v, out),
                 // Return integer values as Bulk Strings (Redis protocol requirement for GET)
-                Some(Value::Int(i)) => resp_bulk(i.to_string().as_bytes()),
+                Some(Value::Int(i)) => write_bulk(i.to_string().as_bytes(), out),
                 // Return null if key doesn't exist
-                None => resp_null(),
+                None => write_null(out),
             },
             
             // SET key value - store key-value pair
@@ -91,53 +101,41 @@ impl Shard {
 
                 self.dict.set(k, val);
                 
-                resp_simple("OK")
+                write_simple("OK", out);
             }
             
             // DEL key - delete key
             Cmd::Del(k) => {
                 // Delete key and return 1 if it existed, 0 if not
                 let removed = self.dict.del(&k) as i64;
-                resp_integer(removed)
+                write_integer(removed, out);
             }
             
             // RENAME oldkey newkey - rename a key
             Cmd::Rename(from, to) => {
-                // Log successful rename to AOF
-                // We do this before moving from and to
-                // Note: We only log if rename is successful, but we need to check existence first
-                // However, checking existence is racy if we don't hold a lock.
-                // For now, let's keep the logic simple and consistent with previous implementation
-                // but we need to clone for AOF if we want to move into rename.
-                
-                // Actually, dict.rename takes ownership.
-                // Let's check if we can optimize this.
-                // If we want to avoid clone, we have to do AOF after, but we lost the keys.
-                // So we probably still need to clone for AOF if enabled.
-                
                 if self.aof.is_some() {
                     let ok = self.dict.rename(from.clone(), to.clone());
                     if ok {
                          if let Some(a) = &self.aof {
                             a.write(&emit_aof_rename(&from, &to));
                         }
-                        resp_simple("OK")
+                        write_simple("OK", out);
                     } else {
-                        resp_simple("ERR no such key")
+                        write_simple("ERR no such key", out);
                     }
                 } else {
                     // No AOF, we can move directly
                     let ok = self.dict.rename(from, to);
                     if ok {
-                        resp_simple("OK")
+                        write_simple("OK", out);
                     } else {
-                        resp_simple("ERR no such key")
+                        write_simple("ERR no such key", out);
                     }
                 }
             }
             
             // EXISTS key - check if key exists
-            Cmd::Exists(k) => resp_integer(self.dict.exists(&k) as i64),
+            Cmd::Exists(k) => write_integer(self.dict.exists(&k) as i64, out),
             
             // INCR key - increment numeric value
             Cmd::Incr(k) => {
@@ -148,26 +146,21 @@ impl Shard {
                     a.write(&emit_aof_incr(&k));
                 }
                 
-                resp_integer(v)
+                write_integer(v, out);
             }
             
             // MGET key1 key2 ... - get multiple keys
             Cmd::MGet(keys) => {
-                // Pre-allocate vector for better performance
-                let mut items = Vec::with_capacity(keys.len());
+                write_array_len(keys.len(), out);
                 
                 // Get each key and format as RESP
                 for k in keys {
-                    let b = match self.dict.get(&k) {
-                        Some(Value::Str(v)) | Some(Value::Blob(v)) => resp_bulk(&v),
-                        Some(Value::Int(i)) => resp_bulk(i.to_string().as_bytes()),
-                        None => resp_null(),
-                    };
-                    items.push(b);
+                    match self.dict.get(&k) {
+                        Some(Value::Str(v)) | Some(Value::Blob(v)) => write_bulk(&v, out),
+                        Some(Value::Int(i)) => write_bulk(i.to_string().as_bytes(), out),
+                        None => write_null(out),
+                    }
                 }
-                
-                // Return as RESP array
-                resp_array(items)
             }
             
             // MSET key1 value1 key2 value2 ... - set multiple key-value pairs
@@ -197,7 +190,7 @@ impl Shard {
                     self.dict.set(k, val);
                 }
                 
-                resp_simple("OK")
+                write_simple("OK", out);
             }
         }
     }

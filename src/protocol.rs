@@ -7,7 +7,7 @@
  */
 
 use anyhow::*;
-use bytes::{Buf, Bytes};
+use bytes::{Buf, Bytes, BytesMut, BufMut};
 
 /// Redis-compatible commands supported by Ignix
 /// 
@@ -326,4 +326,48 @@ pub fn resp_array(items: Vec<Vec<u8>>) -> Vec<u8> {
         out.extend_from_slice(&it);
     }
     out
+}
+
+// Zero-copy writers
+
+/// Write a simple string response (+OK\r\n) directly to buffer
+pub fn write_simple(s: &str, out: &mut BytesMut) {
+    out.reserve(1 + s.len() + 2);
+    out.put_u8(b'+');
+    out.put_slice(s.as_bytes());
+    out.put_slice(b"\r\n");
+}
+
+/// Write a bulk string response ($<len>\r\n<data>\r\n) directly to buffer
+pub fn write_bulk(b: &[u8], out: &mut BytesMut) {
+    let len_str = b.len().to_string();
+    out.reserve(1 + len_str.len() + 2 + b.len() + 2);
+    out.put_u8(b'$');
+    out.put_slice(len_str.as_bytes());
+    out.put_slice(b"\r\n");
+    out.put_slice(b);
+    out.put_slice(b"\r\n");
+}
+
+/// Write a null response ($-1\r\n) directly to buffer
+pub fn write_null(out: &mut BytesMut) {
+    out.extend_from_slice(b"$-1\r\n");
+}
+
+/// Write an integer response (:<number>\r\n) directly to buffer
+pub fn write_integer(i: i64, out: &mut BytesMut) {
+    let i_str = i.to_string();
+    out.reserve(1 + i_str.len() + 2);
+    out.put_u8(b':');
+    out.put_slice(i_str.as_bytes());
+    out.put_slice(b"\r\n");
+}
+
+/// Write array length header (*<count>\r\n) directly to buffer
+pub fn write_array_len(n: usize, out: &mut BytesMut) {
+    let len_str = n.to_string();
+    out.reserve(1 + len_str.len() + 2);
+    out.put_u8(b'*');
+    out.put_slice(len_str.as_bytes());
+    out.put_slice(b"\r\n");
 }

@@ -65,7 +65,7 @@ def main():
     # 2. Run Basic Benchmark
     print_header("Running Basic Benchmark")
     run_command(
-        [sys.executable, "basic_benchmark.py", "--output-dir", os.path.join(results_dir, "basic"), "--skip-plots"],
+        [sys.executable, "basic_benchmark.py", "--output-dir", os.path.join(results_dir, "basic")],
         cwd=scripts_dir
     )
 
