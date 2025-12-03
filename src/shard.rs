@@ -40,17 +40,6 @@ impl Shard {
         }
     }
     
-    /// Execute a Redis command and return the RESP-formatted response
-    /// 
-    /// This is the main entry point for command execution. It handles
-    /// all supported Redis commands, updates the storage, logs to AOF
-    /// if enabled, and returns the appropriate RESP response.
-    /// 
-    /// # Arguments
-    /// * `cmd` - Parsed Redis command to execute
-    /// 
-    /// # Returns
-    /// * RESP-formatted response as byte vector
     /// Execute a Redis command and write response directly to buffer
     /// 
     /// This is the main entry point for command execution. It handles

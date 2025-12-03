@@ -135,7 +135,6 @@ fn run_worker_loop(id: usize, addr: SocketAddr, shard: Arc<Shard>) -> Result<()>
                                 match sock.read(&mut tmp_buf) {
                                     Ok(0) => { should_remove = true; break; }
                                     Ok(n) => {
-                                        // println!("Worker {} read {} bytes from {}", id, n, t);
                                         rbuf.extend_from_slice(&tmp_buf[..n]);
                                     }
                                     Err(ref e) if would_block(e) => break,
