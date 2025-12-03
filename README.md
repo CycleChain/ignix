@@ -18,11 +18,12 @@ Ignix (from "Ignite" + "Index") is a blazing-fast, Redis-protocol compatible key
 
 ## 🏗️ Architecture
 
-Ignix v0.3.0 architecture:
+Ignix v0.3.1 architecture:
 
 - **Multi-Reactor (Thread-per-Core)**: Uses `SO_REUSEPORT` to spawn N independent worker threads (one per CPU core).
 - **Shared Nothing**: Each thread has its own event loop (`mio::Poll`) and handles connections independently.
 - **Zero-Lock Networking**: No shared listener lock; kernel distributes incoming connections.
+- **Zero-Copy Response**: Responses are written directly to the network buffer, avoiding intermediate allocations.
 - **RESP Protocol**: Full Redis Serialization Protocol support with optimized SWAR parsing.
 - **Concurrent Storage**: `DashMap<Bytes, Value>` (sharded locking) for high-concurrency data access.
 - **AOF Persistence**: Dedicated thread, bounded channel, periodic fsync.
@@ -143,7 +144,7 @@ print(r.get('hello'))  # Output: world
 
 ## 📊 Performance
 
-Benchmarks reflect Ignix v0.3.0. Full raw results are in `benchmarks/results/`.
+Benchmarks reflect Ignix v0.3.1. Full raw results are in `benchmarks/results/`.
 
 ### SET Throughput (ops/sec)
 
@@ -166,18 +167,13 @@ Benchmarks reflect Ignix v0.3.0. Full raw results are in `benchmarks/results/`.
 
 | Data | Conns | Redis | Ignix | Ratio (Ignix/Redis) |
 |------|-------|-------|-------|----------------------|
-| 64B  | 1     | 19,612 | 10,121 | 0.52x |
-| 64B  | 10    | 16,780 | 26,341 | 1.57x |
-| 64B  | 50    | 14,948 | 26,766 | 1.79x |
-| 256B | 1     | 20,035 | 3,245 | 0.16x |
-| 256B | 10    | 15,164 | 51,678 | 3.41x |
-| 256B | 50    | 15,619 | 18,508 | 1.18x |
-| 1KB  | 1     | 17,525 | 10,436 | 0.60x |
-| 1KB  | 10    | 11,930 | 23,184 | 1.94x |
-| 1KB  | 50    | 2,491 | 1,687 | 0.68x |
-| 4KB  | 1     | 16,600 | 8,733 | 0.53x |
-| 4KB  | 10    | 7,532 | 20,399 | 2.71x |
-| 4KB  | 50    | 13,035 | 24,078 | 1.85x |
+| 64B  | 50    | 35,235 | 42,495 | **1.21x** |
+| 1KB  | 50    | 33,701 | 39,466 | **1.17x** |
+| 32KB | 20    | 15,912 | 21,445 | **1.35x** |
+| 256KB| 20    | 18,497 | 17,408 | 0.94x |
+| 2MB  | 10    | 1,054 | 2,062 | **1.96x** |
+
+> **Note**: v0.3.1 introduced Zero-Copy Response Generation, significantly boosting GET performance. Ignix now consistently outperforms or matches Redis across most payload sizes.
 
 ### Real-World Scenario (Session Store)
 

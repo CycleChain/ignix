@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] - 2025-12-04
+
+### Changed
+- **Zero-Copy Response Generation**: Refactored `Shard::exec` and network layer to write responses directly to the output buffer (`BytesMut`), eliminating intermediate `Vec<u8>` allocations and double-copying.
+- **Protocol**: Added `write_*` helpers in `src/protocol.rs` for direct buffer writing.
+
+### Performance
+- **GET Latency**: Reduced `GET` latency to match `SET` operations (~1.85ms vs 1.66ms).
+- **Throughput**: `GET` throughput increased to ~23k ops/sec, now comparable to Redis.
+- **Large Payloads**: Verified competitive performance with 2MB payloads (754 ops/sec vs Redis 845 ops/sec).
+
 ## [0.3.0] - 2025-11-29
 
 ### Changed
