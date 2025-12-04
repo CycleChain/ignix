@@ -298,30 +298,106 @@ def plot_results(results: List[BenchmarkResult], output_dir: str):
         plt.savefig(f"{output_dir}/tail_latency_{sc.replace(' ', '_')}.png")
         plt.close()
 
+def save_results_json(results: List[BenchmarkResult], filename: str):
+    data = []
+    if os.path.exists(filename):
+        try:
+            with open(filename, 'r') as f:
+                data = json.load(f)
+        except:
+            pass
+            
+    for r in results:
+        data.append({
+            "name": r.config.name,
+            "operation": r.config.operation,
+            "data_size": r.config.data_size,
+            "connections": r.config.connections,
+            "ops_per_sec": r.ops_per_sec,
+            "avg_latency": r.avg_latency,
+            "p50": r.percentile(50),
+            "p99": r.percentile(99)
+        })
+        
+    with open(filename, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f"   💾 Results saved to {filename}")
+
+def generate_markdown_table(json_file: str):
+    if not os.path.exists(json_file):
+        print("No results file found.")
+        return
+
+    with open(json_file, 'r') as f:
+        data = json.load(f)
+
+    # Group by size and operation
+    grouped = {}
+    for item in data:
+        key = (item['data_size'], item['operation'])
+        if key not in grouped: grouped[key] = {}
+        grouped[key][item['name']] = item
+
+    print("\n### Benchmark Results Summary\n")
+    print("| Operation | Size | Redis (ops/sec) | Ignix (ops/sec) | Ratio (Ignix/Redis) |")
+    print("|-----------|------|-----------------|-----------------|----------------------|")
+
+    for (size, op), servers in sorted(grouped.items()):
+        redis_res = servers.get('Redis')
+        ignix_res = servers.get('Ignix')
+        
+        r_ops = f"{redis_res['ops_per_sec']:,.0f}" if redis_res else "N/A"
+        i_ops = f"{ignix_res['ops_per_sec']:,.0f}" if ignix_res else "N/A"
+        
+        ratio = "N/A"
+        if redis_res and ignix_res and redis_res['ops_per_sec'] > 0:
+            r = ignix_res['ops_per_sec'] / redis_res['ops_per_sec']
+            ratio = f"{r:.2f}x"
+            if r > 1.1: ratio = f"**{ratio}**"
+            
+        size_str = f"{size}B"
+        if size >= 1024: size_str = f"{size//1024}KB"
+        if size >= 1024*1024: size_str = f"{size//1024//1024}MB"
+        
+        print(f"| {op} | {size_str} | {r_ops} | {i_ops} | {ratio} |")
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", default="comprehensive_results")
+    parser.add_argument("--target", choices=["all", "redis", "ignix"], default="all")
+    parser.add_argument("--json-out", default="benchmark_results.json")
+    parser.add_argument("--report-only", action="store_true")
     args = parser.parse_args()
     
+    if args.report_only:
+        generate_markdown_table(args.json_out)
+        return
+    
     configs = []
+    
+    # Define targets
+    targets = []
+    if args.target in ["all", "redis"]:
+        targets.append(("localhost", 6379, "Redis"))
+    if args.target in ["all", "ignix"]:
+        targets.append(("localhost", 7379, "Ignix"))
+
     # Test Cases
-    # Small sizes: High ops count
-    for size in [64, 1024]:
-        for op in ["SET", "GET"]:
-            configs.append(BenchmarkConfig("localhost", 6379, "Redis", 1000, 10000, 50, size, op))
-            configs.append(BenchmarkConfig("localhost", 7379, "Ignix", 1000, 10000, 50, size, op))
+    for host, port, name in targets:
+        # Small sizes: High ops count
+        for size in [64, 1024]:
+            for op in ["SET", "GET"]:
+                configs.append(BenchmarkConfig(host, port, name, 1000, 10000, 50, size, op))
 
-    # Medium sizes: Moderate ops count
-    for size in [32 * 1024, 256 * 1024]: # 32KB, 256KB
-        for op in ["SET", "GET"]:
-            configs.append(BenchmarkConfig("localhost", 6379, "Redis", 500, 5000, 20, size, op))
-            configs.append(BenchmarkConfig("localhost", 7379, "Ignix", 500, 5000, 20, size, op))
+        # Medium sizes: Moderate ops count
+        for size in [32 * 1024, 256 * 1024]: # 32KB, 256KB
+            for op in ["SET", "GET"]:
+                configs.append(BenchmarkConfig(host, port, name, 500, 5000, 20, size, op))
 
-    # Large sizes: Low ops count
-    for size in [2 * 1024 * 1024]: # 2MB
-        for op in ["SET", "GET"]:
-            configs.append(BenchmarkConfig("localhost", 6379, "Redis", 100, 1000, 10, size, op))
-            configs.append(BenchmarkConfig("localhost", 7379, "Ignix", 100, 1000, 10, size, op))
+        # Large sizes: Low ops count
+        for size in [2 * 1024 * 1024]: # 2MB
+            for op in ["SET", "GET"]:
+                configs.append(BenchmarkConfig(host, port, name, 100, 1000, 10, size, op))
 
     results = []
     for conf in configs:
@@ -331,8 +407,14 @@ def main():
         except Exception as e:
             print(f"❌ Failed: {e}")
 
+    if args.json_out:
+        save_results_json(results, args.json_out)
+
     plot_results(results, args.out)
     print(f"\n✨ Comprehensive benchmark complete. Charts saved to {args.out}/")
+    
+    # Print summary table immediately
+    generate_markdown_table(args.json_out)
 
 if __name__ == "__main__":
     main()

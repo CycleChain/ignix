@@ -291,10 +291,77 @@ def plot_comparison(results: List[BenchmarkResult], output_dir: str):
     plt.savefig(f"{output_dir}/real_world_latency.png")
     plt.close()
 
+def save_results_json(results: List[BenchmarkResult], filename: str):
+    data = []
+    if os.path.exists(filename):
+        try:
+            with open(filename, 'r') as f:
+                data = json.load(f)
+        except:
+            pass
+            
+    for r in results:
+        # Remove existing entry for this server if present to avoid duplicates
+        data = [d for d in data if d['name'] != r.config.name]
+        
+        data.append({
+            "name": r.config.name,
+            "throughput": r.throughput,
+            "avg_latency_get": statistics.mean(r.latencies_get) if r.latencies_get else 0,
+            "avg_latency_set": statistics.mean(r.latencies_set) if r.latencies_set else 0,
+            "p99_latency_get": statistics.quantiles(r.latencies_get, n=100)[98] if len(r.latencies_get) >= 100 else 0,
+            "p99_latency_set": statistics.quantiles(r.latencies_set, n=100)[98] if len(r.latencies_set) >= 100 else 0
+        })
+        
+    with open(filename, 'w') as f:
+        json.dump(data, f, indent=2)
+    print(f"   💾 Results saved to {filename}")
+
+def generate_markdown_table(json_file: str):
+    if not os.path.exists(json_file):
+        print("No results file found.")
+        return
+
+    with open(json_file, 'r') as f:
+        data = json.load(f)
+
+    print("\n### Real-World Scenario Results\n")
+    print("| Metric | Redis | Ignix | Ratio (Ignix/Redis) |")
+    print("|--------|-------|-------|----------------------|")
+
+    redis_res = next((d for d in data if d['name'] == 'Redis'), None)
+    ignix_res = next((d for d in data if d['name'] == 'Ignix'), None)
+    
+    if not redis_res or not ignix_res:
+        print("Waiting for both results...")
+        return
+
+    # Throughput
+    r_t = redis_res['throughput']
+    i_t = ignix_res['throughput']
+    ratio_t = i_t / r_t if r_t > 0 else 0
+    ratio_str = f"**{ratio_t:.2f}x**" if ratio_t > 1.1 else f"{ratio_t:.2f}x"
+    print(f"| Throughput | {r_t:,.0f} ops/sec | {i_t:,.0f} ops/sec | {ratio_str} |")
+    
+    # Avg Latency (Combined approximation)
+    r_lat = (redis_res['avg_latency_get'] + redis_res['avg_latency_set']) / 2
+    i_lat = (ignix_res['avg_latency_get'] + ignix_res['avg_latency_set']) / 2
+    ratio_l = i_lat / r_lat if r_lat > 0 else 0
+    # Lower is better for latency
+    ratio_l_str = f"**{ratio_l:.2f}x**" if ratio_l < 0.9 else f"{ratio_l:.2f}x"
+    print(f"| Avg Latency | {r_lat:.2f} ms | {i_lat:.2f} ms | {ratio_l_str} |")
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--out", default="real_world_results")
+    parser.add_argument("--target", choices=["all", "redis", "ignix"], default="all")
+    parser.add_argument("--json-out", default="real_world_results.json")
+    parser.add_argument("--report-only", action="store_true")
     args = parser.parse_args()
+    
+    if args.report_only:
+        generate_markdown_table(args.json_out)
+        return
     
     # Scenario: Session Store
     # 100k keys, 100k ops, 50 conns, 80% read, Zipf 1.2, 1KB-2KB values
@@ -308,10 +375,11 @@ def main():
         "value_size_max": 2048
     }
     
-    configs = [
-        WorkloadConfig(host="localhost", port=6379, name="Redis", **common_config),
-        WorkloadConfig(host="localhost", port=7379, name="Ignix", **common_config)
-    ]
+    configs = []
+    if args.target in ["all", "redis"]:
+        configs.append(WorkloadConfig(host="localhost", port=6379, name="Redis", **common_config))
+    if args.target in ["all", "ignix"]:
+        configs.append(WorkloadConfig(host="localhost", port=7379, name="Ignix", **common_config))
     
     results = []
     for conf in configs:
@@ -321,8 +389,13 @@ def main():
         except Exception as e:
             print(f"❌ Failed {conf.name}: {e}")
             
+    if args.json_out:
+        save_results_json(results, args.json_out)
+            
     plot_comparison(results, args.out)
     print(f"\n✨ Real-world benchmark complete. Charts saved to {args.out}/")
+    
+    generate_markdown_table(args.json_out)
 
 if __name__ == "__main__":
     main()

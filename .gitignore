@@ -85,5 +85,9 @@ devnotes
 benchmark_results
 benchmarks/results/
 benchmarks/test_results/
+comprehensive_results
+benchmark_results.json
+real_world_results
+real_world_results.json
 *.txt
 *.svg

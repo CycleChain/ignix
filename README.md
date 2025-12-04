@@ -151,30 +151,26 @@ Benchmarks reflect Ignix v0.3.1. Full raw results are in `benchmarks/results/`.
 
 ### SET Throughput (ops/sec)
 
-| Data | Conns | Redis | Ignix | Ratio (Ignix/Redis) |
-|------|-------|-------|-------|----------------------|
-| 64B  | 1     | 9,249 | 9,116 | 0.99x |
-| 64B  | 10    | 17,628 | 22,360 | 1.27x |
-| 64B  | 50    | 18,236 | 23,993 | 1.32x |
-| 256B | 1     | 14,615 | 4,738 | 0.32x |
-| 256B | 10    | 17,880 | 16,273 | 0.91x |
-| 256B | 50    | 16,898 | 16,959 | 1.00x |
-| 1KB  | 1     | 16,300 | 6,451 | 0.40x |
-| 1KB  | 10    | 16,936 | 24,323 | 1.44x |
-| 1KB  | 50    | 3,313 | 7,314 | 2.21x |
-| 4KB  | 1     | 11,286 | 8,581 | 0.76x |
-| 4KB  | 10    | 17,232 | 27,933 | 1.62x |
-| 4KB  | 50    | 16,343 | 20,675 | 1.27x |
+
+
+| Data | Redis | Ignix | Ratio (Ignix/Redis) |
+|------|-------|-------|----------------------|
+| 64B  | 7,577 | 17,812 | **2.35x** |
+| 1KB  | 9,018 | 23,077 | **2.56x** |
+| 32KB | 4,330 | 15,862 | **3.66x** |
+| 256KB| 961   | 3,347  | **3.48x** |
+| 2MB  | 343   | 277    | 0.81x |
 
 ### GET Throughput (ops/sec)
 
-| Data | Conns | Redis | Ignix | Ratio (Ignix/Redis) |
-|------|-------|-------|-------|----------------------|
-| 64B  | 50    | 35,235 | 42,495 | **1.21x** |
-| 1KB  | 50    | 33,701 | 39,466 | **1.17x** |
-| 32KB | 20    | 15,912 | 21,445 | **1.35x** |
-| 256KB| 20    | 18,497 | 17,408 | 0.94x |
-| 2MB  | 10    | 1,054 | 2,062 | **1.96x** |
+
+| Data | Redis | Ignix | Ratio (Ignix/Redis) |
+|------|-------|-------|----------------------|
+| 64B  | 9,868 | 29,317 | **2.97x** |
+| 1KB  | 2,040 | 20,712 | **10.16x** |
+| 32KB | 8,183 | 13,055 | **1.60x** |
+| 256KB| 4,017 | 11,266 | **2.80x** |
+| 2MB  | 407   | 1,080  | **2.65x** |
 
 > **Note**: v0.3.1 introduced Zero-Copy Response Generation, significantly boosting GET performance. Ignix now consistently outperforms or matches Redis across most payload sizes.
 
@@ -182,8 +178,8 @@ Benchmarks reflect Ignix v0.3.1. Full raw results are in `benchmarks/results/`.
 
 | Metric | Redis | Ignix | Ratio (Ignix/Redis) |
 |--------|-------|-------|----------------------|
-| Throughput | 3,201 ops/sec | 3,996 ops/sec | **1.25x** |
-| Avg Latency | 13.56 ms | 10.38 ms | **0.76x** |
+| Throughput | 20,507 ops/sec | 23,899 ops/sec | **1.17x** |
+| Avg Latency | 1.93 ms | 1.61 ms | **0.83x** |
 
 Notes:
 - Values rounded from `benchmark_results/benchmark_results.json`.
