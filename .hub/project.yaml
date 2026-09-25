@@ -1,0 +1,104 @@
+# agy-hub proje ayarları. Hub bu dosyayı kartın temel branch'inden, worker ise kartın
+# worktree'sinden okur.
+base_branch: main
+
+# Akış adımları: explore (keşif), plan, plan_approval (insan), implement, verify (bağımsız
+# doğrulama; model çalıştırmaz), review (doğrulayıcı ajan), publish (PR).
+flows:
+  bug: [explore, implement, verify, review, publish]
+  feature: [explore, plan, plan_approval, implement, verify, review, publish]
+default_flow: feature
+
+# Rol talimatları .agents/skills/<adım>-card/SKILL.md içindedir; worker her adımın istemini
+# /explore-card, /plan-card... ile başlatır. agy 1.2.11 özel ajan tanımlarını okur
+# (.agents/agents/<ad>.md ve ~/.gemini/config/agents/<ad>.md; ön bilgi: name, description,
+# tools). Worker --agent bayrağını yine yalnızca `agy agents` listesinde görünen adlar için
+# verir; listede olmayan ad verilmez:
+# agents:
+#   explore: agy-explorer
+#   plan: agy-coordinator
+#   implement: agy-implementer
+#   review: agy-verifier
+
+# Adım başına model ve efor. Boş bırakılırsa agy'nin varsayılanı kullanılır.
+# Kimlikler `agy models` çıktısından: gemini-3.8-flash-{low,medium,high}, gemini-3.1-pro-{low,high},
+# claude-sonnet-4-6, claude-opus-4-6-thinking, gpt-oss-120b-medium ...
+models:
+  explore: {model: "", effort: low}
+  plan: {model: "", effort: high}
+  implement: {model: "", effort: medium}
+  review: {model: "", effort: medium}
+
+# İlerleme durduğunda bir kez geçilecek güçlü model (ör. gemini-3.1-pro-high).
+escalation:
+  implement: {model: "", effort: high}
+
+# Native alt-agent açma kapalı: görev dağıtımını Hub yürütür, keşif ayrı bir adımdır.
+subagents: false
+
+limits:
+  max_impl_attempts: 3      # hızlı kapılar kalırsa aynı konuşmada yeniden deneme
+  max_review_rounds: 2      # doğrulayıcının revize isteyebileceği tur
+  max_repairs: 3            # doğrulama sonrası onarım turu
+  max_dispatches: 24        # kart başına toplam agy çağrısı
+  max_no_progress: 2        # aynı kod ve aynı hata ile üst üste dönüş
+  max_model_escalations: 1
+  run_minutes: 0            # 0: duvar saati sınırı yok
+  stop_continuations_per_dispatch: 2
+
+# Hızlı kapılar: uygulayıcının kendi döngüsündeki geri bildirim. Kabul kanıtı değildir.
+# Sırayla koşar, ilk kalanda durur. Bugünkü main üçünden de kalıyor: tests/basic.rs ve
+# benches/exec.rs eski Shard::exec imzasını kullanıyor, clippy 3 uyarı veriyor, rustfmt 11
+# dosyada fark buluyor. İlk kart bunları düzelten bakım kartı olmalı (AGENTS.md, "Bilinen durum").
+gates:
+  setup: cargo fetch
+  checks:
+    check: cargo check --all-targets
+    clippy: cargo clippy -- -D warnings
+    fmt: cargo fmt --check
+  timeout_s: 1800
+
+# Kontrol profilleri: kanıtı üreten bağımsız koşular. Ayrı bir doğrulama kopyasında,
+# uygulayıcı yazamazken çalışır. ignix'in portu sabittir (7379); HUB_PORT_BASE kullanılamaz.
+check_profiles:
+  test:
+    # large_payloads.rs çalışan sunucu ister; burada atlanır, `sunucu` profilinde koşar.
+    command: cargo test -- --skip test_large_payload
+    parser: auto            # cargo çıktısı pytest kalıbıyla tanınır; sayı ilk test ikilisinden okunur
+    expects_tests: true     # çıkış kodu 0 olsa da hiç test çalışmadıysa kanıt sayılmaz
+    timeout_s: 1800
+    description: Sunucusuz testler (birim, Shard::exec, RESP ayrıştırıcı)
+  sunucu:
+    command: bash .hub/sunucu-testleri.sh
+    parser: auto
+    expects_tests: true
+    timeout_s: 1800
+    description: ignix'i geçici dizinde 127.0.0.1:7379'da başlatıp tüm testleri (#[ignore] dahil) koşar; port doluysa kalır
+  bench:
+    command: "CRITERION_HOME=target/criterion cargo bench --bench '*' -- --noplot"
+    parser: exit_code
+    expects_tests: false
+    timeout_s: 1800
+    description: criterion mikro benchmark'ları (resp, exec); yalnızca çalıştıklarını kanıtlar, sayıyı insan değerlendirir
+
+verification:
+  enabled: true
+  default_checks: [test]
+  setup: cargo fetch
+  baseline_for_regression: true   # regresyon testi temel sürümde gerçekten kalıyor mu
+  exclude: []                     # özete girmeyecek üretilmiş dizinler (git yok sayanlar zaten hariç)
+
+judge:
+  min_score: 8
+  min_score_risky: 9
+
+risky_labels: [riskli, migration, auth, payments]
+
+scheduling:
+  requires: [macos]
+  affinity: [mac-mini]
+
+pr:
+  title_prefix: "[agent]"
+  draft: false
+  merge_method: squash
