@@ -4,7 +4,7 @@ Her alt dizin bir `SKILL.md` taşır (`name` ve `description` ön bilgisi zorunl
 adları ve açıklamaları bağlama alır; içerik gerektiğinde ya da `/ad` ile çağrıldığında yüklenir.
 Claude Code aynı klasörü `.claude/skills` bağlantısı üzerinden görür.
 
-- `explore-card`, `plan-card`, `implement-card`, `review-card`: agy-hub adımları. Worker bu
+- `explore-card`, `plan-card`, `implement-card`, `review-card`, `report-card` (kod değiştirmeyen rapor akışı): agy-hub adımları. Worker bu
   adımların istemini `/explore-card ...` biçiminde başlatır; skill repoda yoksa istem yine
   çalışır, yalnızca bu rol talimatları eklenmez. İş akışları (`.agents/workflows/`) agy'de
   kullanımdan kalktı. agy 1.2.11 `.agents/agents/` tanımlarını da okur, ama Hub rolleri bu
