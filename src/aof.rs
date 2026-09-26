@@ -8,7 +8,7 @@
 
 use crate::protocol::fmt_u64;
 use anyhow::*;
-use crossbeam::channel::{bounded, Sender};
+use crossbeam::channel::{bounded, RecvTimeoutError, Sender};
 use std::io::Write;
 use std::result::Result::{Err, Ok};
 use std::time::{Duration, Instant};
@@ -33,46 +33,66 @@ pub struct AofHandle {
 ///
 /// # Returns
 /// * `AofHandle` for sending commands to be logged
+/// * An error if the file cannot be opened; the caller decides whether to
+///   run without persistence
 ///
 /// # Behavior
-/// * Commands are buffered and written to disk
-/// * File is flushed and synced every 1000ms for durability
-/// * Thread continues until the handle is dropped
+/// * Each record is written to the file as soon as it is received
+/// * Written data is synced to disk at most one second later, also when no
+///   more writes arrive
+/// * Thread continues until every handle is dropped, then syncs and exits
 pub fn spawn_aof_writer(path: &str) -> Result<AofHandle> {
+    // Open the file here, so a path that cannot be used is reported to the
+    // caller instead of panicking in the writer thread (which, with
+    // `panic = "abort"`, would terminate the whole server).
+    let mut file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .with_context(|| format!("cannot open AOF file {path}"))?;
+
     // Bounded channel to provide backpressure under heavy write load
     let (tx, rx) = bounded::<Vec<u8>>(4096);
-    let path = path.to_string();
 
     // Spawn dedicated AOF writer thread
     std::thread::Builder::new()
         .name("aof-writer".into())
         .spawn(move || {
-            // Open AOF file in append mode, create if doesn't exist
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&path)
-                .expect("open aof");
+            let sync_interval = Duration::from_millis(1000);
+            let mut last_sync = Instant::now();
+            let mut unsynced = false;
+            let mut write_failing = false;
 
-            let mut last = Instant::now();
-
-            // Main AOF writer loop
             loop {
-                match rx.recv() {
-                    Ok(buf) => {
-                        let _ = f.write_all(&buf);
-                        if last.elapsed() >= Duration::from_millis(1000) {
-                            let _ = f.flush();
-                            let _ = f.sync_data();
-                            last = Instant::now();
+                match rx.recv_timeout(sync_interval) {
+                    Ok(buf) => match file.write_all(&buf) {
+                        Ok(()) => {
+                            unsynced = true;
+                            write_failing = false;
                         }
-                    }
-                    // Channel closed: drain finished; perform final flush and exit
-                    Err(_) => {
-                        let _ = f.flush();
-                        let _ = f.sync_data();
+                        Err(e) => {
+                            if !write_failing {
+                                log::error!("AOF write failed, records are being lost: {e}");
+                            }
+                            write_failing = true;
+                        }
+                    },
+                    Err(RecvTimeoutError::Timeout) => {}
+                    // Every handle is gone: sync what was written and exit
+                    Err(RecvTimeoutError::Disconnected) => {
+                        if unsynced {
+                            let _ = file.sync_data();
+                        }
                         break;
                     }
+                }
+
+                if unsynced && last_sync.elapsed() >= sync_interval {
+                    if let Err(e) = file.sync_data() {
+                        log::error!("AOF sync failed: {e}");
+                    }
+                    unsynced = false;
+                    last_sync = Instant::now();
                 }
             }
         })?;

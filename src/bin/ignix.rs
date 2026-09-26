@@ -6,7 +6,7 @@
  * AOF persistence, and starts the main server event loop.
  */
 
-use anyhow::*;
+use anyhow::Result;
 use ignix::*;
 use std::net::ToSocketAddrs;
 
@@ -35,7 +35,13 @@ fn main() -> Result<()> {
 
     // Try to create AOF writer for persistence
     // If this fails, server will run without persistence (in-memory only)
-    let aof = aof::spawn_aof_writer("ignix.aof").ok();
+    let aof = match aof::spawn_aof_writer("ignix.aof") {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            log::warn!("AOF persistence disabled: {e:#}");
+            None
+        }
+    };
 
     // Create the main storage shard with ID 0
     // Currently Ignix uses a single shard, but architecture supports multiple

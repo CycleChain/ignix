@@ -120,3 +120,15 @@ fn failed_rename_is_not_logged() {
     let data = aof_after("rename", &[&[b"RENAME", b"nokey", b"other"]]);
     assert!(!contains(&data, b"RENAME"));
 }
+
+#[test]
+fn unopenable_aof_path_returns_an_error() {
+    let dir = temp_dir("unopenable");
+    let path = dir.join("missing-directory").join("test.aof");
+    let result = spawn_aof_writer(path.to_str().unwrap());
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        result.is_err(),
+        "an AOF file that cannot be opened must be reported to the caller"
+    );
+}
