@@ -13,11 +13,15 @@ Usage:
 import socket
 import sys
 
+class ResponseError(Exception):
+    """Error reply from the server"""
+
 class SimpleRedisClient:
     def __init__(self, host='localhost', port=7379):
         self.host = host
         self.port = port
         self.socket = None
+        self.reader = None
     
     def connect(self):
         """Connect to the Ignix server"""
@@ -25,6 +29,9 @@ class SimpleRedisClient:
             self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.socket.settimeout(5)
             self.socket.connect((self.host, self.port))
+            # Buffered reader: a reply can span several reads, and bytes after
+            # one reply belong to the next
+            self.reader = self.socket.makefile('rb')
             return True
         except Exception as e:
             print(f"❌ Connection failed: {e}")
@@ -33,58 +40,61 @@ class SimpleRedisClient:
     def disconnect(self):
         """Disconnect from the server"""
         if self.socket:
+            self.reader.close()
             self.socket.close()
             self.socket = None
+            self.reader = None
     
     def send_command(self, *args):
         """Send a RESP command and return the response"""
         if not self.socket:
             raise Exception("Not connected")
         
-        # Build RESP command
-        command = f"*{len(args)}\r\n"
+        # Build RESP command; bulk lengths count bytes, not characters
+        command = b"*%d\r\n" % len(args)
         for arg in args:
-            arg_str = str(arg)
-            command += f"${len(arg_str)}\r\n{arg_str}\r\n"
+            data = str(arg).encode('utf-8')
+            command += b"$%d\r\n%s\r\n" % (len(data), data)
         
         # Send command
-        self.socket.send(command.encode('utf-8'))
+        self.socket.sendall(command)
         
         # Read response
         return self._read_response()
     
     def _read_response(self):
-        """Read and parse RESP response"""
-        response = b""
-        while True:
-            data = self.socket.recv(1024)
-            if not data:
-                break
-            response += data
-            if response.endswith(b'\r\n'):
-                break
+        """Read and parse one RESP response"""
+        line = self.reader.readline()
+        if not line.endswith(b'\r\n'):
+            raise Exception("Connection closed by server")
+        kind, rest = line[:1], line[1:-2].decode('utf-8')
         
-        response_str = response.decode('utf-8')
-        
-        # Parse RESP response
-        if response_str.startswith('+'):
+        if kind == b'+':
             # Simple string
-            return response_str[1:].rstrip('\r\n')
-        elif response_str.startswith(':'):
+            return rest
+        elif kind == b':':
             # Integer
-            return int(response_str[1:].rstrip('\r\n'))
-        elif response_str.startswith('$'):
-            # Bulk string
-            lines = response_str.split('\r\n')
-            if lines[0] == '$-1':
-                return None  # Null
-            length = int(lines[0][1:])
-            return lines[1] if len(lines) > 1 else ""
-        elif response_str.startswith('-'):
+            return int(rest)
+        elif kind == b'$':
+            # Bulk string; $-1 is null
+            length = int(rest)
+            if length < 0:
+                return None
+            data = self.reader.read(length + 2)
+            if len(data) != length + 2:
+                raise Exception("Connection closed by server")
+            return data[:-2].decode('utf-8')
+        elif kind == b'*':
+            # Array
+            count = int(rest)
+            if count < 0:
+                return None
+            return [self._read_response() for _ in range(count)]
+        elif kind == b'-':
             # Error
-            return response_str[1:].rstrip('\r\n')
+            raise ResponseError(rest)
         else:
-            return response_str.rstrip('\r\n')
+            raise Exception(f"Unexpected reply: {line!r}")
 
 def main():
     print("🔥 Simple Ignix Python Client Example")
