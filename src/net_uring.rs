@@ -7,7 +7,7 @@
 
 #![cfg(target_os = "linux")]
 
-use crate::protocol::{parse_many, write_simple, Cmd};
+use crate::protocol::{parse_many, Cmd};
 use crate::shard::Shard;
 use anyhow::*;
 use bytes::BytesMut;
@@ -16,7 +16,6 @@ use slab::Slab;
 use std::net::SocketAddr;
 use std::net::TcpListener;
 use std::os::unix::io::AsRawFd;
-use std::sync::Arc;
 
 // Operation types for user_data
 const OP_ACCEPT: u64 = 0;
@@ -73,8 +72,9 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
     loop {
         ring.submit_and_wait(1)?;
 
-        let mut cq = ring.completion();
-        let mut sq = ring.submission();
+        // Borrow the submission and completion queues together; taking them one
+        // after the other would borrow `ring` mutably twice.
+        let (_submitter, mut sq, cq) = ring.split();
 
         for cqe in cq {
             let user_data = cqe.user_data();
@@ -143,7 +143,7 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
                                 .extend_from_slice(&conn.read_buffer[..res as usize]);
 
                             // Parse and Execute
-                            if let Ok(_) = parse_many(&mut conn.read_buf, &mut conn.cmds) {
+                            if parse_many(&mut conn.read_buf, &mut conn.cmds).is_ok() {
                                 for cmd in conn.cmds.drain(..) {
                                     shard.exec(cmd, &mut conn.write_buf);
                                 }
