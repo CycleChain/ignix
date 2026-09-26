@@ -6,14 +6,15 @@
  * using mio for async I/O operations.
  */
 
-use crate::protocol::{parse_many, write_simple, Cmd};
+use crate::protocol::{parse_requests, write_error, Request};
 use crate::shard::Shard;
 use anyhow::*;
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
 use hashbrown::HashMap;
+use mio::event::Event;
 use mio::net::{TcpListener, TcpStream};
-use mio::{Events, Interest, Poll, Token};
-use std::io::{Read, Write};
+use mio::{Events, Interest, Poll, Registry, Token};
+use std::io::{ErrorKind, Read, Write};
 use std::net::SocketAddr;
 use std::result::Result::{Err, Ok};
 use std::sync::Arc;
@@ -76,10 +77,68 @@ pub fn run_shard(_shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()>
 
     // Wait for all threads (they should run forever)
     for h in handles {
-        h.join().unwrap();
+        if h.join().is_err() {
+            log::error!("a worker thread panicked");
+        }
     }
 
     Ok(())
+}
+
+/// Per-connection state of the mio backend
+struct Conn {
+    sock: TcpStream,
+    /// Received bytes not parsed yet (at most one incomplete request)
+    rbuf: BytesMut,
+    /// Replies not written to the socket yet
+    wbuf: BytesMut,
+    /// Parsed requests, reused between reads
+    reqs: Vec<Request>,
+    /// Set after EOF or a protocol error: stop reading, flush `wbuf`, close
+    closing: bool,
+    /// Interest currently registered with the poller
+    interest: Interest,
+}
+
+impl Conn {
+    fn new(sock: TcpStream) -> Self {
+        Self {
+            sock,
+            rbuf: BytesMut::with_capacity(READ_BUF),
+            wbuf: BytesMut::new(),
+            reqs: Vec::with_capacity(32),
+            closing: false,
+            interest: Interest::READABLE,
+        }
+    }
+}
+
+/// Execute every complete request in `rbuf` and queue the replies in order.
+///
+/// Invalid commands get an error reply and the connection stays usable.
+/// Returns `false` after a protocol error: the requests before it have been
+/// executed, its error reply is queued after theirs, and the connection must
+/// be closed once `wbuf` is flushed (Redis behaves the same way).
+pub(crate) fn handle_input(
+    shard: &Shard,
+    rbuf: &mut BytesMut,
+    reqs: &mut Vec<Request>,
+    wbuf: &mut BytesMut,
+) -> bool {
+    let parsed = parse_requests(rbuf, reqs);
+    for req in reqs.drain(..) {
+        match req {
+            Request::Cmd(cmd) => shard.exec(cmd, wbuf),
+            Request::Invalid(message) => write_error(&message, wbuf),
+        }
+    }
+    match parsed {
+        Ok(()) => true,
+        Err(e) => {
+            write_error(&e.to_string(), wbuf);
+            false
+        }
+    }
 }
 
 /// Main event loop for a single worker thread
@@ -94,129 +153,32 @@ fn run_worker_loop(id: usize, addr: SocketAddr, shard: Arc<Shard>) -> Result<()>
     poll.registry()
         .register(&mut listener, LISTENER, Interest::READABLE)?;
 
-    // Client state: (socket, read_buf, write_buf, cmd_buf)
-    let mut clients: HashMap<usize, (TcpStream, BytesMut, BytesMut, Vec<Cmd>)> = HashMap::new();
+    let mut clients: HashMap<usize, Conn> = HashMap::new();
     let mut next_tok: usize = 1;
 
     // Buffer for reading from socket
     let mut tmp_buf = [0u8; READ_BUF];
 
     loop {
-        poll.poll(&mut events, None)?;
+        if let Err(e) = poll.poll(&mut events, None) {
+            if e.kind() == ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e.into());
+        }
 
         for ev in events.iter() {
             match ev.token() {
-                LISTENER => loop {
-                    match listener.accept() {
-                        Ok((mut sock, _)) => {
-                            sock.set_nodelay(true).ok();
-                            let tok = next_tok;
-                            next_tok = next_tok.wrapping_add(1);
-                            if next_tok == 0 {
-                                next_tok = 1;
-                            } // Skip 0 (LISTENER)
-
-                            // Register client socket for READABLE only initially
-                            poll.registry()
-                                .register(&mut sock, Token(tok), Interest::READABLE)?;
-
-                            clients.insert(
-                                tok,
-                                (
-                                    sock,
-                                    BytesMut::with_capacity(READ_BUF),
-                                    BytesMut::new(),
-                                    Vec::with_capacity(32),
-                                ),
-                            );
-                        }
-                        Err(ref e) if would_block(e) => break,
-                        Err(e) => {
-                            log::warn!("worker {id}: accept failed: {e}");
-                            break;
-                        }
-                    }
-                },
+                LISTENER => accept_all(id, poll.registry(), &listener, &mut clients, &mut next_tok),
                 Token(t) => {
-                    let mut should_remove = false;
-                    if let Some((sock, rbuf, wbuf, cmds)) = clients.get_mut(&t) {
-                        // READ
-                        if ev.is_readable() {
-                            loop {
-                                match sock.read(&mut tmp_buf) {
-                                    Ok(0) => {
-                                        should_remove = true;
-                                        break;
-                                    }
-                                    Ok(n) => {
-                                        rbuf.extend_from_slice(&tmp_buf[..n]);
-                                    }
-                                    Err(ref e) if would_block(e) => break,
-                                    Err(_) => {
-                                        should_remove = true;
-                                        break;
-                                    }
-                                }
-                            }
-
-                            // PARSE & EXECUTE (Inline)
-                            if !should_remove {
-                                cmds.clear();
-                                if let Err(e) = parse_many(rbuf, cmds) {
-                                    write_simple(&format!("ERR {}", e), wbuf);
-                                } else {
-                                    for cmd in cmds.drain(..) {
-                                        shard.exec(cmd, wbuf);
-                                    }
-                                }
-
-                                // Try to write immediately
-                                if !wbuf.is_empty() {
-                                    match sock.write(wbuf) {
-                                        Ok(n) => {
-                                            let _ = wbuf.split_to(n);
-                                        }
-                                        Err(ref e) if would_block(e) => {}
-                                        Err(_) => {
-                                            should_remove = true;
-                                        }
-                                    }
-                                }
-                            }
+                    let keep = match clients.get_mut(&t) {
+                        Some(conn) => {
+                            drive(conn, ev, &shard, &mut tmp_buf, poll.registry(), Token(t))
                         }
-
-                        // WRITE
-                        if !should_remove && ev.is_writable() && !wbuf.is_empty() {
-                            match sock.write(wbuf) {
-                                Ok(n) => {
-                                    let _ = wbuf.split_to(n);
-                                }
-                                Err(ref e) if would_block(e) => {}
-                                Err(_) => {
-                                    should_remove = true;
-                                }
-                            }
-                        }
-
-                        // Update Interest based on wbuf state
-                        if !should_remove {
-                            let interest = if wbuf.is_empty() {
-                                Interest::READABLE
-                            } else {
-                                Interest::READABLE | Interest::WRITABLE
-                            };
-
-                            if poll
-                                .registry()
-                                .reregister(sock, Token(t), interest)
-                                .is_err()
-                            {
-                                should_remove = true;
-                            }
-                        }
-                    }
-
-                    if should_remove {
+                        None => true,
+                    };
+                    if !keep {
+                        // Dropping the stream closes it and removes it from the poller.
                         clients.remove(&t);
                     }
                 }
@@ -225,11 +187,116 @@ fn run_worker_loop(id: usize, addr: SocketAddr, shard: Arc<Shard>) -> Result<()>
     }
 }
 
+/// Accept every pending connection on this worker's listener.
+///
+/// A connection that cannot be registered is dropped; it never stops the
+/// worker.
+fn accept_all(
+    id: usize,
+    registry: &Registry,
+    listener: &TcpListener,
+    clients: &mut HashMap<usize, Conn>,
+    next_tok: &mut usize,
+) {
+    loop {
+        match listener.accept() {
+            Ok((mut sock, _)) => {
+                sock.set_nodelay(true).ok();
+                let tok = *next_tok;
+                // Token 0 belongs to the listener.
+                *next_tok = next_tok.wrapping_add(1).max(1);
+                if let Err(e) = registry.register(&mut sock, Token(tok), Interest::READABLE) {
+                    log::warn!("worker {id}: cannot register a new connection: {e}");
+                    continue;
+                }
+                clients.insert(tok, Conn::new(sock));
+            }
+            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    ErrorKind::Interrupted | ErrorKind::ConnectionAborted
+                ) =>
+            {
+                continue
+            }
+            Err(e) => {
+                log::warn!("worker {id}: accept failed: {e}");
+                break;
+            }
+        }
+    }
+}
+
+/// Handle one readiness event of a connection.
+///
+/// Returns `false` when the connection is finished and must be dropped.
+fn drive(
+    conn: &mut Conn,
+    ev: &Event,
+    shard: &Shard,
+    tmp_buf: &mut [u8],
+    registry: &Registry,
+    token: Token,
+) -> bool {
+    if ev.is_error() {
+        return false;
+    }
+
+    if (ev.is_readable() || ev.is_read_closed()) && !conn.closing {
+        // Edge-triggered: read until the socket is drained.
+        loop {
+            match conn.sock.read(tmp_buf) {
+                Ok(0) => {
+                    conn.closing = true;
+                    break;
+                }
+                Ok(n) => conn.rbuf.extend_from_slice(&tmp_buf[..n]),
+                Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+                Err(ref e) if would_block(e) => break,
+                Err(_) => return false,
+            }
+        }
+        // Run what arrived even after EOF: a client may send its requests and
+        // half-close right away, and still read the replies.
+        if !handle_input(shard, &mut conn.rbuf, &mut conn.reqs, &mut conn.wbuf) {
+            conn.closing = true;
+            conn.rbuf.clear();
+        }
+    }
+
+    // Write until everything is sent or the socket is full.
+    while !conn.wbuf.is_empty() {
+        match conn.sock.write(&conn.wbuf) {
+            Ok(0) => return false,
+            Ok(n) => conn.wbuf.advance(n),
+            Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
+            Err(ref e) if would_block(e) => break,
+            Err(_) => return false,
+        }
+    }
+
+    if conn.closing && conn.wbuf.is_empty() {
+        return false;
+    }
+
+    let wanted = match (conn.closing, conn.wbuf.is_empty()) {
+        (false, true) => Interest::READABLE,
+        (false, false) => Interest::READABLE | Interest::WRITABLE,
+        // Closing: stop reading, only flush the remaining replies.
+        (true, _) => Interest::WRITABLE,
+    };
+    if wanted != conn.interest {
+        if registry.reregister(&mut conn.sock, token, wanted).is_err() {
+            return false;
+        }
+        conn.interest = wanted;
+    }
+    true
+}
+
 /// Check if an I/O error indicates the operation would block
 #[inline]
 fn would_block(e: &std::io::Error) -> bool {
-    matches!(
-        e.kind(),
-        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
-    )
+    e.kind() == ErrorKind::WouldBlock
 }

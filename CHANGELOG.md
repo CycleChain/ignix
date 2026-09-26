@@ -23,6 +23,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Stricter request framing**: length lines are parsed like Redis `string2ll` (no leading zeros, `+`, spaces or lines longer than 20 characters). Unlike Redis, a bulk payload must be followed by CRLF instead of skipping two bytes blindly, which stops a miscounted length from desynchronising the stream. Empty requests (`*0\r\n`, `*-1\r\n`) are ignored like in Redis instead of being an error.
 
 ### Fixed
+- **Connections stuck after an invalid request**: an unknown command or malformed request stayed at the head of the read buffer, so every later request on that connection got the same error, and requests parsed before it in the same read were dropped without being executed or answered. Clients that send `CLIENT SETINFO` on connect (redis-py 5, node-redis 4.7) were affected. Invalid commands now get an error reply and the connection keeps working; after a protocol error the error is sent and the connection is closed, as in Redis.
+- **Errors sent as status replies**: request errors were written as `+ERR ...`, which clients read as success; they are now RESP errors (`-ERR ...`).
+- **Requests dropped when a client half-closes**: when data and EOF arrived in the same read, the connection was closed without running the requests; they now run and their replies are flushed before the connection is closed.
+- **One connection could stop a worker thread**: a registration error at accept or an interrupted `poll` ended the whole worker and its connections.
 - **Silently ignored arguments**: `DEL a b c` deleted only `a`, `EXISTS a b` checked only `a`, `GET a b` and `INCR a b` ignored the extra argument, and `SET k v NX` or `SET k v EX 10` set the key unconditionally and without expiry while replying `OK`.
 - **Linux build**: the crate did not compile on Linux (and therefore not on docs.rs) because `src/net_uring.rs` used an `Ok(_)` pattern that resolved to `anyhow::Ok` (E0532) and borrowed the io_uring instance mutably twice (E0499).
 
