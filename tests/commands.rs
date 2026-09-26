@@ -152,3 +152,64 @@ fn command_names_are_case_insensitive() {
     assert_eq!(exec(&s, &[b"set", b"k", b"v"]), b"+OK\r\n");
     assert_eq!(exec(&s, &[b"GeT", b"k"]), b"$1\r\nv\r\n");
 }
+
+fn bulk(value: &[u8]) -> Vec<u8> {
+    [
+        format!("${}\r\n", value.len()).as_bytes(),
+        value,
+        b"\r\n".as_slice(),
+    ]
+    .concat()
+}
+
+#[test]
+fn set_preserves_non_canonical_integer_strings() {
+    let s = shard();
+    let values: [&[u8]; 10] = [
+        b"007",
+        b"-0",
+        b"00",
+        b"+1",
+        b" 1",
+        b"1 ",
+        b"0x10",
+        b"1e3",
+        b"9223372036854775808",
+        b"-9223372036854775809",
+    ];
+    for value in values {
+        exec(&s, &[b"SET", b"k", value]);
+        assert_eq!(
+            exec(&s, &[b"GET", b"k"]),
+            bulk(value),
+            "value {:?}",
+            String::from_utf8_lossy(value)
+        );
+    }
+}
+
+#[test]
+fn mset_preserves_non_canonical_integer_strings() {
+    let s = shard();
+    exec(&s, &[b"MSET", b"a", b"007", b"b", b"-0"]);
+    assert_eq!(
+        exec(&s, &[b"MGET", b"a", b"b"]),
+        b"*2\r\n$3\r\n007\r\n$2\r\n-0\r\n"
+    );
+}
+
+#[test]
+fn set_round_trips_canonical_integers() {
+    let s = shard();
+    let values: [&[u8]; 5] = [
+        b"0",
+        b"-1",
+        b"42",
+        b"9223372036854775807",
+        b"-9223372036854775808",
+    ];
+    for value in values {
+        exec(&s, &[b"SET", b"k", value]);
+        assert_eq!(exec(&s, &[b"GET", b"k"]), bulk(value));
+    }
+}

@@ -8,10 +8,24 @@
 
 use crate::aof::{emit_aof_incr, emit_aof_mset, emit_aof_rename, emit_aof_set, AofHandle};
 use crate::protocol::{
-    write_array_len, write_bulk, write_integer, write_null, write_simple, Cmd, Value,
+    parse_canonical_i64, write_array_len, write_bulk, write_integer, write_null, write_simple, Cmd,
+    Value,
 };
 use crate::storage::Dict;
-use bytes::BytesMut;
+use bytes::{Bytes, BytesMut};
+
+/// Choose how to store a value written by SET or MSET.
+///
+/// Canonical integers (the strings Redis would store with its integer
+/// encoding) become `Value::Int`, which INCR can update in place and which
+/// formats back to exactly the same bytes. Everything else, including
+/// "007", "-0" or "+1", is stored byte for byte.
+fn encode_value(v: Bytes) -> Value {
+    match parse_canonical_i64(&v) {
+        Some(i) => Value::Int(i),
+        None => Value::Str(v),
+    }
+}
 
 /// A shard represents a single execution unit
 ///
@@ -75,24 +89,7 @@ impl Shard {
                     a.write(&emit_aof_set(&k, &v));
                 }
 
-                // Optimization: Try to store as integer if possible
-                // Fast fail: Integers fit in 20 chars and start with digit or '-'
-                let val =
-                    if v.len() <= 20 && !v.is_empty() && (v[0].is_ascii_digit() || v[0] == b'-') {
-                        if let Ok(s) = std::str::from_utf8(&v) {
-                            if let Ok(i) = s.parse::<i64>() {
-                                Value::Int(i)
-                            } else {
-                                Value::Str(v)
-                            }
-                        } else {
-                            Value::Str(v)
-                        }
-                    } else {
-                        Value::Str(v)
-                    };
-
-                self.dict.set(k, val);
+                self.dict.set(k, encode_value(v));
 
                 write_simple("OK", out);
             }
@@ -170,25 +167,7 @@ impl Shard {
 
                 // Set all key-value pairs
                 for (k, v) in pairs {
-                    // Optimization: Try to store as integer if possible
-                    // Fast fail: Integers fit in 20 chars and start with digit or '-'
-                    let val = if v.len() <= 20
-                        && !v.is_empty()
-                        && (v[0].is_ascii_digit() || v[0] == b'-')
-                    {
-                        if let Ok(s) = std::str::from_utf8(&v) {
-                            if let Ok(i) = s.parse::<i64>() {
-                                Value::Int(i)
-                            } else {
-                                Value::Str(v)
-                            }
-                        } else {
-                            Value::Str(v)
-                        }
-                    } else {
-                        Value::Str(v)
-                    };
-                    self.dict.set(k, val);
+                    self.dict.set(k, encode_value(v));
                 }
 
                 write_simple("OK", out);
