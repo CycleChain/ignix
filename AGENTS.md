@@ -27,18 +27,21 @@ hacmi. Uyumluluğu Redis belgesine göre, başarımı ölçümle doğrula; ikisi
 | Örnek istemci | `cargo run --example client` (sunucu açıkken) |
 | Tüm hedefleri derle | `cargo check --all-targets` |
 | Lint, biçim | `cargo clippy -- -D warnings`, `cargo fmt --check` |
-| Sunucusuz testler | `cargo test -- --skip test_large_payload` |
+| Sunucusuz testler | `cargo test` (sunucu isteyen testler `#[ignore]` ile atlanır) |
 | Sunucu isteyen testler | `bash .hub/sunucu-testleri.sh` (sunucuyu kendisi başlatır ve durdurur) |
 | Mikro benchmark | `CRITERION_HOME=target/criterion cargo bench --bench resp -- --noplot` |
 
-Bu komutların bugünkü sonuçları, sandbox'ta çalıştırma ve test düzeni: `derleme-ve-test`
-skill'i. Aşağıdaki "Bilinen durum" bölümünü mutlaka oku: bugün bazı komutlar `main`'de kalıyor.
+Sandbox'ta çalıştırma ve test düzeni: `derleme-ve-test` skill'i. Bu komutların hepsi bugün
+Linux'ta geçer; güncel durum ve tuzaklar için aşağıdaki "Bilinen durum" bölümünü oku.
 
 ## Mimari
 
-İstek akışı: TCP bağlantısı → bağlantının okuma tamponu (`BytesMut`) →
-`protocol::parse_many` → `Cmd` → `Shard::exec(&self, cmd, &mut out)` → `Dict` (DashMap) ve
-veri değiştiren komutlarda `AofHandle` → yanıt `write_*` ile doğrudan `out`'a → soket.
+İstek akışı: TCP bağlantısı → bağlantının okuma tamponu (`BytesMut`) → `net::handle_input`
+→ `protocol::parse_requests` → `Request::Cmd(cmd)` için `Shard::exec(&self, cmd, &mut out)`,
+`Request::Invalid(satır)` için `write_error` → `Dict` (DashMap) ve veri değiştiren komutlarda
+`AofHandle` → yanıt `write_*` ile doğrudan `out`'a → soket. Çerçeve (protokol) hatasında
+hata yanıtı yazılır ve bağlantı, yanıtlar boşaltıldıktan sonra kapanır. İki arka uç da
+`handle_input`'u paylaşır.
 
 - `src/net.rs` (varsayılan arka uç, mio): `run_shard`, `available_parallelism()` kadar iş
   parçacığı açar. Her biri `bind_reuseport` (SO_REUSEPORT) ile aynı portu kendi dinleyicisiyle
@@ -46,28 +49,33 @@ veri değiştiren komutlarda `AofHandle` → yanıt `write_*` ile doğrudan `out
   içi yürütülür; ayrı iş havuzu yoktur.
 - `src/net_uring.rs`: Linux'a özgü io_uring arka ucu (`#![cfg(target_os = "linux")]`); tek iş
   parçacığı, SO_REUSEPORT yok, `unsafe` SQE gönderimleri. `--backend=uring` ile seçilir.
-- `src/protocol.rs`: `Cmd` ve `Value` enum'ları; RESP ayrıştırıcı (`parse_one`, `parse_many`,
-  `read_decimal_line`); sıfır kopya yanıt yazıcıları (`write_simple`, `write_bulk`,
-  `write_null`, `write_integer`, `write_array_len`); eski, `Vec<u8>` döndüren `resp_*`.
+- `src/protocol.rs`: `Cmd` ve `Value` enum'ları (`#[non_exhaustive]`); çerçeve okuma
+  (`read_frame`, `read_int_line`, Redis `string2ll` karşılığı `parse_canonical_i64`), komut ve
+  argüman denetimi (`command_from_frame`, Redis hata metinleri), `parse_one`, `parse_many`,
+  `parse_requests` ve `Request`; ayırmasız yanıt yazıcıları (`write_simple`, `write_error`,
+  `write_bulk`, `write_null`, `write_integer`, `write_array_len`); eski, `Vec<u8>` döndüren
+  `resp_*`.
 - `src/shard.rs`: `Shard { id, dict, aof }`, 64 bayta hizalı (`test_shard_alignment` sınar);
   komut semantiği `exec` içinde. Sunucuda tek bir `Arc<Shard>` paylaşılır.
 - `src/storage.rs`: `Dict` = `DashMap<Bytes, Value>`; `get`, `set`, `del`, `rename`,
-  `exists`, `incr` (entry API ile atomik).
-- `src/aof.rs`: `spawn_aof_writer` (ayrı iş parçacığı, 4096 kapasiteli sınırlı kanal; yazma
-  geldikçe en çok saniyede bir `flush` + `sync_data`) ve `emit_aof_*` kodlayıcıları.
+  `exists`, `incr`/`incr_by` (entry API ile atomik, `Result<i64, IncrError>` döner).
+- `src/aof.rs`: `spawn_aof_writer` (dosyayı önce açar, açamazsa `Err` döner; ayrı iş
+  parçacığı, 4096 kapasiteli sınırlı kanal; kayıtlar en geç bir saniye içinde `sync_data` ile
+  diske işlenir) ve ikili güvenli `emit_aof_*` kodlayıcıları.
 - `src/lib.rs`: modüller, `pub use` yeniden dışa aktarımları ve `DEFAULT_ADDR`
   (`0.0.0.0:7379`). Bunlar crates.io'daki genel API'dir.
 - `src/bin/ignix.rs`: giriş noktası; mimalloc global ayırıcı, `--backend=uring` argümanı, AOF
   (`ignix.aof` açılamazsa AOF'suz sürer).
 
-Desteklenen komutlar: PING, GET, SET, DEL, EXISTS, INCR, RENAME, MGET, MSET.
+Desteklenen komutlar: PING, GET, SET, DEL, EXISTS, INCR, INCRBY, DECR, DECRBY, RENAME, MGET,
+MSET.
 
 ## Dizin haritası
 
 | Yol | İçerik |
 |---|---|
 | `src/` | kütüphane ve sunucu (yukarıda) |
-| `tests/` | `basic.rs` (`Shard::exec`), `resp.rs` (ayrıştırıcı), `large_payloads.rs` (127.0.0.1:7379'daki çalışan sunucuya bağlanır) |
+| `tests/` | `common/` (RESP isteğiyle komut yürüten yardımcılar), `basic.rs`, `commands.rs` (komut semantiği), `aof.rs`, `protocol_framing.rs`, `protocol_api.rs`, `resp.rs`; sunucu isteyen `network.rs` ve `large_payloads.rs` (`#[ignore]`) |
 | `benches/` | criterion: `exec.rs`, `resp.rs` (`harness = false`) |
 | `examples/` | `client.rs` (cargo örneği); Python ve Node.js istemcileri, `verify_connection.*` |
 | `benchmarks/` | Redis'e karşı Python benchmark paketi: `run_all.py`, `scripts/`, `quick_benchmark.py`, `run_*.sh` |
@@ -83,32 +91,24 @@ Desteklenen komutlar: PING, GET, SET, DEL, EXISTS, INCR, RENAME, MGET, MSET.
 Bugünkü `main` için geçerlidir. Görevin konusu değilse düzeltmeye kalkma; seni etkiliyorsa
 özetinde belirt.
 
-- **Kırık hedefler:** `tests/basic.rs` ve `benches/exec.rs`, `Shard::exec`'in eski imzasını
-  kullanıyor; `cargo check --all-targets`, `cargo test` ve `cargo bench` derlenmiyor. Ayrıca
-  `cargo clippy -- -D warnings` 3 uyarıda, `cargo fmt --check` 11 dosyada kalıyor. Hub kapıları
-  bu yüzden her kartta kalır; ilk kart bunları düzelten bakım kartı olmalıdır. Başka bir kartta
-  kapı yalnızca bu nedenlerle kalıyorsa `needs_human` ile sor.
-- **Ağ testleri sunucu ister:** `tests/large_payloads.rs` çalışan bir sunucuya bağlanır;
-  `.hub/sunucu-testleri.sh` kullan.
+- **Ağ testleri sunucu ister:** `tests/network.rs` ve `tests/large_payloads.rs` çalışan bir
+  sunucuya bağlanır ve `#[ignore]` ile işaretlidir; `.hub/sunucu-testleri.sh` kullan.
 - **Sabit port, paylaşılan port:** adres `DEFAULT_ADDR`'dır, bayrakla değişmez. SO_REUSEPORT
   yüzünden aynı makinedeki ikinci bir `ignix` hata vermeden aynı portu paylaşır; sunucu
   başlatmadan önce `lsof -nP -iTCP:7379 -sTCP:LISTEN` ile portun boş olduğunu doğrula.
-  `benchmarks/run_*.sh` betikleri `pkill -9 ignix` çalıştırır; paylaşılan makinede kullanma.
-- **Protokol hatası bağlantıyı kilitler:** bilinmeyen bir komut ya da bozuk RESP, okuma
-  tamponunda kalır; aynı bağlantıdaki sonraki bütün istekler `+ERR unknown/invalid command`
-  alır. Bağlanırken `CLIENT SETINFO` gibi komutlar gönderen istemciler (ör. redis-py 5.x)
-  etkilenebilir.
-- **Hata yanıtları durum metni:** hatalar RESP hata tipi (`-ERR`) yerine `+ERR ...` olarak
-  gidiyor (`shard.rs` RENAME, `net.rs` ayrıştırma hatası). Diğer Redis farkları:
-  `resp-komutu-ekleme` skill'i.
-- **AOF yalnızca yazılır:** açılışta geri yüklenmez; `DEL` AOF'a yazılmaz; `emit_aof_*`
-  değerleri `String::from_utf8_lossy` ile yazdığı için UTF-8 olmayan veri bozulur.
+  `benchmarks/run_*.sh` port doluysa başlamaz ve yalnızca kendi başlattığı süreçleri durdurur.
+- **Protokol kapsamı:** yalnızca RESP2 ve RESP dizisi biçimindeki istekler; satır içi (inline)
+  komutlar ve RESP3/`HELLO` yok. Geçersiz komut `-ERR ...` alır ve bağlantı sürer; bozuk RESP
+  `-ERR Protocol error: ...` alır ve bağlantı kapanır (Redis gibi). Hata metinleri Redis 7 ile
+  aynıdır; SET seçenekleri (EX, PX, NX, XX, GET...) açık bir hatayla reddedilir.
+- **AOF yalnızca yazılır:** açılışta geri yüklenmez. Kayıtlar ikili güvenlidir ve DEL de
+  yazılır, ama iş parçacıkları arasında AOF'a yazma sırası ile uygulama sırası aynı
+  olmayabilir (geri yükleme eklenirse ele alınmalı).
 - **Linux'a özgü kod macOS'ta derlenmez:** `net_uring.rs` macOS'ta denetlenemez (çapraz
   denetim de `libmimalloc-sys` yüzünden kalır).
 - **`.gitignore` tuzakları:** `*.txt`, `*.svg`, `*.log`, `*.aof` kalıpları dışlanır; bu
   uzantılarla eklenen yeni dosyalar commit'e girmez. `Cargo.lock` listede olduğu hâlde
   izlenir; bağımlılık değişince onu da commit'le.
-- README'deki `benchmark_redis_vs_ignix.py` yok; gerçek betikler `benchmarks/` altında.
 
 ## Kodlama kuralları
 
@@ -139,9 +139,8 @@ Bugünkü `main` için geçerlidir. Görevin konusu değilse düzeltmeye kalkma;
 - Ağ davranışı (parçalı okuma, büyük yük, bağlantı durumu) için sunucu isteyen test yaz ve
   `#[ignore = "requires a running ignix server on 127.0.0.1:7379"]` ile işaretle.
 - Başarım iddiası ölçüm ister: önce/sonra criterion karşılaştırması (`performans-olcumu`).
-- İş bitince (bakım kartından sonra): `cargo check --all-targets`, `cargo clippy -- -D
-  warnings`, `cargo fmt --check`, `cargo test -- --skip test_large_payload`; ağ koduna
-  dokunduysan `bash .hub/sunucu-testleri.sh`.
+- İş bitince: `cargo check --all-targets`, `cargo clippy --all-targets -- -D warnings`,
+  `cargo fmt --check`, `cargo test`; ağ koduna dokunduysan `bash .hub/sunucu-testleri.sh`.
 
 ## Commit, CHANGELOG ve sürüm
 
