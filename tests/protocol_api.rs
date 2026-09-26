@@ -111,3 +111,11 @@ fn dict_incr_reports_redis_errors_without_changing_the_value() {
         "ERR increment or decrement would overflow"
     );
 }
+
+#[test]
+fn emit_aof_del_encodes_every_key() {
+    assert_eq!(
+        ignix::emit_aof_del(&[b("a"), Bytes::from_static(b"\xff")]),
+        b"*3\r\n$3\r\nDEL\r\n$1\r\na\r\n$1\r\n\xff\r\n"
+    );
+}

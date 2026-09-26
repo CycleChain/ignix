@@ -6,7 +6,9 @@
  * and maintains its own storage and AOF logging.
  */
 
-use crate::aof::{emit_aof_incr, emit_aof_mset, emit_aof_rename, emit_aof_set, AofHandle};
+use crate::aof::{
+    emit_aof_del, emit_aof_incr, emit_aof_mset, emit_aof_rename, emit_aof_set, AofHandle,
+};
 use crate::protocol::{
     parse_canonical_i64, write_array_len, write_bulk, write_error, write_integer, write_null,
     write_simple, Cmd, Value,
@@ -99,6 +101,11 @@ impl Shard {
                 // Keep only the keys that were removed; a repeated key is
                 // removed (and counted) once, like in Redis.
                 keys.retain(|k| self.dict.del(k));
+                if let Some(a) = &self.aof {
+                    if !keys.is_empty() {
+                        a.write(&emit_aof_del(&keys));
+                    }
+                }
                 write_integer(keys.len() as i64, out);
             }
 

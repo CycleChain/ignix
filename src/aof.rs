@@ -6,6 +6,7 @@
  * to disk for crash recovery.
  */
 
+use crate::protocol::fmt_u64;
 use anyhow::*;
 use crossbeam::channel::{bounded, Sender};
 use std::io::Write;
@@ -97,85 +98,94 @@ impl AofHandle {
 //
 // AOF Command Emission Functions
 //
-// These functions generate RESP-formatted commands for logging to AOF.
-// The format is human-readable and compatible with Redis AOF files.
+// These functions encode commands as RESP arrays of bulk strings, the format
+// clients send and Redis AOF files use. Keys and values are copied byte for
+// byte, so binary data is preserved.
 //
+
+/// Number of decimal digits of `n`.
+fn decimal_len(n: usize) -> usize {
+    n.checked_ilog10().map_or(1, |digits| digits as usize + 1)
+}
+
+/// Append a `<prefix><n>\r\n` header line.
+fn push_header(out: &mut Vec<u8>, prefix: u8, n: usize) {
+    let mut digits = [0u8; 20];
+    out.push(prefix);
+    out.extend_from_slice(fmt_u64(n as u64, &mut digits));
+    out.extend_from_slice(b"\r\n");
+}
+
+/// Append a `$<len>\r\n<bytes>\r\n` bulk string.
+fn push_bulk(out: &mut Vec<u8>, bytes: &[u8]) {
+    push_header(out, b'$', bytes.len());
+    out.extend_from_slice(bytes);
+    out.extend_from_slice(b"\r\n");
+}
+
+/// Encoded size of a bulk string holding `bytes`.
+fn bulk_len(bytes: &[u8]) -> usize {
+    1 + decimal_len(bytes.len()) + 2 + bytes.len() + 2
+}
+
+/// Encode the command `name args...` into an exactly sized buffer.
+fn encode<'a>(name: &[u8], args: impl Iterator<Item = &'a [u8]> + Clone) -> Vec<u8> {
+    let count = 1 + args.clone().count();
+    let size =
+        1 + decimal_len(count) + 2 + bulk_len(name) + args.clone().map(bulk_len).sum::<usize>();
+    let mut out = Vec::with_capacity(size);
+    push_header(&mut out, b'*', count);
+    push_bulk(&mut out, name);
+    for arg in args {
+        push_bulk(&mut out, arg);
+    }
+    out
+}
 
 /// Generate AOF entry for SET command
 ///
-/// Creates a RESP-formatted SET command for AOF logging.
 /// Format: *3\r\n$3\r\nSET\r\n$<keylen>\r\n<key>\r\n$<vallen>\r\n<val>\r\n
 ///
 /// # Arguments
 /// * `k` - Key bytes
 /// * `v` - Value bytes
 pub fn emit_aof_set(k: &[u8], v: &[u8]) -> Vec<u8> {
-    format!(
-        "*3\r\n$3\r\nSET\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-        k.len(),
-        String::from_utf8_lossy(k),
-        v.len(),
-        String::from_utf8_lossy(v)
-    )
-    .into_bytes()
+    encode(b"SET", [k, v].into_iter())
 }
 
 /// Generate AOF entry for RENAME command
-///
-/// Creates a RESP-formatted RENAME command for AOF logging.
 ///
 /// # Arguments
 /// * `a` - Old key bytes
 /// * `b` - New key bytes
 pub fn emit_aof_rename(a: &[u8], b: &[u8]) -> Vec<u8> {
-    format!(
-        "*3\r\n$6\r\nRENAME\r\n${}\r\n{}\r\n${}\r\n{}\r\n",
-        a.len(),
-        String::from_utf8_lossy(a),
-        b.len(),
-        String::from_utf8_lossy(b)
-    )
-    .into_bytes()
+    encode(b"RENAME", [a, b].into_iter())
 }
 
 /// Generate AOF entry for INCR command
 ///
-/// Creates a RESP-formatted INCR command for AOF logging.
-///
 /// # Arguments
 /// * `k` - Key bytes to increment
 pub fn emit_aof_incr(k: &[u8]) -> Vec<u8> {
-    format!(
-        "*2\r\n$4\r\nINCR\r\n${}\r\n{}\r\n",
-        k.len(),
-        String::from_utf8_lossy(k)
-    )
-    .into_bytes()
+    encode(b"INCR", [k].into_iter())
 }
 
 use bytes::Bytes;
 
 /// Generate AOF entry for MSET command
 ///
-/// Creates a RESP-formatted MSET command for AOF logging.
 /// Handles multiple key-value pairs in a single command.
 ///
 /// # Arguments
-/// * `pairs` - Vector of (key, value) byte pairs
+/// * `pairs` - (key, value) pairs
 pub fn emit_aof_mset(pairs: &[(Bytes, Bytes)]) -> Vec<u8> {
-    // Calculate total arguments: command + (key + value) * pairs
-    let mut s = format!("*{}\r\n$4\r\nMSET\r\n", 1 + pairs.len() * 2);
+    encode(b"MSET", pairs.iter().flat_map(|(k, v)| [&k[..], &v[..]]))
+}
 
-    // Add each key-value pair
-    for (k, v) in pairs {
-        s.push_str(&format!(
-            "${}\r\n{}\r\n${}\r\n{}\r\n",
-            k.len(),
-            String::from_utf8_lossy(k),
-            v.len(),
-            String::from_utf8_lossy(v)
-        ));
-    }
-
-    s.into_bytes()
+/// Generate AOF entry for DEL command
+///
+/// # Arguments
+/// * `keys` - Keys that were removed
+pub fn emit_aof_del(keys: &[Bytes]) -> Vec<u8> {
+    encode(b"DEL", keys.iter().map(|k| &k[..]))
 }

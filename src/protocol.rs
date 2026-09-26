@@ -527,6 +527,20 @@ pub fn write_integer(i: i64, out: &mut BytesMut) {
     out.put_slice(b"\r\n");
 }
 
+/// Format `n` in decimal into `buf` without allocating and return the digits.
+pub(crate) fn fmt_u64(mut n: u64, buf: &mut [u8; 20]) -> &[u8] {
+    let mut start = buf.len();
+    loop {
+        start -= 1;
+        buf[start] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    &buf[start..]
+}
+
 /// Write array length header (*<count>\r\n) directly to buffer
 pub fn write_array_len(n: usize, out: &mut BytesMut) {
     let len_str = n.to_string();
