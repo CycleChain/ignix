@@ -44,6 +44,9 @@ pub enum Cmd {
     Exists(Vec<Bytes>),
     /// INCR key - increment numeric value
     Incr(Bytes),
+    /// INCRBY key increment - add `increment` to the numeric value; DECRBY
+    /// and DECR are parsed as negative increments
+    IncrBy(Bytes, i64),
     /// MGET key1 key2 ... - get multiple keys
     MGet(Vec<Bytes>),
     /// MSET key1 value1 key2 value2 ... - set multiple key-value pairs
@@ -199,11 +202,14 @@ enum Kind {
     Rename,
     Exists,
     Incr,
+    IncrBy,
+    Decr,
+    DecrBy,
     MGet,
     MSet,
 }
 
-const COMMANDS: [(&str, Kind); 9] = [
+const COMMANDS: [(&str, Kind); 12] = [
     ("ping", Kind::Ping),
     ("get", Kind::Get),
     ("set", Kind::Set),
@@ -211,6 +217,9 @@ const COMMANDS: [(&str, Kind); 9] = [
     ("rename", Kind::Rename),
     ("exists", Kind::Exists),
     ("incr", Kind::Incr),
+    ("incrby", Kind::IncrBy),
+    ("decr", Kind::Decr),
+    ("decrby", Kind::DecrBy),
     ("mget", Kind::MGet),
     ("mset", Kind::MSet),
 ];
@@ -233,8 +242,8 @@ fn command_from_frame(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String>
     let argc = items.len();
     let arity_ok = match kind {
         Kind::Ping => argc <= 2,
-        Kind::Get | Kind::Incr => argc == 2,
-        Kind::Rename => argc == 3,
+        Kind::Get | Kind::Incr | Kind::Decr => argc == 2,
+        Kind::Rename | Kind::IncrBy | Kind::DecrBy => argc == 3,
         Kind::Set => argc >= 3,
         Kind::Del | Kind::Exists | Kind::MGet => argc >= 2,
         Kind::MSet => argc >= 3 && argc % 2 == 1,
@@ -262,13 +271,26 @@ fn command_from_frame(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String>
             }
             Cmd::MSet(pairs)
         }
-        Kind::Get | Kind::Incr => {
+        Kind::Get | Kind::Incr | Kind::Decr => {
             let [key] = <[Bytes; 1]>::try_from(items).map_err(|_| arity_error())?;
-            if matches!(kind, Kind::Get) {
-                Cmd::Get(key)
-            } else {
-                Cmd::Incr(key)
+            match kind {
+                Kind::Get => Cmd::Get(key),
+                Kind::Incr => Cmd::Incr(key),
+                _ => Cmd::IncrBy(key, -1),
             }
+        }
+        Kind::IncrBy | Kind::DecrBy => {
+            let [key, amount] = <[Bytes; 2]>::try_from(items).map_err(|_| arity_error())?;
+            let amount = parse_canonical_i64(&amount)
+                .ok_or_else(|| "ERR value is not an integer or out of range".to_string())?;
+            let delta = if matches!(kind, Kind::IncrBy) {
+                amount
+            } else {
+                amount
+                    .checked_neg()
+                    .ok_or_else(|| "ERR decrement would overflow".to_string())?
+            };
+            Cmd::IncrBy(key, delta)
         }
         Kind::Set => {
             let [key, value] = <[Bytes; 2]>::try_from(items).map_err(|_| arity_error())?;

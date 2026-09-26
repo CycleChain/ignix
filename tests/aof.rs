@@ -132,3 +132,27 @@ fn unopenable_aof_path_returns_an_error() {
         "an AOF file that cannot be opened must be reported to the caller"
     );
 }
+
+#[test]
+fn incrby_and_decr_are_logged_with_their_increment() {
+    let data = aof_after(
+        "incrby",
+        &[
+            &[b"INCRBY", b"k", b"5"],
+            &[b"DECR", b"k"],
+            &[b"DECRBY", b"k", b"-2"],
+        ],
+    );
+    assert!(contains(
+        &data,
+        b"*3\r\n$6\r\nINCRBY\r\n$1\r\nk\r\n$1\r\n5\r\n"
+    ));
+    assert!(contains(
+        &data,
+        b"*3\r\n$6\r\nINCRBY\r\n$1\r\nk\r\n$2\r\n-1\r\n"
+    ));
+    assert!(contains(
+        &data,
+        b"*3\r\n$6\r\nINCRBY\r\n$1\r\nk\r\n$1\r\n2\r\n"
+    ));
+}

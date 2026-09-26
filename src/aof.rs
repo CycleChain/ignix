@@ -6,7 +6,7 @@
  * to disk for crash recovery.
  */
 
-use crate::protocol::fmt_u64;
+use crate::protocol::{fmt_i64, fmt_u64};
 use anyhow::*;
 use crossbeam::channel::{bounded, RecvTimeoutError, Sender};
 use std::io::Write;
@@ -188,6 +188,16 @@ pub fn emit_aof_rename(a: &[u8], b: &[u8]) -> Vec<u8> {
 /// * `k` - Key bytes to increment
 pub fn emit_aof_incr(k: &[u8]) -> Vec<u8> {
     encode(b"INCR", [k].into_iter())
+}
+
+/// Generate AOF entry for INCRBY command (also used for DECRBY and DECR)
+///
+/// # Arguments
+/// * `k` - Key bytes
+/// * `delta` - Amount added to the value
+pub fn emit_aof_incrby(k: &[u8], delta: i64) -> Vec<u8> {
+    let mut digits = [0u8; 20];
+    encode(b"INCRBY", [k, fmt_i64(delta, &mut digits)].into_iter())
 }
 
 use bytes::Bytes;

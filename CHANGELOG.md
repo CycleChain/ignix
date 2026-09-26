@@ -11,6 +11,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Remote crash on malformed requests**: a negative or oversized bulk length (e.g. `*1\r\n$-5\r\n`) made the parser overflow, and a huge element count (`*9223372036854775807\r\n`) made it try to allocate that many elements. Because the release profile uses `panic = "abort"`, a single packet from any client terminated the whole server. Lengths are now parsed with checked arithmetic, bulk strings are limited to 512 MiB and element counts to `INT_MAX` (as in Redis), and malformed input is answered with `ERR Protocol error: ...`.
 
 ### Added
+- **`INCRBY`, `DECRBY` and `DECR`**, with the same integer rules and error messages as Redis. redis-py implements `incr()` with `INCRBY`, so counters did not work with it before. New API: `Cmd::IncrBy(key, delta)` (DECRBY and DECR are parsed as negative deltas), `Dict::incr_by` and `emit_aof_incrby`.
 - **Multi-key `DEL` and `EXISTS`, `PING [message]`**: `DEL` removes every given key and replies with the number removed, `EXISTS` counts every existing argument (repeated keys count each time), and `PING message` echoes the message as a bulk string, as in Redis.
 
 - **Request API for servers**: `protocol::parse_requests` parses every complete request into `Request::Cmd` or `Request::Invalid(error_line)` and only fails on protocol errors, and `protocol::write_error` writes a RESP error reply (`-ERR ...`).

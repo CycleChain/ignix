@@ -7,7 +7,8 @@
  */
 
 use crate::aof::{
-    emit_aof_del, emit_aof_incr, emit_aof_mset, emit_aof_rename, emit_aof_set, AofHandle,
+    emit_aof_del, emit_aof_incr, emit_aof_incrby, emit_aof_mset, emit_aof_rename, emit_aof_set,
+    AofHandle,
 };
 use crate::protocol::{
     fmt_i64, parse_canonical_i64, write_array_len, write_bulk, write_error, write_integer,
@@ -147,6 +148,20 @@ impl Shard {
                         // Log only successful increments
                         if let (Some(a), Some(key)) = (&self.aof, aof_key) {
                             a.write(&emit_aof_incr(&key));
+                        }
+                        write_integer(v, out);
+                    }
+                    Err(e) => write_error(e.as_str(), out),
+                }
+            }
+
+            // INCRBY / DECRBY / DECR - add a delta to a numeric value
+            Cmd::IncrBy(k, delta) => {
+                let aof_key = self.aof.is_some().then(|| k.clone());
+                match self.dict.incr_by(k, delta) {
+                    Ok(v) => {
+                        if let (Some(a), Some(key)) = (&self.aof, aof_key) {
+                            a.write(&emit_aof_incrby(&key, delta));
                         }
                         write_integer(v, out);
                     }

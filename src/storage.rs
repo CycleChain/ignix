@@ -141,6 +141,14 @@ impl Dict {
     /// Like Redis, fails without changing the stored value when it is not a
     /// canonical integer string or when the result would overflow an `i64`.
     pub fn incr(&self, key: Bytes) -> Result<i64, IncrError> {
+        self.incr_by(key, 1)
+    }
+
+    /// Atomically add `delta` to the integer stored under `key`, starting from
+    /// 0 if it is missing (INCRBY, DECRBY and DECR).
+    ///
+    /// Fails without changing the stored value like [`Dict::incr`].
+    pub fn incr_by(&self, key: Bytes, delta: i64) -> Result<i64, IncrError> {
         use dashmap::mapref::entry::Entry;
         match self.inner.entry(key) {
             Entry::Occupied(mut e) => {
@@ -150,13 +158,13 @@ impl Dict {
                         parse_canonical_i64(s).ok_or(IncrError::NotAnInteger)?
                     }
                 };
-                let next = current.checked_add(1).ok_or(IncrError::Overflow)?;
+                let next = current.checked_add(delta).ok_or(IncrError::Overflow)?;
                 *e.get_mut() = Value::Int(next);
                 Ok(next)
             }
             Entry::Vacant(v) => {
-                v.insert(Value::Int(1));
-                Ok(1)
+                v.insert(Value::Int(delta));
+                Ok(delta)
             }
         }
     }

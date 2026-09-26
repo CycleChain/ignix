@@ -296,3 +296,61 @@ fn rename_moves_the_value_and_overwrites_the_target() {
     assert_eq!(exec(&s, &[b"GET", b"a"]), b"$-1\r\n");
     assert_eq!(exec(&s, &[b"GET", b"b"]), b"$1\r\n1\r\n");
 }
+
+#[test]
+fn incrby_decrby_and_decr_apply_the_delta() {
+    let s = shard();
+    exec(&s, &[b"SET", b"n", b"10"]);
+    assert_eq!(exec(&s, &[b"INCRBY", b"n", b"5"]), b":15\r\n");
+    assert_eq!(exec(&s, &[b"INCRBY", b"n", b"-20"]), b":-5\r\n");
+    assert_eq!(exec(&s, &[b"DECRBY", b"n", b"3"]), b":-8\r\n");
+    assert_eq!(exec(&s, &[b"DECR", b"n"]), b":-9\r\n");
+    assert_eq!(exec(&s, &[b"INCRBY", b"new", b"7"]), b":7\r\n");
+    assert_eq!(exec(&s, &[b"DECR", b"new2"]), b":-1\r\n");
+    assert_eq!(exec(&s, &[b"GET", b"n"]), b"$2\r\n-9\r\n");
+}
+
+#[test]
+fn incrby_rejects_a_non_canonical_increment() {
+    let s = shard();
+    exec(&s, &[b"SET", b"n", b"10"]);
+    let increments: [&[u8]; 4] = [b"abc", b"+5", b"007", b" 5"];
+    for increment in increments {
+        assert_eq!(
+            exec(&s, &[b"INCRBY", b"n", increment]),
+            b"-ERR value is not an integer or out of range\r\n"
+        );
+    }
+    assert_eq!(exec(&s, &[b"GET", b"n"]), b"$2\r\n10\r\n");
+}
+
+#[test]
+fn incrby_and_decr_report_overflow_like_redis() {
+    let s = shard();
+    exec(&s, &[b"SET", b"max", b"9223372036854775800"]);
+    assert_eq!(
+        exec(&s, &[b"INCRBY", b"max", b"100"]),
+        b"-ERR increment or decrement would overflow\r\n"
+    );
+    exec(&s, &[b"SET", b"min", b"-9223372036854775808"]);
+    assert_eq!(
+        exec(&s, &[b"DECR", b"min"]),
+        b"-ERR increment or decrement would overflow\r\n"
+    );
+    assert_eq!(
+        exec(&s, &[b"DECRBY", b"n", b"-9223372036854775808"]),
+        b"-ERR decrement would overflow\r\n"
+    );
+}
+
+#[test]
+fn incrby_family_checks_arity() {
+    let cases: &[(&[&[u8]], &str)] = &[
+        (&[b"INCRBY", b"n"], "incrby"),
+        (&[b"DECR"], "decr"),
+        (&[b"DECRBY", b"n", b"1", b"2"], "decrby"),
+    ];
+    for (args, name) in cases {
+        assert_eq!(exec(&shard(), args), arity_error(name));
+    }
+}
