@@ -41,7 +41,7 @@ impl std::error::Error for IncrError {}
 /// High-performance in-memory dictionary
 ///
 /// The core storage structure that holds all key-value pairs in memory.
-/// Uses SwissTable (hashbrown) with AHash for fast lookups and supports all Redis-compatible operations.
+/// Uses DashMap (sharded hash tables) with its default hasher and supports all Redis-compatible operations.
 #[derive(Default)]
 pub struct Dict {
     /// Concurrent DashMap for optimal performance (sharded locking)

@@ -25,21 +25,15 @@ path = "src/bin/ignix.rs"
 
 [dependencies]
 anyhow = "1"
-thiserror = "1"
 bytes = "1"
 mio = { version = "0.8", features = ["net", "os-poll"] }
-parking_lot = "0.12"
-ahash = "0.8"
-xxhash-rust = { version = "0.8", features = ["xxh3"] }
 crossbeam = "0.8"
 log = "0.4"
 env_logger = "0.11"
 socket2 = { version = "0.5", features = ["all"] }
 hashbrown = "0.14"
 dashmap = "6"
-rustc-hash = "1"
 mimalloc = { version = "0.1", default-features = false }
-smol_str = "0.3.4"
 
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -50,7 +44,6 @@ slab = "0.4"
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
-rand = "0.8"
 
 
 [[bench]]
