@@ -5,9 +5,38 @@
  * a concurrent in-memory dictionary using DashMap with a fast hasher.
  */
 
-use crate::protocol::Value;
+use crate::protocol::{parse_canonical_i64, Value};
 use bytes::Bytes;
 use dashmap::DashMap;
+use std::fmt;
+
+/// Error returned by [`Dict::incr`]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum IncrError {
+    /// The stored value is not a canonical 64-bit integer string
+    NotAnInteger,
+    /// The result would not fit in an `i64`
+    Overflow,
+}
+
+impl IncrError {
+    /// The Redis error line for this error
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            IncrError::NotAnInteger => "ERR value is not an integer or out of range",
+            IncrError::Overflow => "ERR increment or decrement would overflow",
+        }
+    }
+}
+
+impl fmt::Display for IncrError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::error::Error for IncrError {}
 
 /// High-performance in-memory dictionary
 ///
@@ -106,34 +135,28 @@ impl Dict {
         self.inner.contains_key(k)
     }
 
-    /// Atomically increment an integer-like value stored under key, creating it if missing
-    pub fn incr(&self, k: &[u8]) -> i64 {
+    /// Atomically increment the integer stored under `key`, creating it with
+    /// value 1 if it is missing.
+    ///
+    /// Like Redis, fails without changing the stored value when it is not a
+    /// canonical integer string or when the result would overflow an `i64`.
+    pub fn incr(&self, key: Bytes) -> Result<i64, IncrError> {
         use dashmap::mapref::entry::Entry;
-        // We need to convert slice to Bytes for entry API if we insert
-        // But DashMap entry API requires owned key.
-        // We can't avoid allocation/clone here if we use entry API with a slice input.
-        // So we accept the cost for INCR.
-        match self.inner.entry(Bytes::copy_from_slice(k)) {
-            Entry::Occupied(mut e) => match e.get_mut() {
-                Value::Int(i) => {
-                    *i += 1;
-                    *i
-                }
-                Value::Str(s) => {
-                    let mut n = std::str::from_utf8(s)
-                        .ok()
-                        .and_then(|x| x.parse::<i64>().ok())
-                        .unwrap_or(0);
-                    n += 1;
-                    // Optimize: Store as Int now!
-                    *e.get_mut() = Value::Int(n);
-                    n
-                }
-                _ => 0,
-            },
+        match self.inner.entry(key) {
+            Entry::Occupied(mut e) => {
+                let current = match e.get() {
+                    Value::Int(i) => *i,
+                    Value::Str(s) | Value::Blob(s) => {
+                        parse_canonical_i64(s).ok_or(IncrError::NotAnInteger)?
+                    }
+                };
+                let next = current.checked_add(1).ok_or(IncrError::Overflow)?;
+                *e.get_mut() = Value::Int(next);
+                Ok(next)
+            }
             Entry::Vacant(v) => {
                 v.insert(Value::Int(1));
-                1
+                Ok(1)
             }
         }
     }

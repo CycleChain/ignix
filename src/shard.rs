@@ -8,8 +8,8 @@
 
 use crate::aof::{emit_aof_incr, emit_aof_mset, emit_aof_rename, emit_aof_set, AofHandle};
 use crate::protocol::{
-    parse_canonical_i64, write_array_len, write_bulk, write_integer, write_null, write_simple, Cmd,
-    Value,
+    parse_canonical_i64, write_array_len, write_bulk, write_error, write_integer, write_null,
+    write_simple, Cmd, Value,
 };
 use crate::storage::Dict;
 use bytes::{Bytes, BytesMut};
@@ -134,14 +134,18 @@ impl Shard {
 
             // INCR key - increment numeric value
             Cmd::Incr(k) => {
-                let v = self.dict.incr(&k);
-
-                // Log increment to AOF
-                if let Some(a) = &self.aof {
-                    a.write(&emit_aof_incr(&k));
+                // Keep the key for the AOF record only when persistence is on.
+                let aof_key = self.aof.is_some().then(|| k.clone());
+                match self.dict.incr(k) {
+                    Ok(v) => {
+                        // Log only successful increments
+                        if let (Some(a), Some(key)) = (&self.aof, aof_key) {
+                            a.write(&emit_aof_incr(&key));
+                        }
+                        write_integer(v, out);
+                    }
+                    Err(e) => write_error(e.as_str(), out),
                 }
-
-                write_integer(v, out);
             }
 
             // MGET key1 key2 ... - get multiple keys

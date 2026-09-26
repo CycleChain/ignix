@@ -89,3 +89,25 @@ fn commands_have_the_expected_shapes() {
         Cmd::MSet(vec![(b("a"), b("1")), (b("b"), b("2"))])
     );
 }
+
+#[test]
+fn dict_incr_reports_redis_errors_without_changing_the_value() {
+    let dict = ignix::Dict::default();
+    dict.set(b("text"), ignix::Value::Str(b("abc")));
+    assert_eq!(dict.incr(b("text")), Err(ignix::IncrError::NotAnInteger));
+    assert_eq!(dict.get(b"text"), Some(ignix::Value::Str(b("abc"))));
+
+    dict.set(b("max"), ignix::Value::Int(i64::MAX));
+    assert_eq!(dict.incr(b("max")), Err(ignix::IncrError::Overflow));
+    assert_eq!(dict.get(b"max"), Some(ignix::Value::Int(i64::MAX)));
+
+    assert_eq!(dict.incr(b("new")), Ok(1));
+    assert_eq!(
+        ignix::IncrError::NotAnInteger.to_string(),
+        "ERR value is not an integer or out of range"
+    );
+    assert_eq!(
+        ignix::IncrError::Overflow.to_string(),
+        "ERR increment or decrement would overflow"
+    );
+}

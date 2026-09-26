@@ -213,3 +213,52 @@ fn set_round_trips_canonical_integers() {
         assert_eq!(exec(&s, &[b"GET", b"k"]), bulk(value));
     }
 }
+
+#[test]
+fn incr_on_non_integer_returns_error_and_keeps_value() {
+    let s = shard();
+    exec(&s, &[b"SET", b"k", b"abc"]);
+    assert_eq!(
+        exec(&s, &[b"INCR", b"k"]),
+        b"-ERR value is not an integer or out of range\r\n"
+    );
+    assert_eq!(exec(&s, &[b"GET", b"k"]), b"$3\r\nabc\r\n");
+}
+
+#[test]
+fn incr_on_non_canonical_integer_returns_error() {
+    let s = shard();
+    exec(&s, &[b"SET", b"k", b"007"]);
+    assert_eq!(
+        exec(&s, &[b"INCR", b"k"]),
+        b"-ERR value is not an integer or out of range\r\n"
+    );
+    assert_eq!(exec(&s, &[b"GET", b"k"]), b"$3\r\n007\r\n");
+}
+
+#[test]
+fn incr_overflow_returns_error_and_keeps_value() {
+    let s = shard();
+    exec(&s, &[b"SET", b"k", b"9223372036854775807"]);
+    assert_eq!(
+        exec(&s, &[b"INCR", b"k"]),
+        b"-ERR increment or decrement would overflow\r\n"
+    );
+    assert_eq!(exec(&s, &[b"GET", b"k"]), b"$19\r\n9223372036854775807\r\n");
+}
+
+#[test]
+fn incr_missing_key_starts_at_one() {
+    let s = shard();
+    assert_eq!(exec(&s, &[b"INCR", b"counter"]), b":1\r\n");
+    assert_eq!(exec(&s, &[b"INCR", b"counter"]), b":2\r\n");
+    assert_eq!(exec(&s, &[b"GET", b"counter"]), b"$1\r\n2\r\n");
+}
+
+#[test]
+fn incr_updates_integer_values() {
+    let s = shard();
+    exec(&s, &[b"SET", b"k", b"-10"]);
+    assert_eq!(exec(&s, &[b"INCR", b"k"]), b":-9\r\n");
+    assert_eq!(exec(&s, &[b"GET", b"k"]), b"$2\r\n-9\r\n");
+}
