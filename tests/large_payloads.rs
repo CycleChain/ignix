@@ -46,6 +46,7 @@ fn read_bulk_string(stream: &mut TcpStream) -> Vec<u8> {
 }
 
 #[test]
+#[ignore = "requires a running ignix server on 127.0.0.1:7379"]
 fn test_large_payload_100kb() {
     let mut stream = get_client();
     let size = 100 * 1024;
@@ -75,6 +76,7 @@ fn test_large_payload_100kb() {
 }
 
 #[test]
+#[ignore = "requires a running ignix server on 127.0.0.1:7379"]
 fn test_large_payload_1mb() {
     let mut stream = get_client();
     let size = 1024 * 1024;
@@ -117,6 +119,7 @@ fn test_large_payload_1mb() {
 }
 
 #[test]
+#[ignore = "requires a running ignix server on 127.0.0.1:7379"]
 fn test_large_payload_10mb() {
     let mut stream = get_client();
     let size = 10 * 1024 * 1024;

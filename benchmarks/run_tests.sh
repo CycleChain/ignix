@@ -20,7 +20,7 @@ echo "Server started with PID $SERVER_PID" >> test_status.txt
 sleep 5
 
 echo "Running tests..." >> test_status.txt
-cargo test --test large_payloads -- --nocapture > test_output.txt 2>&1
+cargo test --test large_payloads -- --include-ignored --nocapture > test_output.txt 2>&1
 EXIT_CODE=$?
 echo "Tests finished with exit code $EXIT_CODE" >> test_status.txt
 kill $SERVER_PID
