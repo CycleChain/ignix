@@ -262,3 +262,37 @@ fn incr_updates_integer_values() {
     assert_eq!(exec(&s, &[b"INCR", b"k"]), b":-9\r\n");
     assert_eq!(exec(&s, &[b"GET", b"k"]), b"$2\r\n-9\r\n");
 }
+
+#[test]
+fn rename_missing_key_returns_resp_error() {
+    assert_eq!(
+        exec(&shard(), &[b"RENAME", b"nokey", b"other"]),
+        b"-ERR no such key\r\n"
+    );
+}
+
+#[test]
+fn rename_missing_key_onto_itself_is_an_error() {
+    assert_eq!(
+        exec(&shard(), &[b"RENAME", b"nokey", b"nokey"]),
+        b"-ERR no such key\r\n"
+    );
+}
+
+#[test]
+fn rename_existing_key_onto_itself_is_ok() {
+    let s = shard();
+    exec(&s, &[b"SET", b"k", b"v"]);
+    assert_eq!(exec(&s, &[b"RENAME", b"k", b"k"]), b"+OK\r\n");
+    assert_eq!(exec(&s, &[b"GET", b"k"]), b"$1\r\nv\r\n");
+}
+
+#[test]
+fn rename_moves_the_value_and_overwrites_the_target() {
+    let s = shard();
+    exec(&s, &[b"SET", b"a", b"1"]);
+    exec(&s, &[b"SET", b"b", b"2"]);
+    assert_eq!(exec(&s, &[b"RENAME", b"a", b"b"]), b"+OK\r\n");
+    assert_eq!(exec(&s, &[b"GET", b"a"]), b"$-1\r\n");
+    assert_eq!(exec(&s, &[b"GET", b"b"]), b"$1\r\n1\r\n");
+}

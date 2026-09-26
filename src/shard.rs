@@ -104,24 +104,16 @@ impl Shard {
 
             // RENAME oldkey newkey - rename a key
             Cmd::Rename(from, to) => {
-                if self.aof.is_some() {
-                    let ok = self.dict.rename(from.clone(), to.clone());
-                    if ok {
-                        if let Some(a) = &self.aof {
-                            a.write(&emit_aof_rename(&from, &to));
-                        }
-                        write_simple("OK", out);
-                    } else {
-                        write_simple("ERR no such key", out);
+                // Encode the AOF record before the keys move into the map;
+                // it is only written if the rename succeeds.
+                let record = self.aof.as_ref().map(|_| emit_aof_rename(&from, &to));
+                if self.dict.rename(from, to) {
+                    if let (Some(a), Some(record)) = (&self.aof, record) {
+                        a.write(&record);
                     }
+                    write_simple("OK", out);
                 } else {
-                    // No AOF, we can move directly
-                    let ok = self.dict.rename(from, to);
-                    if ok {
-                        write_simple("OK", out);
-                    } else {
-                        write_simple("ERR no such key", out);
-                    }
+                    write_error("ERR no such key", out);
                 }
             }
 

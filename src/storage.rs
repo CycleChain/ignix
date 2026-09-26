@@ -106,9 +106,9 @@ impl Dict {
     /// * `false` if source key didn't exist
     #[inline]
     pub fn rename(&self, from: Bytes, to: Bytes) -> bool {
-        // Handle edge case where source and destination are the same
+        // Renaming a key onto itself only succeeds if the key exists (Redis)
         if from == to {
-            return true;
+            return self.inner.contains_key(&from);
         }
 
         // Simple remove-then-insert; note this is not atomic across shards
