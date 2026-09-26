@@ -22,9 +22,9 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 /// 4. Create storage shard
 /// 5. Start server event loop
 fn main() -> Result<()> {
-    // Initialize logging - respects RUST_LOG environment variable
-    // Example: RUST_LOG=debug cargo run --release
-    env_logger::init();
+    // Initialize logging - respects RUST_LOG environment variable and shows
+    // info and above by default. Example: RUST_LOG=debug cargo run --release
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
 
     // Parse arguments
     let args: Vec<String> = std::env::args().collect();
@@ -50,9 +50,7 @@ fn main() -> Result<()> {
     }
 
     if use_uring {
-        eprintln!(
-            "Warning: io_uring backend is only available on Linux. Falling back to mio/epoll."
-        );
+        log::warn!("io_uring backend is only available on Linux, falling back to mio/epoll");
     }
 
     // Start the main server event loop

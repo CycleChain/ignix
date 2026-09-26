@@ -82,7 +82,7 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
 
             if user_data == OP_ACCEPT {
                 if res < 0 {
-                    eprintln!("Accept error: {}", res);
+                    log::warn!("accept failed: {}", std::io::Error::from_raw_os_error(-res));
                 } else {
                     let fd = res;
                     let entry = connections.vacant_entry();

@@ -69,7 +69,7 @@ pub fn run_shard(_shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()>
         let shard = shard.clone();
         handles.push(std::thread::spawn(move || {
             if let Err(e) = run_worker_loop(id, addr, shard) {
-                eprintln!("Worker {} failed: {}", id, e);
+                log::error!("worker {id} stopped: {e:#}");
             }
         }));
     }
@@ -120,7 +120,6 @@ fn run_worker_loop(id: usize, addr: SocketAddr, shard: Arc<Shard>) -> Result<()>
                             poll.registry()
                                 .register(&mut sock, Token(tok), Interest::READABLE)?;
 
-                            // println!("Worker {} accepted connection {}", id, tok);
                             clients.insert(
                                 tok,
                                 (
@@ -133,7 +132,7 @@ fn run_worker_loop(id: usize, addr: SocketAddr, shard: Arc<Shard>) -> Result<()>
                         }
                         Err(ref e) if would_block(e) => break,
                         Err(e) => {
-                            eprintln!("Worker {} accept err: {}", id, e);
+                            log::warn!("worker {id}: accept failed: {e}");
                             break;
                         }
                     }
