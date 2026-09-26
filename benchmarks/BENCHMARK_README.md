@@ -84,6 +84,12 @@ server.
   most once per second. Run Redis with
   `--appendonly yes --appendfsync everysec --save ""` for the same
   guarantees; `run_benchmarks.sh` does this when it starts Redis.
+- **Disk space.** Ignix never compacts its AOF, so every write stays in
+  the file: after the measurements in the main README (two rounds of
+  these scripts and of `redis-benchmark`) the Ignix AOF was 13.8 GB,
+  against 2.3 GB for Redis, which rewrites its AOF.
+  `run_benchmarks.sh` starts both servers in a directory made by
+  `mktemp -d` (set `TMPDIR` to put it elsewhere) and deletes it at the end.
 - **Threads.** Ignix runs one event loop per CPU core; Redis executes
   commands on a single thread. Both share the machine with the client.
 - **The client is the bottleneck.** These scripts use Python threads, which

@@ -278,7 +278,7 @@ Monitor AOF: `tail -f ignix.aof`
 - Limited command set compared with Redis (no `KEYS`, `INFO`, `CLIENT`, `CONFIG`, `SELECT`, `QUIT`, ...).
 - RESP2 only: no RESP3 or `HELLO`, and no inline commands (plain text lines such as `PING` typed into telnet).
 - No key expiry: `SET` options and `EXPIRE` are not implemented.
-- The AOF is write-only: it is not loaded on startup, so data does not survive a restart, and it is never compacted.
+- The AOF is write-only: it is not loaded on startup, so data does not survive a restart, and it is never compacted, so it grows with every write. The server used for the Performance section ended with a 13.8 GB `ignix.aof`; Redis, which rewrites its AOF, used 2.3 GB.
 - Multi-key commands (`MSET`, `DEL`, `RENAME`) are not atomic with respect to other connections.
 - No authentication, and the server listens on the fixed address `0.0.0.0:7379`; do not expose it to untrusted networks.
 - The io_uring backend runs on a single thread.
