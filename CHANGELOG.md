@@ -23,6 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Logging**: diagnostics (accept errors, stopped workers, backend fallback) go through the `log` crate, so `RUST_LOG` now controls them; the default level is `info`. Previously nothing was logged and `RUST_LOG` had no effect.
 - **Stricter request framing**: length lines are parsed like Redis `string2ll` (no leading zeros, `+`, spaces or lines longer than 20 characters). Unlike Redis, a bulk payload must be followed by CRLF instead of skipping two bytes blindly, which stops a miscounted length from desynchronising the stream. Empty requests (`*0\r\n`, `*-1\r\n`) are ignored like in Redis instead of being an error.
 
+### Performance
+- **Allocation-free reply headers**: `write_bulk`, `write_integer` and `write_array_len`, and GET/MGET of integer values, formatted numbers with `to_string()` (one heap allocation per reply); they now format into a stack buffer. Criterion on a shared 4-vCPU Linux container, two runs against the previous commit: `reply/write_bulk_10k` -22% / -25%, `reply/write_integer_10k` -20% / -22%, `reply/write_array_len_10k` -28% / -29%, `exec/get_int_10k` -5% / -15%; the unchanged SET and parser paths moved within the run-to-run noise (up to ±20%).
+
 ### Fixed
 - **Connections stuck after an invalid request**: an unknown command or malformed request stayed at the head of the read buffer, so every later request on that connection got the same error, and requests parsed before it in the same read were dropped without being executed or answered. Clients that send `CLIENT SETINFO` on connect (redis-py 5, node-redis 4.7) were affected. Invalid commands now get an error reply and the connection keeps working; after a protocol error the error is sent and the connection is closed, as in Redis.
 - **Errors sent as status replies**: request errors were written as `+ERR ...`, which clients read as success; they are now RESP errors (`-ERR ...`).

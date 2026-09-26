@@ -119,3 +119,28 @@ fn emit_aof_del_encodes_every_key() {
         b"*3\r\n$3\r\nDEL\r\n$1\r\na\r\n$1\r\n\xff\r\n"
     );
 }
+
+#[test]
+fn integer_replies_cover_the_whole_i64_range() {
+    use ignix::protocol::{write_array_len, write_bulk, write_integer};
+    let mut out = BytesMut::new();
+    for (value, expected) in [
+        (0i64, &b":0\r\n"[..]),
+        (-1, b":-1\r\n"),
+        (i64::MAX, b":9223372036854775807\r\n"),
+        (i64::MIN, b":-9223372036854775808\r\n"),
+    ] {
+        out.clear();
+        write_integer(value, &mut out);
+        assert_eq!(&out[..], expected);
+    }
+    out.clear();
+    write_array_len(0, &mut out);
+    write_array_len(1234567, &mut out);
+    write_bulk(b"", &mut out);
+    write_bulk(&[b'x'; 12], &mut out);
+    assert_eq!(
+        &out[..],
+        b"*0\r\n*1234567\r\n$0\r\n\r\n$12\r\nxxxxxxxxxxxx\r\n"
+    );
+}

@@ -10,8 +10,8 @@ use crate::aof::{
     emit_aof_del, emit_aof_incr, emit_aof_mset, emit_aof_rename, emit_aof_set, AofHandle,
 };
 use crate::protocol::{
-    parse_canonical_i64, write_array_len, write_bulk, write_error, write_integer, write_null,
-    write_simple, Cmd, Value,
+    fmt_i64, parse_canonical_i64, write_array_len, write_bulk, write_error, write_integer,
+    write_null, write_simple, Cmd, Value,
 };
 use crate::storage::Dict;
 use bytes::{Bytes, BytesMut};
@@ -26,6 +26,20 @@ fn encode_value(v: Bytes) -> Value {
     match parse_canonical_i64(&v) {
         Some(i) => Value::Int(i),
         None => Value::Str(v),
+    }
+}
+
+/// Write a stored value, or null when the key is missing, as a GET reply.
+///
+/// Integers are sent as bulk strings, as Redis does for GET.
+fn write_value(value: Option<Value>, out: &mut BytesMut) {
+    match value {
+        Some(Value::Str(v)) | Some(Value::Blob(v)) => write_bulk(&v, out),
+        Some(Value::Int(i)) => {
+            let mut digits = [0u8; 20];
+            write_bulk(fmt_i64(i, &mut digits), out);
+        }
+        None => write_null(out),
     }
 }
 
@@ -74,14 +88,7 @@ impl Shard {
             Cmd::Ping(Some(message)) => write_bulk(&message, out),
 
             // GET key - retrieve value for key
-            Cmd::Get(k) => match self.dict.get(&k) {
-                // Return string/blob values as bulk strings
-                Some(Value::Str(v)) | Some(Value::Blob(v)) => write_bulk(&v, out),
-                // Return integer values as Bulk Strings (Redis protocol requirement for GET)
-                Some(Value::Int(i)) => write_bulk(i.to_string().as_bytes(), out),
-                // Return null if key doesn't exist
-                None => write_null(out),
-            },
+            Cmd::Get(k) => write_value(self.dict.get(&k), out),
 
             // SET key value - store key-value pair
             Cmd::Set(k, v) => {
@@ -153,11 +160,7 @@ impl Shard {
 
                 // Get each key and format as RESP
                 for k in keys {
-                    match self.dict.get(&k) {
-                        Some(Value::Str(v)) | Some(Value::Blob(v)) => write_bulk(&v, out),
-                        Some(Value::Int(i)) => write_bulk(i.to_string().as_bytes(), out),
-                        None => write_null(out),
-                    }
+                    write_value(self.dict.get(&k), out);
                 }
             }
 

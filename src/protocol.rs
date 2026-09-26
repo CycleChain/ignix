@@ -504,10 +504,11 @@ pub fn write_error(message: &str, out: &mut BytesMut) {
 
 /// Write a bulk string response ($<len>\r\n<data>\r\n) directly to buffer
 pub fn write_bulk(b: &[u8], out: &mut BytesMut) {
-    let len_str = b.len().to_string();
-    out.reserve(1 + len_str.len() + 2 + b.len() + 2);
+    let mut digits = [0u8; 20];
+    let len = fmt_u64(b.len() as u64, &mut digits);
+    out.reserve(1 + len.len() + 2 + b.len() + 2);
     out.put_u8(b'$');
-    out.put_slice(len_str.as_bytes());
+    out.put_slice(len);
     out.put_slice(b"\r\n");
     out.put_slice(b);
     out.put_slice(b"\r\n");
@@ -520,10 +521,11 @@ pub fn write_null(out: &mut BytesMut) {
 
 /// Write an integer response (:<number>\r\n) directly to buffer
 pub fn write_integer(i: i64, out: &mut BytesMut) {
-    let i_str = i.to_string();
-    out.reserve(1 + i_str.len() + 2);
+    let mut digits = [0u8; 20];
+    let digits = fmt_i64(i, &mut digits);
+    out.reserve(1 + digits.len() + 2);
     out.put_u8(b':');
-    out.put_slice(i_str.as_bytes());
+    out.put_slice(digits);
     out.put_slice(b"\r\n");
 }
 
@@ -541,11 +543,24 @@ pub(crate) fn fmt_u64(mut n: u64, buf: &mut [u8; 20]) -> &[u8] {
     &buf[start..]
 }
 
+/// Format `n` in decimal into `buf` without allocating and return the text.
+pub(crate) fn fmt_i64(n: i64, buf: &mut [u8; 20]) -> &[u8] {
+    // The magnitude of i64::MIN has 19 digits, so the sign always fits.
+    let start = buf.len() - fmt_u64(n.unsigned_abs(), buf).len();
+    if n < 0 {
+        buf[start - 1] = b'-';
+        &buf[start - 1..]
+    } else {
+        &buf[start..]
+    }
+}
+
 /// Write array length header (*<count>\r\n) directly to buffer
 pub fn write_array_len(n: usize, out: &mut BytesMut) {
-    let len_str = n.to_string();
-    out.reserve(1 + len_str.len() + 2);
+    let mut digits = [0u8; 20];
+    let digits = fmt_u64(n as u64, &mut digits);
+    out.reserve(1 + digits.len() + 2);
     out.put_u8(b'*');
-    out.put_slice(len_str.as_bytes());
+    out.put_slice(digits);
     out.put_slice(b"\r\n");
 }
