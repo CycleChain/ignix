@@ -49,16 +49,15 @@ tail ignix.aof
 -rw-r--r--  1 user  staff  714 Sep 22 18:06 ignix.aof
 ```
 
-The file contains RESP commands that were executed. Every command you run gets logged here!
+The file contains the commands that changed data, in RESP format: SET, MSET, DEL, RENAME, INCR, INCRBY, DECR and DECRBY. Reads such as GET are not logged.
 
 ## 🔍 Method 4: Stop/Start Test
 
 The most definitive test:
 
 1. **Stop Ignix:**
-   ```bash
-   pkill -f ignix
-   ```
+   Press Ctrl+C in the terminal where Ignix runs, or stop that process with `kill <pid>`
+   (find the pid with `lsof -nP -iTCP:7379 -sTCP:LISTEN`).
 
 2. **Try to connect with your client:**
    ```bash
@@ -67,7 +66,7 @@ The most definitive test:
    
    **Expected output:**
    ```
-   ❌ Connection failed: [Errno 61] Connection refused
+   ❌ Connection failed: [Errno 111] Connection refused
    ```
 
 3. **Start Ignix again:**
@@ -120,7 +119,7 @@ If you accidentally connect to a Redis server instead of Ignix, you'll see:
 - [ ] `ps aux | grep ignix` shows Ignix process
 - [ ] `lsof -i :7379` shows `ignix` command
 - [ ] `ignix.aof` file exists and gets updated
-- [ ] Client fails when you stop Ignix (`pkill -f ignix`)
+- [ ] Client fails when you stop Ignix
 - [ ] Client works when you start Ignix (`cargo run --release`)
 
 ## 💡 Pro Tips

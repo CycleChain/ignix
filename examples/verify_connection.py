@@ -116,6 +116,7 @@ def verify_ignix_connection():
     print("-" * 25)
     
     aof_file = "ignix.aof"
+    aof_size_before = os.path.getsize(aof_file) if os.path.exists(aof_file) else 0
     if os.path.exists(aof_file):
         stat = os.stat(aof_file)
         mod_time = time.ctime(stat.st_mtime)
@@ -168,14 +169,19 @@ def verify_ignix_connection():
         print("\n5️⃣  AOF File Update Check:")
         print("-" * 25)
         
-        # Check if AOF file was updated after our operation
-        if os.path.exists(aof_file):
-            new_stat = os.stat(aof_file)
-            if new_stat.st_mtime > stat.st_mtime:
-                print("✅ AOF file updated after our operation")
-                print("✅ This confirms we're connected to Ignix!")
-            else:
-                print("⚠️  AOF file not updated (might be Redis)")
+        # Check if AOF file grew after our operation. The AOF is written by a
+        # background thread, so give it a moment.
+        updated = False
+        for _ in range(20):
+            if os.path.exists(aof_file) and os.path.getsize(aof_file) > aof_size_before:
+                updated = True
+                break
+            time.sleep(0.1)
+        if updated:
+            print("✅ AOF file updated after our operation")
+            print("✅ This confirms we're connected to Ignix!")
+        else:
+            print("⚠️  AOF file not updated (might be Redis, or Ignix runs in another directory)")
         
         return True
         

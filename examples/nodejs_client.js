@@ -24,10 +24,15 @@ async function main() {
         // Connect to Ignix server
         console.log('Connecting to Ignix server at localhost:7379...');
         client = redis.createClient({
-            host: 'localhost',
-            port: 7379,
-            connect_timeout: 5000,
-            socket_timeout: 5000
+            socket: {
+                host: 'localhost',
+                port: 7379,
+                connectTimeout: 5000,
+                // Fail instead of retrying forever when Ignix is not running
+                reconnectStrategy: false
+            },
+            // Ignix does not implement CLIENT SETINFO
+            disableClientInfo: true
         });
         
         // Handle connection events
@@ -121,10 +126,11 @@ async function main() {
         console.log('\n📊 Statistics:');
         console.log('-'.repeat(15));
         
-        // Count remaining keys
-        const allKeys = await client.keys('*');
-        console.log(`✅ Total keys: ${allKeys.length}`);
-        console.log(`✅ Keys: ${allKeys}`);
+        // Count the keys this example created (Ignix does not implement KEYS)
+        const knownKeys = ['counter', 'user:1:name', 'user:1:age',
+                           'fruit:1', 'fruit:2', 'fruit:3', 'greeting'];
+        const existing = await client.exists(knownKeys);
+        console.log(`✅ ${existing} of ${knownKeys.length} example keys exist`);
         
         console.log('\n✅ All operations completed successfully!');
         
@@ -138,8 +144,9 @@ async function main() {
         process.exit(1);
     } finally {
         // Close connection
-        if (client) {
-            await client.quit();
+        // Ignix does not implement QUIT, so close the socket directly
+        if (client && client.isOpen) {
+            await client.disconnect();
             console.log('\n🔌 Disconnected from Ignix server');
         }
     }

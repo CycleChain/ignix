@@ -26,6 +26,7 @@ def main():
         client = redis.Redis(
             host='localhost',
             port=7379,
+            protocol=2,  # Ignix speaks RESP2; recent redis-py versions default to RESP3
             decode_responses=True,  # Automatically decode bytes to strings
             socket_connect_timeout=5,
             socket_timeout=5
@@ -109,10 +110,11 @@ def main():
         print("\n📊 Statistics:")
         print("-" * 15)
         
-        # Count remaining keys
-        all_keys = client.keys('*')
-        print(f"✅ Total keys: {len(all_keys)}")
-        print(f"✅ Keys: {all_keys}")
+        # Count the keys this example created (Ignix does not implement KEYS)
+        known_keys = ['counter', 'user:1:name', 'user:1:age',
+                      'fruit:1', 'fruit:2', 'fruit:3', 'greeting']
+        existing = client.exists(*known_keys)
+        print(f"✅ {existing} of {len(known_keys)} example keys exist")
         
         print("\n✅ All operations completed successfully!")
         
