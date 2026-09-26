@@ -30,7 +30,7 @@ const INVALID_BULK: &str = "ERR Protocol error: invalid bulk length";
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
 pub enum Cmd {
-    /// PING [message] - test connectivity; echoes `message` when given
+    /// PING \[message\] - test connectivity; echoes `message` when given
     Ping(Option<Bytes>),
     /// GET key - retrieve value for a key
     Get(Bytes),
@@ -445,7 +445,7 @@ pub fn resp_simple(s: &str) -> Vec<u8> {
     v
 }
 
-/// Encode a bulk string response ($<len>\r\n<data>\r\n)
+/// Encode a bulk string response (`$<len>\r\n<data>\r\n`)
 ///
 /// Used for returning string/binary data
 pub fn resp_bulk(b: &[u8]) -> Vec<u8> {
@@ -466,7 +466,7 @@ pub fn resp_null() -> Vec<u8> {
     b"$-1\r\n".to_vec()
 }
 
-/// Encode an integer response (:<number>\r\n)
+/// Encode an integer response (`:<number>\r\n`)
 ///
 /// Used for numeric results like counters, exists checks, etc.
 pub fn resp_integer(i: i64) -> Vec<u8> {
@@ -478,7 +478,7 @@ pub fn resp_integer(i: i64) -> Vec<u8> {
     v
 }
 
-/// Encode an array response (*<count>\r\n<item1><item2>...)
+/// Encode an array response (`*<count>\r\n<item1><item2>...`)
 ///
 /// Used for multi-value responses like MGET results
 pub fn resp_array(items: Vec<Vec<u8>>) -> Vec<u8> {
@@ -524,7 +524,7 @@ pub fn write_error(message: &str, out: &mut BytesMut) {
     out.put_slice(b"\r\n");
 }
 
-/// Write a bulk string response ($<len>\r\n<data>\r\n) directly to buffer
+/// Write a bulk string response (`$<len>\r\n<data>\r\n`) directly to buffer
 pub fn write_bulk(b: &[u8], out: &mut BytesMut) {
     let mut digits = [0u8; 20];
     let len = fmt_u64(b.len() as u64, &mut digits);
@@ -541,7 +541,7 @@ pub fn write_null(out: &mut BytesMut) {
     out.extend_from_slice(b"$-1\r\n");
 }
 
-/// Write an integer response (:<number>\r\n) directly to buffer
+/// Write an integer response (`:<number>\r\n`) directly to buffer
 pub fn write_integer(i: i64, out: &mut BytesMut) {
     let mut digits = [0u8; 20];
     let digits = fmt_i64(i, &mut digits);
@@ -577,7 +577,7 @@ pub(crate) fn fmt_i64(n: i64, buf: &mut [u8; 20]) -> &[u8] {
     }
 }
 
-/// Write array length header (*<count>\r\n) directly to buffer
+/// Write array length header (`*<count>\r\n`) directly to buffer
 pub fn write_array_len(n: usize, out: &mut BytesMut) {
     let mut digits = [0u8; 20];
     let digits = fmt_u64(n as u64, &mut digits);

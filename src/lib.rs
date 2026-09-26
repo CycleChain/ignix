@@ -1,10 +1,10 @@
 // Core modules for Ignix key-value store
 pub mod aof; // AOF writer + emit helpers for persistence
-pub mod net;
+pub mod net; // bind_reuseport + run_shard (server loop)
 pub mod net_uring;
 pub mod protocol; // RESP parser + encoders + Cmd enum
 pub mod shard; // Shard::exec (command execution logic)
-pub mod storage; // Dict + Value types for in-memory storage // bind_reuseport + run_shard (server loop)
+pub mod storage; // Dict + Value types for in-memory storage
 
 // Re-export all public items from modules for easier access
 pub use aof::*;

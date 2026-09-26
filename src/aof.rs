@@ -164,7 +164,7 @@ fn encode<'a>(name: &[u8], args: impl Iterator<Item = &'a [u8]> + Clone) -> Vec<
 
 /// Generate AOF entry for SET command
 ///
-/// Format: *3\r\n$3\r\nSET\r\n$<keylen>\r\n<key>\r\n$<vallen>\r\n<val>\r\n
+/// Format: `*3\r\n$3\r\nSET\r\n$<keylen>\r\n<key>\r\n$<vallen>\r\n<val>\r\n`
 ///
 /// # Arguments
 /// * `k` - Key bytes

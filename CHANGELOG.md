@@ -13,7 +13,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **`INCRBY`, `DECRBY` and `DECR`**, with the same integer rules and error messages as Redis. redis-py implements `incr()` with `INCRBY`, so counters did not work with it before. New API: `Cmd::IncrBy(key, delta)` (DECRBY and DECR are parsed as negative deltas), `Dict::incr_by` and `emit_aof_incrby`.
 - **Multi-key `DEL` and `EXISTS`, `PING [message]`**: `DEL` removes every given key and replies with the number removed, `EXISTS` counts every existing argument (repeated keys count each time), and `PING message` echoes the message as a bulk string, as in Redis.
-
 - **Request API for servers**: `protocol::parse_requests` parses every complete request into `Request::Cmd` or `Request::Invalid(error_line)` and only fails on protocol errors, and `protocol::write_error` writes a RESP error reply (`-ERR ...`).
 
 ### Changed
@@ -44,10 +43,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Benchmark scripts reported unchecked results**: the Python clients counted a missing or error GET reply as a success, ignored failed pre-fills, never reported errors, and could desynchronise on large values (`basic_benchmark.py` read a bulk reply with a single `recv`); `basic_benchmark.py` only compared 1-connection runs. All scripts now share `benchmarks/scripts/resp_client.py`, check every reply, report errors (and exit non-zero on them), exclude connection setup from timing, and run each configuration on both servers back to back. `run_benchmarks.sh` and `run_tests.sh` no longer `pkill -9 ignix`, stop only what they started and propagate the exit status.
 - **Client examples**: the redis-py example broke on connect and used `KEYS`; the node-redis example connected to port 6379 because node-redis 4 ignores top-level `host`/`port`, and used `KEYS`/`QUIT`. Both run end to end against Ignix now (redis-py 8.1.0 with `protocol=2`, node-redis 4.7.1).
 - **Linux build**: the crate did not compile on Linux (and therefore not on docs.rs) because `src/net_uring.rs` used an `Ok(_)` pattern that resolved to `anyhow::Ok` (E0532) and borrowed the io_uring instance mutably twice (E0499).
+- **API documentation**: RESP formats in doc comments, such as `$<len>\r\n<data>\r\n`, were read as HTML tags, so the placeholders vanished from the rendered docs; `cargo doc` now builds without warnings.
 
 ### Migration Notes
 - Call `dict.incr(Bytes::copy_from_slice(key))` (or pass an owned `Bytes`) and handle the `IncrError` result.
 - Build `Cmd::Ping(None)`, `Cmd::Del(vec![key])` and `Cmd::Exists(vec![key])` where the old unit/single-key variants were used, and add a wildcard arm to exhaustive matches on `Cmd` and `Value`.
+- Errors from `parse_one` and `parse_many` are now complete Redis error lines that already start with `ERR`; send them with `write_error(&e.to_string(), out)` instead of adding an `ERR` prefix and writing a status reply.
 
 ## [0.3.2] - 2025-12-04
 
