@@ -53,8 +53,9 @@ impl Shard {
     /// * `out` - Buffer to write response to
     pub fn exec(&self, cmd: Cmd, out: &mut BytesMut) {
         match cmd {
-            // PING command - simple connectivity test
-            Cmd::Ping => write_simple("PONG", out),
+            // PING [message] - connectivity test; echoes the message when given
+            Cmd::Ping(None) => write_simple("PONG", out),
+            Cmd::Ping(Some(message)) => write_bulk(&message, out),
 
             // GET key - retrieve value for key
             Cmd::Get(k) => match self.dict.get(&k) {
@@ -96,11 +97,12 @@ impl Shard {
                 write_simple("OK", out);
             }
 
-            // DEL key - delete key
-            Cmd::Del(k) => {
-                // Delete key and return 1 if it existed, 0 if not
-                let removed = self.dict.del(&k) as i64;
-                write_integer(removed, out);
+            // DEL key [key ...] - delete keys, reply with the number removed
+            Cmd::Del(mut keys) => {
+                // Keep only the keys that were removed; a repeated key is
+                // removed (and counted) once, like in Redis.
+                keys.retain(|k| self.dict.del(k));
+                write_integer(keys.len() as i64, out);
             }
 
             // RENAME oldkey newkey - rename a key
@@ -126,8 +128,12 @@ impl Shard {
                 }
             }
 
-            // EXISTS key - check if key exists
-            Cmd::Exists(k) => write_integer(self.dict.exists(&k) as i64, out),
+            // EXISTS key [key ...] - count existing keys; repeated keys count
+            // every time, like in Redis
+            Cmd::Exists(keys) => {
+                let existing = keys.iter().filter(|k| self.dict.exists(k)).count();
+                write_integer(existing as i64, out);
+            }
 
             // INCR key - increment numeric value
             Cmd::Incr(k) => {

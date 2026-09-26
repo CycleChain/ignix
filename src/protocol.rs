@@ -24,21 +24,24 @@ const INVALID_BULK: &str = "ERR Protocol error: invalid bulk length";
 /// Redis-compatible commands supported by Ignix
 ///
 /// Each variant represents a specific Redis command with its parameters.
-/// All data is stored as byte vectors to handle both text and binary data.
+/// Keys and values are `Bytes`, so both text and binary data are supported.
+/// More commands will be added, so matches outside this crate need a
+/// wildcard arm.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Cmd {
-    /// PING command - test server connectivity
-    Ping,
+    /// PING [message] - test connectivity; echoes `message` when given
+    Ping(Option<Bytes>),
     /// GET key - retrieve value for a key
     Get(Bytes),
     /// SET key value - set a key-value pair
     Set(Bytes, Bytes),
-    /// DEL key - delete a key
-    Del(Bytes),
+    /// DEL key [key ...] - delete keys, replying with the number removed
+    Del(Vec<Bytes>),
     /// RENAME oldkey newkey - rename a key
     Rename(Bytes, Bytes),
-    /// EXISTS key - check if key exists
-    Exists(Bytes),
+    /// EXISTS key [key ...] - count how many of the keys exist
+    Exists(Vec<Bytes>),
     /// INCR key - increment numeric value
     Incr(Bytes),
     /// MGET key1 key2 ... - get multiple keys
@@ -50,7 +53,10 @@ pub enum Cmd {
 /// Value types that can be stored in Ignix
 ///
 /// Supports different data types while maintaining Redis compatibility.
+/// More types will be added, so matches outside this crate need a wildcard
+/// arm.
 #[derive(Debug, Clone, PartialEq)]
+#[non_exhaustive]
 pub enum Value {
     /// String/binary data
     Str(Bytes),
@@ -183,39 +189,132 @@ fn read_frame(data: &[u8]) -> Result<Option<(usize, Vec<Bytes>)>> {
     Ok(Some((cursor, items)))
 }
 
+/// Commands known to the parser, with the name Redis uses in error messages.
+#[derive(Clone, Copy)]
+enum Kind {
+    Ping,
+    Get,
+    Set,
+    Del,
+    Rename,
+    Exists,
+    Incr,
+    MGet,
+    MSet,
+}
+
+const COMMANDS: [(&str, Kind); 9] = [
+    ("ping", Kind::Ping),
+    ("get", Kind::Get),
+    ("set", Kind::Set),
+    ("del", Kind::Del),
+    ("rename", Kind::Rename),
+    ("exists", Kind::Exists),
+    ("incr", Kind::Incr),
+    ("mget", Kind::MGet),
+    ("mset", Kind::MSet),
+];
+
+/// SET options that Redis supports but Ignix does not implement yet.
+const UNSUPPORTED_SET_OPTIONS: [&str; 8] =
+    ["NX", "XX", "GET", "EX", "PX", "EXAT", "PXAT", "KEEPTTL"];
+
 /// Build a command from the arguments of one request frame.
-fn command_from_frame(items: Vec<Bytes>) -> Result<Cmd> {
-    // Match command names and validate argument counts
-    // Using case-insensitive comparison without allocation
-    let cmd = if items[0].eq_ignore_ascii_case(b"PING") {
-        Cmd::Ping
-    } else if items[0].eq_ignore_ascii_case(b"GET") && items.len() >= 2 {
-        Cmd::Get(items[1].clone())
-    } else if items[0].eq_ignore_ascii_case(b"SET") && items.len() >= 3 {
-        Cmd::Set(items[1].clone(), items[2].clone())
-    } else if items[0].eq_ignore_ascii_case(b"DEL") && items.len() >= 2 {
-        Cmd::Del(items[1].clone())
-    } else if items[0].eq_ignore_ascii_case(b"RENAME") && items.len() >= 3 {
-        Cmd::Rename(items[1].clone(), items[2].clone())
-    } else if items[0].eq_ignore_ascii_case(b"EXISTS") && items.len() >= 2 {
-        Cmd::Exists(items[1].clone())
-    } else if items[0].eq_ignore_ascii_case(b"INCR") && items.len() >= 2 {
-        Cmd::Incr(items[1].clone())
-    } else if items[0].eq_ignore_ascii_case(b"MGET") && items.len() >= 2 {
-        Cmd::MGet(items[1..].to_vec())
-    } else if items[0].eq_ignore_ascii_case(b"MSET") && items.len() >= 3 && items.len() % 2 == 1 {
-        // MSET requires odd number of args (command + key-value pairs)
-        let mut v = Vec::with_capacity((items.len() - 1) / 2);
-        for pair in items[1..].chunks(2) {
-            if pair.len() == 2 {
-                v.push((pair[0].clone(), pair[1].clone()));
+///
+/// On failure returns a complete RESP error line worded like Redis 7.
+fn command_from_frame(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String> {
+    let Some(&(name, kind)) = COMMANDS
+        .iter()
+        .find(|(name, _)| items[0].eq_ignore_ascii_case(name.as_bytes()))
+    else {
+        return Err(unknown_command_error(&items));
+    };
+
+    let argc = items.len();
+    let arity_ok = match kind {
+        Kind::Ping => argc <= 2,
+        Kind::Get | Kind::Incr => argc == 2,
+        Kind::Rename => argc == 3,
+        Kind::Set => argc >= 3,
+        Kind::Del | Kind::Exists | Kind::MGet => argc >= 2,
+        Kind::MSet => argc >= 3 && argc % 2 == 1,
+    };
+    let arity_error = || format!("ERR wrong number of arguments for '{name}' command");
+    if !arity_ok {
+        return Err(arity_error());
+    }
+    if matches!(kind, Kind::Set) && argc > 3 {
+        return Err(set_option_error(&items[3]));
+    }
+
+    // Drop the command name; what is left are the arguments.
+    items.remove(0);
+    let cmd = match kind {
+        Kind::Ping => Cmd::Ping(items.pop()),
+        Kind::Del => Cmd::Del(items),
+        Kind::Exists => Cmd::Exists(items),
+        Kind::MGet => Cmd::MGet(items),
+        Kind::MSet => {
+            let mut pairs = Vec::with_capacity(items.len() / 2);
+            let mut args = items.into_iter();
+            while let (Some(key), Some(value)) = (args.next(), args.next()) {
+                pairs.push((key, value));
+            }
+            Cmd::MSet(pairs)
+        }
+        Kind::Get | Kind::Incr => {
+            let [key] = <[Bytes; 1]>::try_from(items).map_err(|_| arity_error())?;
+            if matches!(kind, Kind::Get) {
+                Cmd::Get(key)
+            } else {
+                Cmd::Incr(key)
             }
         }
-        Cmd::MSet(v)
-    } else {
-        bail!("unknown/invalid command");
+        Kind::Set => {
+            let [key, value] = <[Bytes; 2]>::try_from(items).map_err(|_| arity_error())?;
+            Cmd::Set(key, value)
+        }
+        Kind::Rename => {
+            let [from, to] = <[Bytes; 2]>::try_from(items).map_err(|_| arity_error())?;
+            Cmd::Rename(from, to)
+        }
     };
     Ok(cmd)
+}
+
+/// `ERR unknown command ...`, truncated like Redis: the name is cut to 128
+/// bytes, and quoted arguments are appended while that part is shorter than
+/// 128 bytes (each one cut to the remaining room).
+fn unknown_command_error(items: &[Bytes]) -> String {
+    const LIMIT: usize = 128;
+    let name = &items[0];
+    let mut msg = Vec::with_capacity(96);
+    msg.extend_from_slice(b"ERR unknown command '");
+    msg.extend_from_slice(&name[..name.len().min(LIMIT)]);
+    msg.extend_from_slice(b"', with args beginning with: ");
+    let args_start = msg.len();
+    for arg in &items[1..] {
+        let used = msg.len() - args_start;
+        if used >= LIMIT {
+            break;
+        }
+        msg.push(b'\'');
+        msg.extend_from_slice(&arg[..arg.len().min(LIMIT - used)]);
+        msg.extend_from_slice(b"' ");
+    }
+    String::from_utf8_lossy(&msg).into_owned()
+}
+
+/// Error for the first extra `SET` argument: options Redis knows are reported
+/// as unsupported, anything else is a syntax error (as in Redis).
+fn set_option_error(option: &[u8]) -> String {
+    match UNSUPPORTED_SET_OPTIONS
+        .iter()
+        .find(|name| option.eq_ignore_ascii_case(name.as_bytes()))
+    {
+        Some(name) => format!("ERR SET option '{name}' is not supported"),
+        None => "ERR syntax error".to_string(),
+    }
 }
 
 /// Parse a single RESP command from byte data
@@ -240,7 +339,8 @@ pub fn parse_one(data: &[u8]) -> Result<Option<(usize, Cmd)>> {
         if items.is_empty() {
             continue;
         }
-        return Ok(Some((consumed, command_from_frame(items)?)));
+        let cmd = command_from_frame(items).map_err(anyhow::Error::msg)?;
+        return Ok(Some((consumed, cmd)));
     }
 }
 

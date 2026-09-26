@@ -9,7 +9,7 @@ fn parse_ping_and_set_get() {
     buf.extend_from_slice(b"*2\r\n$3\r\nGET\r\n$1\r\na\r\n");
     let mut cmds = Vec::new();
     protocol::parse_many(&mut buf, &mut cmds).unwrap();
-    assert!(matches!(cmds[0], Cmd::Ping));
+    assert!(matches!(cmds[0], Cmd::Ping(None)));
     assert!(matches!(cmds[1], Cmd::Set(_, _)));
     assert!(matches!(cmds[2], Cmd::Get(_)));
 }

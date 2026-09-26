@@ -10,11 +10,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - **Remote crash on malformed requests**: a negative or oversized bulk length (e.g. `*1\r\n$-5\r\n`) made the parser overflow, and a huge element count (`*9223372036854775807\r\n`) made it try to allocate that many elements. Because the release profile uses `panic = "abort"`, a single packet from any client terminated the whole server. Lengths are now parsed with checked arithmetic, bulk strings are limited to 512 MiB and element counts to `INT_MAX` (as in Redis), and malformed input is answered with `ERR Protocol error: ...`.
 
+### Added
+- **Multi-key `DEL` and `EXISTS`, `PING [message]`**: `DEL` removes every given key and replies with the number removed, `EXISTS` counts every existing argument (repeated keys count each time), and `PING message` echoes the message as a bulk string, as in Redis.
+
 ### Changed
+- **Breaking: command enum shapes**: `Cmd::Ping` is now `Cmd::Ping(Option<Bytes>)`, `Cmd::Del(Bytes)` is `Cmd::Del(Vec<Bytes>)` and `Cmd::Exists(Bytes)` is `Cmd::Exists(Vec<Bytes>)`. `Cmd` and `Value` are `#[non_exhaustive]`, so future commands and value types are not breaking changes.
+- **Redis-style argument validation**: a wrong number of arguments is rejected with `ERR wrong number of arguments for '<command>' command`, an unknown command with `ERR unknown command '<name>', with args beginning with: ...` (truncated like Redis), and `SET` options that are not implemented yet (`NX`, `XX`, `GET`, `EX`, `PX`, `EXAT`, `PXAT`, `KEEPTTL`) with `ERR SET option '<name>' is not supported`; any other extra `SET` token is `ERR syntax error`.
 - **Stricter request framing**: length lines are parsed like Redis `string2ll` (no leading zeros, `+`, spaces or lines longer than 20 characters). Unlike Redis, a bulk payload must be followed by CRLF instead of skipping two bytes blindly, which stops a miscounted length from desynchronising the stream. Empty requests (`*0\r\n`, `*-1\r\n`) are ignored like in Redis instead of being an error.
 
 ### Fixed
+- **Silently ignored arguments**: `DEL a b c` deleted only `a`, `EXISTS a b` checked only `a`, `GET a b` and `INCR a b` ignored the extra argument, and `SET k v NX` or `SET k v EX 10` set the key unconditionally and without expiry while replying `OK`.
 - **Linux build**: the crate did not compile on Linux (and therefore not on docs.rs) because `src/net_uring.rs` used an `Ok(_)` pattern that resolved to `anyhow::Ok` (E0532) and borrowed the io_uring instance mutably twice (E0499).
+
+### Migration Notes
+- Build `Cmd::Ping(None)`, `Cmd::Del(vec![key])` and `Cmd::Exists(vec![key])` where the old unit/single-key variants were used, and add a wildcard arm to exhaustive matches on `Cmd` and `Value`.
 
 ## [0.3.2] - 2025-12-04
 
