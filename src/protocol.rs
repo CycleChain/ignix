@@ -346,24 +346,63 @@ pub fn parse_one(data: &[u8]) -> Result<Option<(usize, Cmd)>> {
 
 /// Parse multiple RESP commands from a buffer
 ///
-/// This function continuously parses commands from the buffer until
-/// no complete commands remain. It's used for handling pipelined requests.
+/// Parses and consumes complete commands until no complete request remains;
+/// used for pipelined requests.
+///
+/// An invalid command (unknown name, wrong number of arguments) is consumed
+/// and reported as `Err`; calling again continues with the next request. A
+/// protocol error leaves the malformed bytes in `buf`. Use [`parse_requests`]
+/// to keep going past invalid commands and tell the two cases apart.
 ///
 /// # Arguments
 /// * `buf` - Mutable buffer containing RESP data
 /// * `out` - Vector to store parsed commands
-pub fn parse_many(buf: &mut bytes::BytesMut, out: &mut Vec<Cmd>) -> Result<()> {
+pub fn parse_many(buf: &mut BytesMut, out: &mut Vec<Cmd>) -> Result<()> {
     loop {
-        let (consumed, cmd) = match parse_one(&buf[..])? {
-            Some(x) => x,
-            None => break, // No complete command available
+        let Some((consumed, items)) = read_frame(&buf[..])? else {
+            return Ok(());
         };
-
-        // Remove consumed bytes from buffer
         buf.advance(consumed);
-        out.push(cmd);
+        if items.is_empty() {
+            continue;
+        }
+        out.push(command_from_frame(items).map_err(anyhow::Error::msg)?);
     }
-    Ok(())
+}
+
+/// One complete request read from a connection buffer
+#[derive(Debug, Clone, PartialEq)]
+pub enum Request {
+    /// A valid command to execute
+    Cmd(Cmd),
+    /// A well-formed request that is not a valid command (unknown command,
+    /// wrong number of arguments, unsupported option). Holds the complete
+    /// error line to reply with (see [`write_error`]); the connection stays
+    /// usable.
+    Invalid(String),
+}
+
+/// Parse every complete request in `buf` into `out`, consuming its bytes
+///
+/// Invalid commands become [`Request::Invalid`] and parsing continues after
+/// them. `Err` is returned only for a protocol (framing) error: the requests
+/// read before it are already in `out`, and the malformed bytes stay in
+/// `buf`. Its message is a complete error line; Redis replies with it and
+/// closes the connection.
+pub fn parse_requests(buf: &mut BytesMut, out: &mut Vec<Request>) -> Result<()> {
+    loop {
+        let Some((consumed, items)) = read_frame(&buf[..])? else {
+            return Ok(());
+        };
+        buf.advance(consumed);
+        if items.is_empty() {
+            continue;
+        }
+        out.push(match command_from_frame(items) {
+            Ok(cmd) => Request::Cmd(cmd),
+            Err(message) => Request::Invalid(message),
+        });
+    }
 }
 
 //
@@ -442,6 +481,24 @@ pub fn write_simple(s: &str, out: &mut BytesMut) {
     out.reserve(1 + s.len() + 2);
     out.put_u8(b'+');
     out.put_slice(s.as_bytes());
+    out.put_slice(b"\r\n");
+}
+
+/// Write an error reply (-ERR ...\r\n) directly to buffer
+///
+/// `message` is a complete error line such as `ERR no such key`. Line breaks
+/// are replaced with spaces so the reply stays a single RESP line.
+pub fn write_error(message: &str, out: &mut BytesMut) {
+    out.reserve(1 + message.len() + 2);
+    out.put_u8(b'-');
+    if message.bytes().any(|b| b == b'\r' || b == b'\n') {
+        out.extend(message.bytes().map(|b| match b {
+            b'\r' | b'\n' => b' ',
+            other => other,
+        }));
+    } else {
+        out.put_slice(message.as_bytes());
+    }
     out.put_slice(b"\r\n");
 }
 

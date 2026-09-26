@@ -13,7 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - **Multi-key `DEL` and `EXISTS`, `PING [message]`**: `DEL` removes every given key and replies with the number removed, `EXISTS` counts every existing argument (repeated keys count each time), and `PING message` echoes the message as a bulk string, as in Redis.
 
+- **Request API for servers**: `protocol::parse_requests` parses every complete request into `Request::Cmd` or `Request::Invalid(error_line)` and only fails on protocol errors, and `protocol::write_error` writes a RESP error reply (`-ERR ...`).
+
 ### Changed
+- **`parse_many` no longer gets stuck on an invalid command**: the invalid request is consumed before the error is returned, so the next call continues with the following request. Protocol errors still leave the malformed bytes in the buffer.
 - **Breaking: command enum shapes**: `Cmd::Ping` is now `Cmd::Ping(Option<Bytes>)`, `Cmd::Del(Bytes)` is `Cmd::Del(Vec<Bytes>)` and `Cmd::Exists(Bytes)` is `Cmd::Exists(Vec<Bytes>)`. `Cmd` and `Value` are `#[non_exhaustive]`, so future commands and value types are not breaking changes.
 - **Redis-style argument validation**: a wrong number of arguments is rejected with `ERR wrong number of arguments for '<command>' command`, an unknown command with `ERR unknown command '<name>', with args beginning with: ...` (truncated like Redis), and `SET` options that are not implemented yet (`NX`, `XX`, `GET`, `EX`, `PX`, `EXAT`, `PXAT`, `KEEPTTL`) with `ERR SET option '<name>' is not supported`; any other extra `SET` token is `ERR syntax error`.
 - **Stricter request framing**: length lines are parsed like Redis `string2ll` (no leading zeros, `+`, spaces or lines longer than 20 characters). Unlike Redis, a bulk payload must be followed by CRLF instead of skipping two bytes blindly, which stops a miscounted length from desynchronising the stream. Empty requests (`*0\r\n`, `*-1\r\n`) are ignored like in Redis instead of being an error.

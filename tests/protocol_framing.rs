@@ -134,3 +134,18 @@ fn protocol_error_leaves_buffer_untouched() {
     assert_eq!(cmds.len(), 1, "the PING before the bad frame is parsed");
     assert_eq!(&buf[..], b"*1\r\nX");
 }
+
+#[test]
+fn parse_many_consumes_an_invalid_command_before_reporting_it() {
+    let mut buf = BytesMut::from(&b"*1\r\n$3\r\nFOO\r\n*1\r\n$4\r\nPING\r\n"[..]);
+    let mut cmds = Vec::new();
+    assert!(parse_many(&mut buf, &mut cmds).is_err());
+    assert_eq!(
+        &buf[..],
+        b"*1\r\n$4\r\nPING\r\n",
+        "the invalid command must not stay at the head of the buffer"
+    );
+    parse_many(&mut buf, &mut cmds).unwrap();
+    assert_eq!(cmds.len(), 1);
+    assert!(buf.is_empty());
+}
