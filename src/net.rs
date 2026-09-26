@@ -67,7 +67,6 @@ pub fn run_shard(_shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()>
 
     for id in 0..threads {
         let shard = shard.clone();
-        let addr = addr;
         handles.push(std::thread::spawn(move || {
             if let Err(e) = run_worker_loop(id, addr, shard) {
                 eprintln!("Worker {} failed: {}", id, e);
@@ -208,7 +207,11 @@ fn run_worker_loop(id: usize, addr: SocketAddr, shard: Arc<Shard>) -> Result<()>
                                 Interest::READABLE | Interest::WRITABLE
                             };
 
-                            if let Err(_) = poll.registry().reregister(sock, Token(t), interest) {
+                            if poll
+                                .registry()
+                                .reregister(sock, Token(t), interest)
+                                .is_err()
+                            {
                                 should_remove = true;
                             }
                         }
