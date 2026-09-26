@@ -1,22 +1,22 @@
 /*!
  * io_uring Network Backend (Linux Only)
- * 
+ *
  * This module implements a high-performance network loop using Linux's io_uring
  * interface. It is conditionally compiled and only available on Linux.
  */
 
 #![cfg(target_os = "linux")]
 
-use crate::shard::Shard;
 use crate::protocol::{parse_many, write_simple, Cmd};
+use crate::shard::Shard;
 use anyhow::*;
 use bytes::BytesMut;
 use io_uring::{opcode, types, IoUring};
 use slab::Slab;
 use std::net::SocketAddr;
+use std::net::TcpListener;
 use std::os::unix::io::AsRawFd;
 use std::sync::Arc;
-use std::net::TcpListener;
 
 // Operation types for user_data
 const OP_ACCEPT: u64 = 0;
@@ -27,15 +27,18 @@ const OP_ACCEPT: u64 = 0;
 struct Connection {
     fd: i32,
     // Box provides stable address for io_uring even if Slab reallocates
-    read_buffer: Box<[u8; 4096]>, 
+    read_buffer: Box<[u8; 4096]>,
     read_buf: BytesMut,
     write_buf: BytesMut,
     cmds: Vec<Cmd>,
 }
 
 pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> {
-    println!("🚀 Starting Ignix with io_uring backend (Shard {})", shard_id);
-    
+    println!(
+        "🚀 Starting Ignix with io_uring backend (Shard {})",
+        shard_id
+    );
+
     // Setup listener
     let listener = TcpListener::bind(addr)?;
     let listener_fd = listener.as_raw_fd();
@@ -45,7 +48,10 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
     let mut connections = Slab::with_capacity(1024);
 
     // Initial Accept
-    let mut accept_addr = libc::sockaddr { sa_family: 0, sa_data: [0; 14] };
+    let mut accept_addr = libc::sockaddr {
+        sa_family: 0,
+        sa_data: [0; 14],
+    };
     let mut accept_addr_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr>() as _;
 
     {
@@ -53,11 +59,11 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
         let accept_op = opcode::Accept::new(
             types::Fd(listener_fd),
             &mut accept_addr,
-            &mut accept_addr_len
+            &mut accept_addr_len,
         )
         .build()
         .user_data(OP_ACCEPT);
-        
+
         unsafe {
             sq.push(&accept_op).expect("submission queue full");
         }
@@ -81,7 +87,7 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
                     let fd = res;
                     let entry = connections.vacant_entry();
                     let key = entry.key();
-                    
+
                     let mut conn = Connection {
                         fd,
                         read_buffer: Box::new([0u8; 4096]),
@@ -89,7 +95,7 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
                         write_buf: BytesMut::new(),
                         cmds: Vec::new(),
                     };
-                    
+
                     // Get stable pointer before moving conn into Slab
                     // Actually, Box pointer is stable even after move.
                     let buf_ptr = conn.read_buffer.as_mut_ptr();
@@ -101,23 +107,19 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
                     let accept_op = opcode::Accept::new(
                         types::Fd(listener_fd),
                         &mut accept_addr,
-                        &mut accept_addr_len
+                        &mut accept_addr_len,
                     )
                     .build()
                     .user_data(OP_ACCEPT);
-                    
+
                     unsafe {
                         sq.push(&accept_op).expect("sq full");
                     }
-                    
+
                     // Submit Read
-                    let read_op = opcode::Read::new(
-                        types::Fd(fd),
-                        buf_ptr,
-                        buf_len as _
-                    )
-                    .build()
-                    .user_data(((key as u64) << 32) | 1); // 1 = READ
+                    let read_op = opcode::Read::new(types::Fd(fd), buf_ptr, buf_len as _)
+                        .build()
+                        .user_data(((key as u64) << 32) | 1); // 1 = READ
 
                     unsafe {
                         sq.push(&read_op).expect("sq full");
@@ -128,7 +130,8 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
                 let op = user_data & 0xFFFFFFFF;
 
                 if connections.contains(key) {
-                    if op == 1 { // READ completion
+                    if op == 1 {
+                        // READ completion
                         if res <= 0 {
                             // EOF or Error
                             connections.remove(key);
@@ -136,8 +139,9 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
                             // unsafe { libc::close(conn.fd); }
                         } else {
                             let conn = connections.get_mut(key).unwrap();
-                            conn.read_buf.extend_from_slice(&conn.read_buffer[..res as usize]);
-                            
+                            conn.read_buf
+                                .extend_from_slice(&conn.read_buffer[..res as usize]);
+
                             // Parse and Execute
                             if let Ok(_) = parse_many(&mut conn.read_buf, &mut conn.cmds) {
                                 for cmd in conn.cmds.drain(..) {
@@ -150,11 +154,11 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
                                 let write_op = opcode::Write::new(
                                     types::Fd(conn.fd),
                                     conn.write_buf.as_ptr(),
-                                    conn.write_buf.len() as _
+                                    conn.write_buf.len() as _,
                                 )
                                 .build()
                                 .user_data(((key as u64) << 32) | 2); // 2 = WRITE
-                                
+
                                 unsafe {
                                     sq.push(&write_op).expect("sq full");
                                 }
@@ -163,7 +167,7 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
                                 let read_op = opcode::Read::new(
                                     types::Fd(conn.fd),
                                     conn.read_buffer.as_mut_ptr(),
-                                    conn.read_buffer.len() as _
+                                    conn.read_buffer.len() as _,
                                 )
                                 .build()
                                 .user_data(((key as u64) << 32) | 1);
@@ -173,8 +177,9 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
                                 }
                             }
                         }
-                    } else if op == 2 { // WRITE completion
-                         if res < 0 {
+                    } else if op == 2 {
+                        // WRITE completion
+                        if res < 0 {
                             connections.remove(key);
                         } else {
                             let conn = connections.get_mut(key).unwrap();
@@ -185,11 +190,11 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
                                 let write_op = opcode::Write::new(
                                     types::Fd(conn.fd),
                                     conn.write_buf.as_ptr(),
-                                    conn.write_buf.len() as _
+                                    conn.write_buf.len() as _,
                                 )
                                 .build()
                                 .user_data(((key as u64) << 32) | 2);
-                                
+
                                 unsafe {
                                     sq.push(&write_op).expect("sq full");
                                 }
@@ -198,7 +203,7 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
                                 let read_op = opcode::Read::new(
                                     types::Fd(conn.fd),
                                     conn.read_buffer.as_mut_ptr(),
-                                    conn.read_buffer.len() as _
+                                    conn.read_buffer.len() as _,
                                 )
                                 .build()
                                 .user_data(((key as u64) << 32) | 1);
@@ -212,7 +217,7 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
                 }
             }
         }
-        
+
         sq.sync();
     }
 }

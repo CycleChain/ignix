@@ -6,11 +6,11 @@
  */
 
 use crate::protocol::Value;
-use dashmap::DashMap;
 use bytes::Bytes;
+use dashmap::DashMap;
 
 /// High-performance in-memory dictionary
-/// 
+///
 /// The core storage structure that holds all key-value pairs in memory.
 /// Uses SwissTable (hashbrown) with AHash for fast lookups and supports all Redis-compatible operations.
 #[derive(Default)]
@@ -21,10 +21,10 @@ pub struct Dict {
 
 impl Dict {
     /// Get a value by key (immutable reference)
-    /// 
+    ///
     /// # Arguments
     /// * `k` - Key to lookup as byte slice
-    /// 
+    ///
     /// # Returns
     /// * `Some(&Value)` if key exists
     /// * `None` if key doesn't exist
@@ -32,14 +32,14 @@ impl Dict {
     pub fn get(&self, k: &[u8]) -> Option<Value> {
         self.inner.get(k).map(|v| v.clone())
     }
-    
+
     // note: Direct mutable references are not exposed; use entry APIs for atomic updates.
-    
+
     /// Set a key-value pair
-    /// 
+    ///
     /// Inserts or updates a key with the given value.
     /// If key already exists, the old value is replaced.
-    /// 
+    ///
     /// # Arguments
     /// * `k` - Key as owned Bytes
     /// * `v` - Value to store
@@ -47,14 +47,14 @@ impl Dict {
     pub fn set(&self, k: Bytes, v: Value) {
         self.inner.insert(k, v);
     }
-    
+
     /// Delete a key
-    /// 
+    ///
     /// Removes the key and its associated value from the dictionary.
-    /// 
+    ///
     /// # Arguments
     /// * `k` - Key to delete as byte slice
-    /// 
+    ///
     /// # Returns
     /// * `true` if key existed and was deleted
     /// * `false` if key didn't exist
@@ -62,16 +62,16 @@ impl Dict {
     pub fn del(&self, k: &[u8]) -> bool {
         self.inner.remove(k).is_some()
     }
-    
+
     /// Rename a key
-    /// 
+    ///
     /// Moves the value from the old key to the new key.
     /// The old key is deleted and the new key gets the value.
-    /// 
+    ///
     /// # Arguments
     /// * `from` - Current key name as owned Bytes
     /// * `to` - New key name as owned Bytes
-    /// 
+    ///
     /// # Returns
     /// * `true` if rename was successful
     /// * `false` if source key didn't exist
@@ -81,7 +81,7 @@ impl Dict {
         if from == to {
             return true;
         }
-        
+
         // Simple remove-then-insert; note this is not atomic across shards
         if let Some((_, v)) = self.inner.remove(&from) {
             self.inner.insert(to, v);
@@ -90,14 +90,14 @@ impl Dict {
             false
         }
     }
-    
+
     /// Check if a key exists
-    /// 
+    ///
     /// Tests for key existence without retrieving the value.
-    /// 
+    ///
     /// # Arguments
     /// * `k` - Key to check as byte slice
-    /// 
+    ///
     /// # Returns
     /// * `true` if key exists
     /// * `false` if key doesn't exist

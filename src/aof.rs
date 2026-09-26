@@ -1,6 +1,6 @@
 /*!
  * Append-Only File (AOF) Persistence
- * 
+ *
  * This module implements Redis-compatible AOF persistence for durability.
  * Commands are logged in RESP format to a file and periodically flushed
  * to disk for crash recovery.
@@ -9,11 +9,11 @@
 use anyhow::*;
 use crossbeam::channel::{bounded, Sender};
 use std::io::Write;
+use std::result::Result::{Err, Ok};
 use std::time::{Duration, Instant};
-use std::result::Result::{Ok, Err};
 
 /// Handle for writing to the AOF (Append-Only File)
-/// 
+///
 /// This handle allows async writing to the AOF file through a background
 /// thread. Commands are sent via a channel and written to disk periodically.
 #[derive(Clone)]
@@ -23,16 +23,16 @@ pub struct AofHandle {
 }
 
 /// Spawn a background AOF writer thread
-/// 
+///
 /// Creates a dedicated thread that handles all AOF writes asynchronously.
 /// This prevents blocking the main execution thread on disk I/O operations.
-/// 
+///
 /// # Arguments
 /// * `path` - File path for the AOF file
-/// 
+///
 /// # Returns
 /// * `AofHandle` for sending commands to be logged
-/// 
+///
 /// # Behavior
 /// * Commands are buffered and written to disk
 /// * File is flushed and synced every 1000ms for durability
@@ -41,7 +41,7 @@ pub fn spawn_aof_writer(path: &str) -> Result<AofHandle> {
     // Bounded channel to provide backpressure under heavy write load
     let (tx, rx) = bounded::<Vec<u8>>(4096);
     let path = path.to_string();
-    
+
     // Spawn dedicated AOF writer thread
     std::thread::Builder::new()
         .name("aof-writer".into())
@@ -52,9 +52,9 @@ pub fn spawn_aof_writer(path: &str) -> Result<AofHandle> {
                 .append(true)
                 .open(&path)
                 .expect("open aof");
-            
+
             let mut last = Instant::now();
-            
+
             // Main AOF writer loop
             loop {
                 match rx.recv() {
@@ -75,16 +75,16 @@ pub fn spawn_aof_writer(path: &str) -> Result<AofHandle> {
                 }
             }
         })?;
-    
+
     Ok(AofHandle { tx })
 }
 
 impl AofHandle {
     /// Write a command to the AOF
-    /// 
+    ///
     /// Sends the command bytes to the background writer thread.
     /// This is non-blocking and returns immediately.
-    /// 
+    ///
     /// # Arguments
     /// * `bytes` - RESP-formatted command bytes to write
     #[inline]
@@ -102,10 +102,10 @@ impl AofHandle {
 //
 
 /// Generate AOF entry for SET command
-/// 
+///
 /// Creates a RESP-formatted SET command for AOF logging.
 /// Format: *3\r\n$3\r\nSET\r\n$<keylen>\r\n<key>\r\n$<vallen>\r\n<val>\r\n
-/// 
+///
 /// # Arguments
 /// * `k` - Key bytes
 /// * `v` - Value bytes
@@ -121,9 +121,9 @@ pub fn emit_aof_set(k: &[u8], v: &[u8]) -> Vec<u8> {
 }
 
 /// Generate AOF entry for RENAME command
-/// 
+///
 /// Creates a RESP-formatted RENAME command for AOF logging.
-/// 
+///
 /// # Arguments
 /// * `a` - Old key bytes
 /// * `b` - New key bytes
@@ -139,9 +139,9 @@ pub fn emit_aof_rename(a: &[u8], b: &[u8]) -> Vec<u8> {
 }
 
 /// Generate AOF entry for INCR command
-/// 
+///
 /// Creates a RESP-formatted INCR command for AOF logging.
-/// 
+///
 /// # Arguments
 /// * `k` - Key bytes to increment
 pub fn emit_aof_incr(k: &[u8]) -> Vec<u8> {
@@ -156,16 +156,16 @@ pub fn emit_aof_incr(k: &[u8]) -> Vec<u8> {
 use bytes::Bytes;
 
 /// Generate AOF entry for MSET command
-/// 
+///
 /// Creates a RESP-formatted MSET command for AOF logging.
 /// Handles multiple key-value pairs in a single command.
-/// 
+///
 /// # Arguments
 /// * `pairs` - Vector of (key, value) byte pairs
 pub fn emit_aof_mset(pairs: &[(Bytes, Bytes)]) -> Vec<u8> {
     // Calculate total arguments: command + (key + value) * pairs
     let mut s = format!("*{}\r\n$4\r\nMSET\r\n", 1 + pairs.len() * 2);
-    
+
     // Add each key-value pair
     for (k, v) in pairs {
         s.push_str(&format!(
@@ -176,6 +176,6 @@ pub fn emit_aof_mset(pairs: &[(Bytes, Bytes)]) -> Vec<u8> {
             String::from_utf8_lossy(v)
         ));
     }
-    
+
     s.into_bytes()
 }
