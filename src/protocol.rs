@@ -6,8 +6,20 @@
  * including command parsing, validation, and response formatting.
  */
 
-use anyhow::*;
+use anyhow::{bail, Result};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+
+/// Largest element count accepted in one request (Redis rejects counts above `INT_MAX`).
+const MAX_MULTIBULK_LEN: i64 = i32::MAX as i64;
+/// Largest bulk string accepted in one request (Redis `proto-max-bulk-len` default: 512 MiB).
+const MAX_BULK_LEN: i64 = 512 * 1024 * 1024;
+/// Longest integer line Redis accepts: 20 bytes, e.g. `-9223372036854775808`.
+const MAX_INT_LINE: usize = 20;
+/// Smallest encoding of one element (`$0\r\n\r\n`), used to bound preallocation.
+const MIN_ELEMENT_LEN: usize = 6;
+
+const INVALID_MULTIBULK: &str = "ERR Protocol error: invalid multibulk length";
+const INVALID_BULK: &str = "ERR Protocol error: invalid bulk length";
 
 /// Redis-compatible commands supported by Ignix
 ///
@@ -48,78 +60,131 @@ pub enum Value {
     Blob(Bytes),
 }
 
-/// Parse a single RESP command from byte data
+/// Parse a signed 64-bit integer exactly like Redis `string2ll`.
 ///
-/// This function implements the core RESP parsing logic according to the Redis protocol.
-/// It expects commands in the format: *<count>\r\n$<len>\r\n<data>\r\n...
-///
-/// # Arguments
-/// * `data` - Raw byte slice containing RESP-formatted command
-///
-/// # Returns
-/// * `Ok(Some((consumed_bytes, command)))` - Successfully parsed command
-/// * `Ok(None)` - Incomplete data, need more bytes
-/// * `Err(...)` - Protocol error or invalid command
-pub fn parse_one(data: &[u8]) -> Result<Option<(usize, Cmd)>> {
-    // Check if we have any data to parse
-    if data.is_empty() {
-        return Ok(None);
+/// Accepts an optional `-` followed by digits without leading zeros (`0`
+/// itself is allowed), at most 20 bytes in total, and the value must fit in an
+/// `i64`. `+`, spaces, `-0` and other non-canonical forms are rejected, so every
+/// accepted input formats back to the same bytes.
+pub(crate) fn parse_canonical_i64(s: &[u8]) -> Option<i64> {
+    if s.is_empty() || s.len() > MAX_INT_LINE {
+        return None;
     }
-
-    // RESP arrays must start with '*'
-    if data[0] != b'*' {
-        bail!("protocol error: expected array");
+    if s == b"0" {
+        return Some(0);
     }
-
-    // Read the number of array elements
-    let (i, n) = read_decimal_line(&data[1..])?;
-    if i == 0 {
-        return Ok(None);
+    let (negative, digits) = match s {
+        [b'-', rest @ ..] => (true, rest),
+        _ => (false, s),
+    };
+    if !matches!(digits.first(), Some(b'1'..=b'9')) {
+        return None;
     }
-    let mut cursor = 1 + i;
-
-    if n <= 0 {
-        bail!("empty array");
-    }
-
-    // Pre-allocate vector for better performance
-    let mut items: Vec<Bytes> = Vec::with_capacity(n as usize);
-
-    // Parse each array element (bulk strings)
-    for _ in 0..n {
-        // Check if we have enough data
-        if cursor >= data.len() {
-            return Ok(None); // Need more data
+    let mut magnitude: u64 = 0;
+    for &c in digits {
+        if !c.is_ascii_digit() {
+            return None;
         }
-
-        // Each element must be a bulk string starting with '$'
-        if data[cursor] != b'$' {
-            bail!("expected bulk");
+        magnitude = magnitude
+            .checked_mul(10)?
+            .checked_add(u64::from(c - b'0'))?;
+    }
+    if negative {
+        // i64::MIN has no positive counterpart, so negate in the unsigned domain.
+        if magnitude > i64::MIN.unsigned_abs() {
+            return None;
         }
+        Some(0i64.wrapping_sub_unsigned(magnitude))
+    } else {
+        i64::try_from(magnitude).ok()
+    }
+}
 
-        // Read the length of this bulk string
-        let (i2, len) = read_decimal_line(&data[cursor + 1..])?;
-        if i2 == 0 {
+/// Read the integer of a `*<n>\r\n` or `$<n>\r\n` header whose digits start at `pos`.
+///
+/// Returns `Ok(None)` while the line is incomplete, the position after the
+/// line and the value once it is complete, and `invalid` as the error when the
+/// line is malformed.
+fn read_int_line(data: &[u8], pos: usize, invalid: &'static str) -> Result<Option<(usize, i64)>> {
+    let rest = &data[pos..];
+    let window = &rest[..rest.len().min(MAX_INT_LINE + 1)];
+    let Some(cr) = window.iter().position(|&b| b == b'\r') else {
+        if rest.len() > MAX_INT_LINE {
+            bail!(invalid);
+        }
+        return Ok(None);
+    };
+    match rest.get(cr + 1) {
+        None => Ok(None),
+        Some(b'\n') => match parse_canonical_i64(&rest[..cr]) {
+            Some(value) => Ok(Some((pos + cr + 2, value))),
+            None => bail!(invalid),
+        },
+        Some(_) => bail!(invalid),
+    }
+}
+
+/// Read one complete request frame: `*<n>\r\n` followed by `n` bulk strings.
+///
+/// Returns `Ok(None)` when more data is needed and the consumed length with
+/// the arguments otherwise. Malformed input is an error whose message is a
+/// complete RESP error line (`ERR Protocol error: ...`). A frame with `n <= 0`
+/// has no arguments; Redis ignores such requests.
+fn read_frame(data: &[u8]) -> Result<Option<(usize, Vec<Bytes>)>> {
+    let Some(&first) = data.first() else {
+        return Ok(None);
+    };
+    if first != b'*' {
+        bail!(
+            "ERR Protocol error: expected '*', got '{}'",
+            first.escape_ascii()
+        );
+    }
+    let Some((mut cursor, count)) = read_int_line(data, 1, INVALID_MULTIBULK)? else {
+        return Ok(None);
+    };
+    if count > MAX_MULTIBULK_LEN {
+        bail!(INVALID_MULTIBULK);
+    }
+    if count <= 0 {
+        return Ok(Some((cursor, Vec::new())));
+    }
+    let count = count as usize;
+
+    // Do not trust the announced count for preallocation: every element needs
+    // at least MIN_ELEMENT_LEN bytes of input that must actually arrive.
+    let mut items = Vec::with_capacity(count.min((data.len() - cursor) / MIN_ELEMENT_LEN + 1));
+    for _ in 0..count {
+        let Some(&prefix) = data.get(cursor) else {
             return Ok(None);
+        };
+        if prefix != b'$' {
+            bail!(
+                "ERR Protocol error: expected '$', got '{}'",
+                prefix.escape_ascii()
+            );
         }
-        cursor += 1 + i2;
-
-        // Calculate total bytes needed (length + \r\n)
-        let need = len as usize + 2;
-        if cursor + need > data.len() {
-            return Ok(None); // Need more data
+        let Some((start, len)) = read_int_line(data, cursor + 1, INVALID_BULK)? else {
+            return Ok(None);
+        };
+        if !(0..=MAX_BULK_LEN).contains(&len) {
+            bail!(INVALID_BULK);
         }
-
-        // Extract the payload
-        let payload = &data[cursor..cursor + len as usize];
-        items.push(Bytes::copy_from_slice(payload));
-        cursor += need;
+        let end = start + len as usize;
+        let Some(terminator) = data.get(end..end + 2) else {
+            return Ok(None);
+        };
+        if terminator != b"\r\n" {
+            bail!(INVALID_BULK);
+        }
+        items.push(Bytes::copy_from_slice(&data[start..end]));
+        cursor = end + 2;
     }
+    Ok(Some((cursor, items)))
+}
 
-    if items.is_empty() {
-        bail!("empty array body");
-    }
-
+/// Build a command from the arguments of one request frame.
+fn command_from_frame(items: Vec<Bytes>) -> Result<Cmd> {
     // Match command names and validate argument counts
     // Using case-insensitive comparison without allocation
     let cmd = if items[0].eq_ignore_ascii_case(b"PING") {
@@ -150,8 +215,33 @@ pub fn parse_one(data: &[u8]) -> Result<Option<(usize, Cmd)>> {
     } else {
         bail!("unknown/invalid command");
     };
+    Ok(cmd)
+}
 
-    Ok(Some((cursor, cmd)))
+/// Parse a single RESP command from byte data
+///
+/// Requests are RESP arrays of bulk strings: `*<count>\r\n$<len>\r\n<data>\r\n...`.
+/// Empty requests (`*0\r\n` or a negative count) are skipped, as Redis does.
+///
+/// # Arguments
+/// * `data` - Raw byte slice containing RESP-formatted command
+///
+/// # Returns
+/// * `Ok(Some((consumed_bytes, command)))` - Successfully parsed command
+/// * `Ok(None)` - Incomplete data, need more bytes
+/// * `Err(...)` - Protocol error or invalid command
+pub fn parse_one(data: &[u8]) -> Result<Option<(usize, Cmd)>> {
+    let mut consumed = 0;
+    loop {
+        let Some((len, items)) = read_frame(&data[consumed..])? else {
+            return Ok(None);
+        };
+        consumed += len;
+        if items.is_empty() {
+            continue;
+        }
+        return Ok(Some((consumed, command_from_frame(items)?)));
+    }
 }
 
 /// Parse multiple RESP commands from a buffer
@@ -174,44 +264,6 @@ pub fn parse_many(buf: &mut bytes::BytesMut, out: &mut Vec<Cmd>) -> Result<()> {
         out.push(cmd);
     }
     Ok(())
-}
-
-/// Read a decimal number followed by \r\n
-///
-/// Helper function to parse RESP numeric fields like array lengths
-/// and bulk string lengths.
-///
-/// # Returns
-/// * `(bytes_consumed, parsed_number)`
-fn read_decimal_line(s: &[u8]) -> Result<(usize, i64)> {
-    let mut i = 0;
-    let mut num: i64 = 0;
-    let mut sign: i64 = 1;
-
-    if i < s.len() && s[i] == b'-' {
-        sign = -1;
-        i += 1;
-    }
-
-    while i < s.len() {
-        let c = s[i];
-        if c.is_ascii_digit() {
-            num = num.wrapping_mul(10).wrapping_add((c - b'0') as i64);
-            i += 1;
-        } else {
-            break;
-        }
-    }
-
-    // Check for \r\n
-    if i + 1 < s.len() && s[i] == b'\r' && s[i + 1] == b'\n' {
-        Ok((i + 2, num * sign))
-    } else if i + 1 >= s.len() {
-        // Incomplete
-        Ok((0, 0))
-    } else {
-        bail!("expected CRLF");
-    }
 }
 
 //
