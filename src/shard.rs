@@ -10,8 +10,9 @@ use crate::aof::{
     emit_aof_del, emit_aof_flushall, emit_aof_flushdb, emit_aof_incr, emit_aof_incrby,
     emit_aof_mset, emit_aof_rename, emit_aof_set, AofHandle,
 };
+use crate::glob::Pattern;
 use crate::protocol::{
-    fmt_i64, parse_canonical_i64, write_array_len, write_bulk, write_error, write_integer,
+    fmt_i64, fmt_u64, parse_canonical_i64, write_array_len, write_bulk, write_error, write_integer,
     write_map_len, write_nil, write_simple, Cmd, FlushMode, Protocol, Value,
 };
 use crate::session::Session;
@@ -95,6 +96,12 @@ fn write_mget(dict: &Dict, keys: &[Bytes], protocol: Protocol, out: &mut BytesMu
     for value in &later {
         write_value(value.as_ref(), protocol, out);
     }
+}
+
+/// Compile a KEYS or SCAN pattern; `*` alone needs no matching (and, unlike
+/// other patterns, also matches the empty key, as in Redis)
+fn glob(pattern: &[u8]) -> Option<Pattern> {
+    (pattern != b"*").then(|| Pattern::new(pattern, false))
 }
 
 /// `CLIENT HELP`, in Redis's words, for the subcommands Ignix supports
@@ -359,6 +366,37 @@ impl Shard {
             Cmd::Type(key) => {
                 let exists = self.dict.read(&key, |value| value.is_some());
                 write_simple(if exists { "string" } else { "none" }, out);
+            }
+
+            // KEYS pattern
+            Cmd::Keys(pattern) => {
+                let keys = self.dict.keys(glob(&pattern).as_ref());
+                write_array_len(keys.len(), out);
+                for key in &keys {
+                    write_bulk(key, out);
+                }
+            }
+
+            // SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]
+            Cmd::Scan {
+                cursor,
+                pattern,
+                count,
+                type_name,
+            } => {
+                let pattern = pattern.and_then(|p| glob(&p));
+                let (next, mut keys) = self.dict.scan(cursor, count, pattern.as_ref());
+                // Every value is a string
+                if type_name.is_some_and(|t| !t.eq_ignore_ascii_case(b"string")) {
+                    keys.clear();
+                }
+                write_array_len(2, out);
+                let mut digits = [0u8; 20];
+                write_bulk(fmt_u64(next, &mut digits), out);
+                write_array_len(keys.len(), out);
+                for key in &keys {
+                    write_bulk(key, out);
+                }
             }
 
             // FLUSHDB / FLUSHALL [ASYNC|SYNC] - there is one database, so both

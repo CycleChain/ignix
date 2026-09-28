@@ -383,6 +383,185 @@ fn flush_options_other_than_async_or_sync_are_syntax_errors() {
     }
 }
 
+/// Split a reply made of bulk strings and arrays of them into its strings
+fn bulk_strings(reply: &[u8]) -> Vec<Vec<u8>> {
+    let mut strings = Vec::new();
+    let mut rest = reply;
+    while let Some(end) = rest.windows(2).position(|w| w == b"\r\n") {
+        let (line, after) = (&rest[..end], &rest[end + 2..]);
+        rest = after;
+        if line[0] == b'$' {
+            let len: usize = std::str::from_utf8(&line[1..]).unwrap().parse().unwrap();
+            strings.push(rest[..len].to_vec());
+            rest = &rest[len + 2..];
+        }
+    }
+    strings
+}
+
+/// The cursor and keys of a SCAN reply
+fn scan_reply(reply: &[u8]) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let mut strings = bulk_strings(reply);
+    assert!(
+        reply.starts_with(b"*2\r\n"),
+        "{:?}",
+        String::from_utf8_lossy(reply)
+    );
+    let cursor = strings.remove(0);
+    (cursor, strings)
+}
+
+/// Every key a full SCAN returns, running `between` after each step
+fn full_scan(s: &Shard, options: &[&[u8]], mut between: impl FnMut()) -> Vec<Vec<u8>> {
+    let mut cursor = b"0".to_vec();
+    let mut keys = Vec::new();
+    loop {
+        let mut args: Vec<&[u8]> = vec![b"SCAN", &cursor];
+        args.extend_from_slice(options);
+        let (next, batch) = scan_reply(&exec(s, &args));
+        keys.extend(batch);
+        between();
+        if next == b"0" {
+            return keys;
+        }
+        cursor = next;
+    }
+}
+
+#[test]
+fn keys_returns_the_keys_matching_a_glob_pattern() {
+    let s = shard();
+    for key in [
+        &b"hello"[..],
+        b"hallo",
+        b"hxllo",
+        b"heeeello",
+        b"other",
+        b"",
+    ] {
+        exec(&s, &[b"SET", key, b"1"]);
+    }
+    let mut matched = bulk_strings(&exec(&s, &[b"KEYS", b"h?llo"]));
+    matched.sort();
+    assert_eq!(matched, [&b"hallo"[..], b"hello", b"hxllo"]);
+    // `*` also returns the empty key, other patterns never match it
+    assert_eq!(bulk_strings(&exec(&s, &[b"KEYS", b"*"])).len(), 6);
+    assert_eq!(bulk_strings(&exec(&s, &[b"KEYS", b"**"])).len(), 5);
+    assert_eq!(exec(&s, &[b"KEYS", b"nothing*"]), b"*0\r\n");
+    assert_eq!(exec(&s, &[b"KEYS"]), arity_error("keys"));
+}
+
+#[test]
+fn scan_returns_every_key_exactly_once() {
+    let s = shard();
+    for i in 0..10_000 {
+        exec(&s, &[b"SET", format!("key:{i}").as_bytes(), b"v"]);
+    }
+    let mut keys = full_scan(&s, &[], || ());
+    keys.sort();
+    let mut expected: Vec<Vec<u8>> = (0..10_000)
+        .map(|i| format!("key:{i}").into_bytes())
+        .collect();
+    expected.sort();
+    assert_eq!(keys, expected);
+}
+
+#[test]
+fn scan_returns_keys_that_exist_throughout_exactly_once_despite_writes() {
+    let s = shard();
+    for i in 0..10_000 {
+        exec(&s, &[b"SET", format!("stable:{i}").as_bytes(), b"v"]);
+        exec(&s, &[b"SET", format!("doomed:{i}").as_bytes(), b"v"]);
+    }
+    let mut step = 0;
+    let keys = full_scan(&s, &[b"COUNT", b"100"], || {
+        // Between steps, delete some keys and add new ones
+        for i in step * 100..(step + 1) * 100 {
+            exec(&s, &[b"DEL", format!("doomed:{i}").as_bytes()]);
+            exec(&s, &[b"SET", format!("new:{step}:{i}").as_bytes(), b"v"]);
+        }
+        step += 1;
+    });
+    let mut stable: Vec<&Vec<u8>> = keys.iter().filter(|k| k.starts_with(b"stable:")).collect();
+    stable.sort();
+    stable.dedup();
+    assert_eq!(stable.len(), 10_000);
+    assert_eq!(
+        keys.iter().filter(|k| k.starts_with(b"stable:")).count(),
+        10_000
+    );
+    // Nothing is returned twice
+    let mut all = keys.clone();
+    all.sort();
+    all.dedup();
+    assert_eq!(all.len(), keys.len());
+}
+
+#[test]
+fn scan_filters_with_match_and_type_and_takes_count_as_a_hint() {
+    let s = shard();
+    for i in 0..100 {
+        exec(&s, &[b"SET", format!("user:{i}").as_bytes(), b"v"]);
+        exec(&s, &[b"SET", format!("item:{i}").as_bytes(), b"v"]);
+    }
+    let users = full_scan(&s, &[b"MATCH", b"user:*"], || ());
+    assert_eq!(users.len(), 100);
+    assert!(users.iter().all(|k| k.starts_with(b"user:")));
+    // The last MATCH wins; TYPE is compared ignoring case
+    let items = full_scan(&s, &[b"MATCH", b"user:*", b"match", b"item:*"], || ());
+    assert_eq!(items.len(), 100);
+    assert_eq!(full_scan(&s, &[b"TYPE", b"STRING"], || ()).len(), 200);
+    assert!(full_scan(&s, &[b"TYPE", b"hash"], || ()).is_empty());
+    // A large COUNT scans everything in one step
+    let (cursor, keys) = scan_reply(&exec(&s, &[b"SCAN", b"0", b"COUNT", b"100000"]));
+    assert_eq!((cursor, keys.len()), (b"0".to_vec(), 200));
+}
+
+#[test]
+fn scan_parses_cursors_like_strtoul() {
+    let s = shard();
+    exec(&s, &[b"SET", b"k", b"v"]);
+    for cursor in [&b""[..], b"0", b"+0", b"00"] {
+        assert_eq!(
+            scan_reply(&exec(&s, &[b"SCAN", cursor, b"COUNT", b"100000"]))
+                .1
+                .len(),
+            1
+        );
+    }
+    // -1 wraps around to a cursor past the end
+    assert_eq!(exec(&s, &[b"SCAN", b"-1"]), b"*2\r\n$1\r\n0\r\n*0\r\n");
+    for cursor in [
+        &b" 0"[..],
+        b"abc",
+        b"0x1",
+        b"+",
+        b"-",
+        b"18446744073709551616",
+    ] {
+        assert_eq!(exec(&s, &[b"SCAN", cursor]), b"-ERR invalid cursor\r\n");
+    }
+}
+
+#[test]
+fn scan_option_errors_match_redis() {
+    let s = shard();
+    let syntax = b"-ERR syntax error\r\n";
+    assert_eq!(exec(&s, &[b"SCAN", b"0", b"COUNT", b"0"]), syntax);
+    assert_eq!(exec(&s, &[b"SCAN", b"0", b"COUNT"]), syntax);
+    assert_eq!(exec(&s, &[b"SCAN", b"0", b"FOO", b"x"]), syntax);
+    assert_eq!(
+        exec(&s, &[b"SCAN", b"0", b"COUNT", b"abc"]),
+        b"-ERR value is not an integer or out of range\r\n"
+    );
+    // The cursor is checked first
+    assert_eq!(
+        exec(&s, &[b"SCAN", b"x", b"FOO"]),
+        b"-ERR invalid cursor\r\n"
+    );
+    assert_eq!(exec(&s, &[b"SCAN"]), arity_error("scan"));
+}
+
 #[test]
 fn get_with_extra_argument_is_an_arity_error() {
     let s = shard();

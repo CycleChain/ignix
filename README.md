@@ -91,6 +91,8 @@ world
 | `MSET key value [key value ...]` | Set multiple values | `MSET k1 v1 k2 v2` → `+OK` |
 | `TYPE key` | Type of the value (`string`), or `none` | `TYPE k1` → `+string` |
 | `DBSIZE` | Number of keys | `DBSIZE` → `:2` |
+| `KEYS pattern` | Keys matching a glob pattern (`*`, `?`, `[a-z]`, `\\`), like Redis | `KEYS user:*` → `*2\r\n...` |
+| `SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]` | Iterate over the keys | `SCAN 0` → `*2\r\n$2\r\n17\r\n*...` |
 | `FLUSHDB [ASYNC\|SYNC]`, `FLUSHALL [ASYNC\|SYNC]` | Delete every key (with `ASYNC` the memory is freed in the background) | `FLUSHDB` → `+OK` |
 
 Replies and error messages match Redis 7, for example `-ERR wrong number of arguments for 'get' command`, `-ERR unknown command 'FOO', with args beginning with: ...` and `-ERR value is not an integer or out of range`. After an invalid command the connection keeps working; after malformed RESP the server replies `-ERR Protocol error: ...` and closes the connection, as Redis does.
@@ -303,7 +305,8 @@ Monitor AOF: `tail -f ignix.aof`
 
 ## 🐛 Known Limitations
 
-- Limited command set compared with Redis (no `KEYS`, `INFO`, `CONFIG`, ...); `CLIENT` supports only `ID`, `GETNAME`, `SETNAME`, `SETINFO` and `HELP`.
+- Limited command set compared with Redis (no `INFO`, `CONFIG`, ...); `CLIENT` supports only `ID`, `GETNAME`, `SETNAME`, `SETINFO` and `HELP`.
+- `SCAN` visits the keyspace one shard (1/1024 of the keys) at a time, so with many keys a step returns more keys than `COUNT`; like in Redis, every key that exists during the whole iteration is returned, and here exactly once.
 - A single database: `SELECT` accepts only index 0.
 - No inline commands (plain text lines such as `PING` typed into telnet); requests must be RESP arrays.
 - No key expiry: `SET` options and `EXPIRE` are not implemented.

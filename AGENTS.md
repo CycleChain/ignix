@@ -62,6 +62,10 @@ boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler 
 - `src/commands.rs`: statik komut tablosu (`CommandSpec { name, arity, kind }`, tek listeden
   `commands!` makrosuyla); `lookup` adı küçük harfe indirgenmiş bir `u128`'e paketleyip eşler.
   Yeni komut önce buraya eklenir.
+- `src/glob.rs`: KEYS, SCAN MATCH (ve `nocase` ile CONFIG GET) desenleri; Redis
+  `stringmatchlen` ile aynı sonucu verir (işaretli `char` aralıkları, kapanmamış `[`, 1000 yıldız
+  sınırı dahil), ama özyinelemesizdir. Davranışı değiştirmeden önce testlerindeki Redis 7.0.15
+  çıktılarına bak.
 - `src/session.rs`: `Session`, bağlantı başına durum: istemci kimliği (bağlantı başına bir kez
   genel sayaçtan), protokol (RESP2/RESP3), istemci adı, kütüphane adı ve sürümü (`CLIENT
   SETINFO`), QUIT'in kapanış bayrağı.
@@ -86,8 +90,8 @@ boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler 
   (`ignix.aof` açılamazsa AOF'suz sürer).
 
 Desteklenen komutlar: PING, ECHO, QUIT, SELECT (yalnızca 0), HELLO, CLIENT (ID, GETNAME,
-SETNAME, SETINFO, HELP), GET, SET, DEL, UNLINK, EXISTS, TYPE, DBSIZE, FLUSHDB, FLUSHALL, INCR,
-INCRBY, DECR, DECRBY, RENAME, MGET, MSET.
+SETNAME, SETINFO, HELP), GET, SET, DEL, UNLINK, EXISTS, TYPE, DBSIZE, KEYS, SCAN, FLUSHDB,
+FLUSHALL, INCR, INCRBY, DECR, DECRBY, RENAME, MGET, MSET.
 
 ## Dizin haritası
 

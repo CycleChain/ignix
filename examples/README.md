@@ -99,7 +99,7 @@ cargo run --release
 
 ### Command Not Found
 ```
-❌ Redis Error: unknown command 'KEYS', with args beginning with: '*'
+❌ Redis Error: unknown command 'HSET', with args beginning with: 'user' 'name' 'ada'
 ```
 **Solution**: The command is not implemented in Ignix yet. Check the [supported commands list](../README.md#-supported-commands).
 

@@ -120,6 +120,21 @@ pub enum Cmd {
     FlushDb(FlushMode),
     /// FLUSHALL \[ASYNC|SYNC\] - delete every key of every database
     FlushAll(FlushMode),
+    /// KEYS pattern - every key matching the glob `pattern`
+    Keys(Bytes),
+    /// SCAN cursor \[MATCH pattern\] \[COUNT count\] \[TYPE type\] - the next
+    /// keys of an iteration over the keyspace
+    #[non_exhaustive]
+    Scan {
+        /// Where the iteration goes on; 0 starts it
+        cursor: u64,
+        /// Only keys matching this glob pattern are returned
+        pattern: Option<Bytes>,
+        /// About how many keys to look at (10 unless given)
+        count: usize,
+        /// Only keys holding values of this type are returned
+        type_name: Option<Bytes>,
+    },
 }
 
 /// Value types that can be stored in Ignix
@@ -432,6 +447,11 @@ fn command_from_frame(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String>
             Cmd::Echo(message)
         }
         Kind::Quit => Cmd::Quit,
+        Kind::Keys => {
+            let [pattern] = <[Bytes; 1]>::try_from(items).map_err(|_| arity_error())?;
+            Cmd::Keys(pattern)
+        }
+        Kind::Scan => scan_command(items)?,
         Kind::Client => client_command(items)?,
         Kind::Hello => {
             let mut args = items.into_iter();
@@ -465,6 +485,67 @@ fn command_from_frame(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String>
         }
     };
     Ok(cmd)
+}
+
+/// Parse a SCAN cursor like Redis: `strtoul` in base 10 with nothing left
+/// over, so an empty cursor is 0 and `-1` wraps around, while a leading
+/// space or an overflow makes it invalid.
+fn parse_scan_cursor(s: &[u8]) -> Option<u64> {
+    let (negative, digits) = match s {
+        [] => return Some(0),
+        [b'+', rest @ ..] => (false, rest),
+        [b'-', rest @ ..] => (true, rest),
+        _ => (false, s),
+    };
+    if digits.is_empty() || !digits.iter().all(u8::is_ascii_digit) {
+        return None;
+    }
+    let mut value: u64 = 0;
+    for &digit in digits {
+        value = value
+            .checked_mul(10)?
+            .checked_add(u64::from(digit - b'0'))?;
+    }
+    Some(if negative {
+        value.wrapping_neg()
+    } else {
+        value
+    })
+}
+
+/// Build a SCAN command from the arguments after `SCAN`.
+fn scan_command(items: Vec<Bytes>) -> std::result::Result<Cmd, String> {
+    let cursor = parse_scan_cursor(&items[0]).ok_or_else(|| "ERR invalid cursor".to_string())?;
+    let (mut pattern, mut count, mut type_name) = (None, 10, None);
+    let options = &items[1..];
+    let mut i = 0;
+    while i < options.len() {
+        let option = &options[i];
+        let Some(value) = options.get(i + 1) else {
+            return Err("ERR syntax error".to_string());
+        };
+        if option.eq_ignore_ascii_case(b"count") {
+            let n = parse_canonical_i64(value)
+                .ok_or_else(|| "ERR value is not an integer or out of range".to_string())?;
+            if n < 1 {
+                return Err("ERR syntax error".to_string());
+            }
+            count = usize::try_from(n).unwrap_or(usize::MAX);
+        } else if option.eq_ignore_ascii_case(b"match") {
+            pattern = Some(value.clone());
+        } else if option.eq_ignore_ascii_case(b"type") {
+            type_name = Some(value.clone());
+        } else {
+            return Err("ERR syntax error".to_string());
+        }
+        i += 2;
+    }
+    Ok(Cmd::Scan {
+        cursor,
+        pattern,
+        count,
+        type_name,
+    })
 }
 
 /// Build a `CLIENT` subcommand from the arguments after `CLIENT`.

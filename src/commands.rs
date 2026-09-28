@@ -31,6 +31,8 @@ pub(crate) enum Kind {
     Unlink,
     FlushDb,
     FlushAll,
+    Keys,
+    Scan,
 }
 
 /// The static description of a command
@@ -132,6 +134,8 @@ commands! {
     UNLINK = "unlink", -2, Unlink;
     FLUSHDB = "flushdb", -1, FlushDb;
     FLUSHALL = "flushall", -1, FlushAll;
+    KEYS = "keys", 2, Keys;
+    SCAN = "scan", -2, Scan;
 }
 
 #[cfg(test)]

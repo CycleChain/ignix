@@ -6,6 +6,7 @@
  * shard's table, so every operation hashes the key once.
  */
 
+use crate::glob::Pattern;
 use crate::protocol::{parse_canonical_i64, Value};
 use bytes::Bytes;
 use crossbeam::utils::CachePadded;
@@ -189,6 +190,50 @@ impl Dict {
     /// Whether the dictionary holds no keys
     pub fn is_empty(&self) -> bool {
         self.read_all().iter().all(|table| table.is_empty())
+    }
+
+    /// Every key matching `pattern`, or every key without one, collected
+    /// with every shard read-locked (KEYS)
+    pub(crate) fn keys(&self, pattern: Option<&Pattern>) -> Vec<Bytes> {
+        let tables = self.read_all();
+        let mut keys = Vec::new();
+        for table in &tables {
+            let matching = table
+                .keys()
+                .filter(|k| pattern.is_none_or(|p| p.matches(k)));
+            keys.extend(matching.cloned());
+        }
+        keys
+    }
+
+    /// One step of SCAN from `cursor`, the index of the next shard to visit.
+    ///
+    /// Visits whole shards until it has looked at `count` keys or visited
+    /// `10 * count` shards (Redis counts buckets the same way), and returns
+    /// the next cursor, 0 once every shard has been visited, with the keys
+    /// matching `pattern`. A key never moves to another shard, so every key
+    /// that exists during the whole iteration is returned exactly once.
+    pub(crate) fn scan(
+        &self,
+        cursor: u64,
+        count: usize,
+        pattern: Option<&Pattern>,
+    ) -> (u64, Vec<Bytes>) {
+        let mut shard = usize::try_from(cursor).unwrap_or(SHARDS);
+        let (mut seen, mut visited) = (0, 0);
+        let mut keys = Vec::new();
+        while shard < SHARDS && seen < count && visited < count.saturating_mul(10) {
+            let table = self.read_shard(shard);
+            seen += table.len();
+            let matching = table
+                .keys()
+                .filter(|k| pattern.is_none_or(|p| p.matches(k)));
+            keys.extend(matching.cloned());
+            shard += 1;
+            visited += 1;
+        }
+        let next = if shard < SHARDS { shard as u64 } else { 0 };
+        (next, keys)
     }
 
     /// Remove every key
