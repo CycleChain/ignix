@@ -13,7 +13,7 @@
 #![cfg(target_os = "linux")]
 
 use crate::net::handle_input;
-use crate::protocol::Request;
+use crate::protocol::{Request, RequestParser};
 use crate::shard::Shard;
 use anyhow::Result;
 use bytes::{Buf, BytesMut};
@@ -47,6 +47,8 @@ struct Connection {
     read_buffer: Box<[u8; READ_BUF]>,
     /// Received bytes not parsed yet
     read_buf: BytesMut,
+    /// How far the incomplete request in `read_buf` has been parsed
+    parser: RequestParser,
     /// Replies not written yet. Never modified while a write is in flight.
     write_buf: BytesMut,
     reqs: Vec<Request>,
@@ -60,6 +62,7 @@ impl Connection {
             stream,
             read_buffer: Box::new([0u8; READ_BUF]),
             read_buf: BytesMut::with_capacity(READ_BUF),
+            parser: RequestParser::new(),
             write_buf: BytesMut::new(),
             reqs: Vec::with_capacity(32),
             closing: false,
@@ -194,6 +197,7 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
                             if !handle_input(
                                 &shard,
                                 &mut conn.read_buf,
+                                &mut conn.parser,
                                 &mut conn.reqs,
                                 &mut conn.write_buf,
                             ) {

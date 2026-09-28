@@ -6,7 +6,7 @@
  * using mio for async I/O operations.
  */
 
-use crate::protocol::{parse_requests, write_error, Request};
+use crate::protocol::{write_error, Request, RequestParser};
 use crate::shard::Shard;
 use anyhow::*;
 use bytes::{Buf, BytesMut};
@@ -143,6 +143,8 @@ struct Conn {
     sock: TcpStream,
     /// Received bytes not parsed yet (at most one incomplete request)
     rbuf: BytesMut,
+    /// How far the incomplete request in `rbuf` has been parsed
+    parser: RequestParser,
     /// Replies not written to the socket yet
     wbuf: BytesMut,
     /// Parsed requests, reused between reads
@@ -158,6 +160,7 @@ impl Conn {
         Self {
             sock,
             rbuf: BytesMut::with_capacity(READ_BUF),
+            parser: RequestParser::new(),
             wbuf: BytesMut::new(),
             reqs: Vec::with_capacity(32),
             closing: false,
@@ -171,14 +174,17 @@ impl Conn {
 /// Invalid commands get an error reply and the connection stays usable.
 /// Returns `false` after a protocol error: the requests before it have been
 /// executed, its error reply is queued after theirs, and the connection must
-/// be closed once `wbuf` is flushed (Redis behaves the same way).
+/// be closed once `wbuf` is flushed (Redis behaves the same way). `parser`
+/// keeps the progress through a request that has not fully arrived; the
+/// caller only appends to `rbuf`.
 pub(crate) fn handle_input(
     shard: &Shard,
     rbuf: &mut BytesMut,
+    parser: &mut RequestParser,
     reqs: &mut Vec<Request>,
     wbuf: &mut BytesMut,
 ) -> bool {
-    let parsed = parse_requests(rbuf, reqs);
+    let parsed = parser.parse(rbuf, reqs);
     for req in reqs.drain(..) {
         match req {
             Request::Cmd(cmd) => shard.exec(cmd, wbuf),
@@ -189,6 +195,7 @@ pub(crate) fn handle_input(
         Ok(()) => true,
         Err(e) => {
             write_error(&e.to_string(), wbuf);
+            parser.reset();
             false
         }
     }
@@ -347,7 +354,13 @@ fn drive(
         }
         // Run what arrived even after EOF: a client may send its requests and
         // half-close right away, and still read the replies.
-        if !handle_input(shard, &mut conn.rbuf, &mut conn.reqs, &mut conn.wbuf) {
+        if !handle_input(
+            shard,
+            &mut conn.rbuf,
+            &mut conn.parser,
+            &mut conn.reqs,
+            &mut conn.wbuf,
+        ) {
             conn.closing = true;
             conn.rbuf.clear();
         }

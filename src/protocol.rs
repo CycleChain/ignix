@@ -140,56 +140,124 @@ fn read_int_line(data: &[u8], pos: usize, invalid: &'static str) -> Result<Optio
 /// complete RESP error line (`ERR Protocol error: ...`). A frame with `n <= 0`
 /// has no arguments; Redis ignores such requests.
 fn read_frame(data: &[u8]) -> Result<Option<(usize, Vec<Bytes>)>> {
-    let Some(&first) = data.first() else {
-        return Ok(None);
-    };
-    if first != b'*' {
-        bail!(
-            "ERR Protocol error: expected '*', got '{}'",
-            first.escape_ascii()
-        );
-    }
-    let Some((mut cursor, count)) = read_int_line(data, 1, INVALID_MULTIBULK)? else {
-        return Ok(None);
-    };
-    if count > MAX_MULTIBULK_LEN {
-        bail!(INVALID_MULTIBULK);
-    }
-    if count <= 0 {
-        return Ok(Some((cursor, Vec::new())));
-    }
-    let count = count as usize;
+    RequestParser::default().next_frame(data)
+}
 
-    // Do not trust the announced count for preallocation: every element needs
-    // at least MIN_ELEMENT_LEN bytes of input that must actually arrive.
-    let mut items = Vec::with_capacity(count.min((data.len() - cursor) / MIN_ELEMENT_LEN + 1));
-    for _ in 0..count {
-        let Some(&prefix) = data.get(cursor) else {
-            return Ok(None);
-        };
-        if prefix != b'$' {
-            bail!(
-                "ERR Protocol error: expected '$', got '{}'",
-                prefix.escape_ascii()
-            );
-        }
-        let Some((start, len)) = read_int_line(data, cursor + 1, INVALID_BULK)? else {
-            return Ok(None);
-        };
-        if !(0..=MAX_BULK_LEN).contains(&len) {
-            bail!(INVALID_BULK);
-        }
-        let end = start + len as usize;
-        let Some(terminator) = data.get(end..end + 2) else {
-            return Ok(None);
-        };
-        if terminator != b"\r\n" {
-            bail!(INVALID_BULK);
-        }
-        items.push(Bytes::copy_from_slice(&data[start..end]));
-        cursor = end + 2;
+/// Incremental request parser for one connection
+///
+/// Works like [`parse_requests`], but remembers how far a request that has
+/// not fully arrived was already parsed, so each call only looks at the new
+/// bytes: a large request that arrives in many small reads costs time linear
+/// in its size. `parse_requests` starts a partial request over on every call
+/// and copies its arguments again each time.
+#[derive(Debug, Default)]
+pub struct RequestParser {
+    /// Offset in the buffer of the next unparsed element; 0 when no request
+    /// is in progress
+    cursor: usize,
+    /// Elements of the current request still to be read
+    remaining: usize,
+    /// Elements of the current request read so far
+    items: Vec<Bytes>,
+}
+
+impl RequestParser {
+    /// A parser with no request in progress
+    pub fn new() -> Self {
+        Self::default()
     }
-    Ok(Some((cursor, items)))
+
+    /// Parse every complete request in `buf` into `out`, consuming its bytes
+    ///
+    /// Same results and errors as [`parse_requests`]. Between calls `buf` may
+    /// only grow at the end: the bytes of a partial request must stay where
+    /// they are. After an error, or when the buffer is cleared, call
+    /// [`RequestParser::reset`] before parsing again.
+    pub fn parse(&mut self, buf: &mut BytesMut, out: &mut Vec<Request>) -> Result<()> {
+        loop {
+            let Some((consumed, items)) = self.next_frame(&buf[..])? else {
+                return Ok(());
+            };
+            buf.advance(consumed);
+            if items.is_empty() {
+                continue;
+            }
+            out.push(match command_from_frame(items) {
+                Ok(cmd) => Request::Cmd(cmd),
+                Err(message) => Request::Invalid(message),
+            });
+        }
+    }
+
+    /// Forget the request in progress
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    /// Continue reading the frame at the start of `data`; see [`read_frame`].
+    fn next_frame(&mut self, data: &[u8]) -> Result<Option<(usize, Vec<Bytes>)>> {
+        // The caller removed bytes it should have kept: start over.
+        if self.cursor > data.len() {
+            self.reset();
+        }
+        if self.cursor == 0 {
+            let Some(&first) = data.first() else {
+                return Ok(None);
+            };
+            if first != b'*' {
+                bail!(
+                    "ERR Protocol error: expected '*', got '{}'",
+                    first.escape_ascii()
+                );
+            }
+            let Some((cursor, count)) = read_int_line(data, 1, INVALID_MULTIBULK)? else {
+                return Ok(None);
+            };
+            if count > MAX_MULTIBULK_LEN {
+                bail!(INVALID_MULTIBULK);
+            }
+            if count <= 0 {
+                return Ok(Some((cursor, Vec::new())));
+            }
+            let count = count as usize;
+            // Do not trust the announced count for preallocation: every
+            // element needs at least MIN_ELEMENT_LEN bytes of input that must
+            // actually arrive.
+            self.items = Vec::with_capacity(count.min((data.len() - cursor) / MIN_ELEMENT_LEN + 1));
+            self.remaining = count;
+            self.cursor = cursor;
+        }
+        while self.remaining > 0 {
+            let cursor = self.cursor;
+            let Some(&prefix) = data.get(cursor) else {
+                return Ok(None);
+            };
+            if prefix != b'$' {
+                bail!(
+                    "ERR Protocol error: expected '$', got '{}'",
+                    prefix.escape_ascii()
+                );
+            }
+            let Some((start, len)) = read_int_line(data, cursor + 1, INVALID_BULK)? else {
+                return Ok(None);
+            };
+            if !(0..=MAX_BULK_LEN).contains(&len) {
+                bail!(INVALID_BULK);
+            }
+            let end = start + len as usize;
+            let Some(terminator) = data.get(end..end + 2) else {
+                return Ok(None);
+            };
+            if terminator != b"\r\n" {
+                bail!(INVALID_BULK);
+            }
+            self.items.push(Bytes::copy_from_slice(&data[start..end]));
+            self.cursor = end + 2;
+            self.remaining -= 1;
+        }
+        let consumed = std::mem::take(&mut self.cursor);
+        Ok(Some((consumed, std::mem::take(&mut self.items))))
+    }
 }
 
 /// Commands known to the parser, with the name Redis uses in error messages.
@@ -411,20 +479,12 @@ pub enum Request {
 /// read before it are already in `out`, and the malformed bytes stay in
 /// `buf`. Its message is a complete error line; Redis replies with it and
 /// closes the connection.
+///
+/// A partial request is parsed again from its start on the next call; a
+/// server reading from a socket should keep a [`RequestParser`] per
+/// connection instead.
 pub fn parse_requests(buf: &mut BytesMut, out: &mut Vec<Request>) -> Result<()> {
-    loop {
-        let Some((consumed, items)) = read_frame(&buf[..])? else {
-            return Ok(());
-        };
-        buf.advance(consumed);
-        if items.is_empty() {
-            continue;
-        }
-        out.push(match command_from_frame(items) {
-            Ok(cmd) => Request::Cmd(cmd),
-            Err(message) => Request::Invalid(message),
-        });
-    }
+    RequestParser::new().parse(buf, out)
 }
 
 //

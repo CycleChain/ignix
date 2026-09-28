@@ -1,8 +1,9 @@
 //! Request parsing and reply writing APIs used by the network backends.
 
 use bytes::{Bytes, BytesMut};
-use ignix::protocol::{parse_one, parse_requests, write_error, Request};
+use ignix::protocol::{parse_one, parse_requests, write_error, Request, RequestParser};
 use ignix::Cmd;
+use std::time::{Duration, Instant};
 
 fn b(s: &str) -> Bytes {
     Bytes::copy_from_slice(s.as_bytes())
@@ -142,5 +143,90 @@ fn integer_replies_cover_the_whole_i64_range() {
     assert_eq!(
         &out[..],
         b"*0\r\n*1234567\r\n$0\r\n\r\n$12\r\nxxxxxxxxxxxx\r\n"
+    );
+}
+
+/// RESP encoding of a request
+fn request(args: &[&[u8]]) -> Vec<u8> {
+    let mut out = format!("*{}\r\n", args.len()).into_bytes();
+    for arg in args {
+        out.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+        out.extend_from_slice(arg);
+        out.extend_from_slice(b"\r\n");
+    }
+    out
+}
+
+#[test]
+fn request_parser_gives_the_same_requests_when_fed_one_byte_at_a_time() {
+    let mut input = request(&[b"SET", b"a", b"1"]);
+    input.extend(request(&[b"FOO", b"bar"]));
+    input.extend_from_slice(b"*0\r\n");
+    input.extend(request(&[b"GET", b"a"]));
+    let mut mset: Vec<&[u8]> = vec![b"MSET"];
+    let pairs: Vec<String> = (0..100).map(|i| format!("key{i}")).collect();
+    for key in &pairs {
+        mset.push(key.as_bytes());
+        mset.push(b"value");
+    }
+    input.extend(request(&mset));
+
+    let mut expected = Vec::new();
+    parse_requests(&mut BytesMut::from(&input[..]), &mut expected).unwrap();
+    assert_eq!(expected.len(), 4);
+
+    let mut parser = RequestParser::new();
+    let mut buf = BytesMut::new();
+    let mut out = Vec::new();
+    for byte in &input {
+        buf.extend_from_slice(std::slice::from_ref(byte));
+        parser.parse(&mut buf, &mut out).unwrap();
+    }
+    assert_eq!(out, expected);
+    assert!(buf.is_empty());
+}
+
+#[test]
+fn request_parser_reports_protocol_errors_and_can_be_reset() {
+    let mut parser = RequestParser::new();
+    let mut buf = BytesMut::from(&b"*2\r\n$3\r\nGET\r\n"[..]);
+    let mut out = Vec::new();
+    parser.parse(&mut buf, &mut out).unwrap();
+    assert!(out.is_empty(), "the request is not complete yet");
+    buf.extend_from_slice(b"X");
+    let err = parser.parse(&mut buf, &mut out).unwrap_err();
+    assert_eq!(err.to_string(), "ERR Protocol error: expected '$', got 'X'");
+
+    parser.reset();
+    let mut buf = BytesMut::from(&request(&[b"PING"])[..]);
+    parser.parse(&mut buf, &mut out).unwrap();
+    assert_eq!(out, vec![Request::Cmd(Cmd::Ping(None))]);
+}
+
+#[test]
+fn request_parser_reads_a_large_request_in_small_pieces_in_linear_time() {
+    // 200,000 keys (about 2.6 MB) arriving in 4 KiB reads. Parsing the whole
+    // request again on every read would copy about 2.6 MB x 650 / 2.
+    let keys: Vec<String> = (0..200_000).map(|i| format!("k{i:06}")).collect();
+    let mut args: Vec<&[u8]> = vec![b"DEL"];
+    args.extend(keys.iter().map(|k| k.as_bytes()));
+    let input = request(&args);
+
+    let started = Instant::now();
+    let mut parser = RequestParser::new();
+    let mut buf = BytesMut::new();
+    let mut out = Vec::new();
+    for piece in input.chunks(4096) {
+        buf.extend_from_slice(piece);
+        parser.parse(&mut buf, &mut out).unwrap();
+    }
+    let elapsed = started.elapsed();
+    match &out[..] {
+        [Request::Cmd(Cmd::Del(parsed))] => assert_eq!(parsed.len(), keys.len()),
+        other => panic!("unexpected result: {} requests", other.len()),
+    }
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "parsing a fragmented 200k-argument request took {elapsed:?}"
     );
 }
