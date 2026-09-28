@@ -155,6 +155,19 @@ impl Dict {
             .map(|(_, entry)| entry.value.clone())
     }
 
+    /// Call `f` with the value stored under `k` while its shard's read lock
+    /// is held, e.g. to copy it into a reply without cloning it. `f` must not
+    /// use the dictionary.
+    #[inline]
+    pub(crate) fn read<R>(&self, k: &[u8], f: impl FnOnce(Option<&Value>) -> R) -> R {
+        let (hash, shard) = self.locate(k);
+        let table = self.read_shard(shard);
+        f(table
+            .raw_entry()
+            .from_key_hashed_nocheck(hash, k)
+            .map(|(_, entry)| &entry.value))
+    }
+
     // note: Direct mutable references are not exposed; use entry APIs for atomic updates.
 
     /// Set a key-value pair

@@ -30,17 +30,42 @@ fn encode_value(v: Bytes) -> Value {
     }
 }
 
+/// Values up to this size are copied into a GET reply while the shard's read
+/// lock is held; larger ones are cloned (a reference count) and written after
+/// the lock is released, so a long copy never holds up writers.
+const COPY_UNDER_LOCK_MAX: usize = 16 * 1024;
+
 /// Write a stored value, or null when the key is missing, as a GET reply.
 ///
 /// Integers are sent as bulk strings, as Redis does for GET.
-fn write_value(value: Option<Value>, out: &mut BytesMut) {
+fn write_value(value: Option<&Value>, out: &mut BytesMut) {
     match value {
-        Some(Value::Str(v)) | Some(Value::Blob(v)) => write_bulk(&v, out),
+        Some(Value::Str(v)) | Some(Value::Blob(v)) => write_bulk(v, out),
         Some(Value::Int(i)) => {
             let mut digits = [0u8; 20];
-            write_bulk(fmt_i64(i, &mut digits), out);
+            write_bulk(fmt_i64(*i, &mut digits), out);
         }
         None => write_null(out),
+    }
+}
+
+/// Write the GET reply for `key`.
+///
+/// Small values are copied straight from the dictionary, which avoids the
+/// two atomic reference-count updates of cloning `Bytes` (contended when
+/// many connections read the same key).
+fn write_get(dict: &Dict, key: &[u8], out: &mut BytesMut) {
+    let large = dict.read(key, |value| match value {
+        Some(Value::Str(v)) | Some(Value::Blob(v)) if v.len() > COPY_UNDER_LOCK_MAX => {
+            Some(v.clone())
+        }
+        small => {
+            write_value(small, out);
+            None
+        }
+    });
+    if let Some(v) = large {
+        write_bulk(&v, out);
     }
 }
 
@@ -89,7 +114,7 @@ impl Shard {
             Cmd::Ping(Some(message)) => write_bulk(&message, out),
 
             // GET key - retrieve value for key
-            Cmd::Get(k) => write_value(self.dict.get(&k), out),
+            Cmd::Get(k) => write_get(&self.dict, &k, out),
 
             // SET key value - store key-value pair
             Cmd::Set(k, v) => {
@@ -175,7 +200,7 @@ impl Shard {
 
                 // Get each key and format as RESP
                 for k in keys {
-                    write_value(self.dict.get(&k), out);
+                    write_get(&self.dict, &k, out);
                 }
             }
 
