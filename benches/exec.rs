@@ -1,8 +1,8 @@
 //! Criterion benchmarks for `Shard::exec`.
 //!
 //! Inputs are built outside the timed code and one pre-sized output buffer is
-//! reused. Only `Cmd` variants with a stable shape (Set, Get, Incr, MGet) are
-//! used, so saved baselines stay comparable across changes.
+//! reused. Only `Cmd` variants with a stable shape (Set, Get, Incr, MGet,
+//! MSet, Del) are used, so saved baselines stay comparable across changes.
 
 use bytes::{Bytes, BytesMut};
 use criterion::{criterion_group, criterion_main, Criterion, Throughput};
@@ -15,6 +15,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 const N: usize = 10_000;
 const MGET_KEYS: usize = 16;
+const MSET_KEYS: usize = 10;
 
 fn keys() -> Vec<Bytes> {
     (0..N).map(|i| Bytes::from(format!("key:{i:06}"))).collect()
@@ -115,6 +116,42 @@ fn bench_exec(c: &mut Criterion) {
                 let start = (round * MGET_KEYS) % (N - MGET_KEYS);
                 let batch = keys[start..start + MGET_KEYS].to_vec();
                 shard.exec(Cmd::MGet(batch), &mut out);
+            }
+            black_box(out.len())
+        })
+    });
+
+    // MSET and DEL of 10 keys, like redis-benchmark's MSET test
+    let batches = N / MSET_KEYS;
+    let pairs = |batch: usize| -> Vec<(Bytes, Bytes)> {
+        let range = batch * MSET_KEYS..(batch + 1) * MSET_KEYS;
+        keys[range.clone()]
+            .iter()
+            .cloned()
+            .zip(str_values[range].iter().cloned())
+            .collect()
+    };
+    group.throughput(Throughput::Elements(N as u64));
+
+    let shard = filled(&keys, &str_values);
+    group.bench_function("mset_10x1k", |b| {
+        b.iter(|| {
+            out.clear();
+            for batch in 0..batches {
+                shard.exec(Cmd::MSet(pairs(batch)), &mut out);
+            }
+            black_box(out.len())
+        })
+    });
+
+    let shard = Shard::new(0, None);
+    group.bench_function("mset_del_10x1k", |b| {
+        b.iter(|| {
+            out.clear();
+            for batch in 0..batches {
+                shard.exec(Cmd::MSet(pairs(batch)), &mut out);
+                let keys = keys[batch * MSET_KEYS..(batch + 1) * MSET_KEYS].to_vec();
+                shard.exec(Cmd::Del(keys), &mut out);
             }
             black_box(out.len())
         })
