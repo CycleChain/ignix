@@ -37,12 +37,14 @@ Linux'ta geçer; güncel durum ve tuzaklar için aşağıdaki "Bilinen durum" b�
 ## Mimari
 
 İstek akışı: TCP bağlantısı → bağlantının okuma tamponu (`BytesMut`) → `net::handle_input`
-→ bağlantının `RequestParser`'ı → `Request::Cmd(cmd)` için
-`Shard::exec_session(cmd, &mut session, &mut out)`, `Request::Invalid(satır)` için `write_error`
-→ `Dict` (parçalı anahtar alanı) ve veri değiştiren komutlarda `AofHandle` → yanıt `write_*` ile
-doğrudan `out`'a → soket. Çerçeve (protokol) hatasında hata yanıtı yazılır ve bağlantı, yanıtlar
-boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler atılır. İki arka uç da
-`handle_input`'u paylaşır.
+→ bağlantının `RequestParser`'ı (`parse_split`) → `Ok(cmd)` için
+`Shard::exec_session(cmd, &mut session, &mut out)` (NOAUTH kapısı, `exec_frequent` ya da
+`exec_other`), `Err(Refusal::Invalid(satır))` için `write_error`, `Err(Refusal::Rejected(satır))`
+için kimlik doğrulanmışsa `write_error`, değilse NOAUTH → `Dict` (parçalı anahtar alanı) ve veri
+değiştiren komutlarda, değişen anahtarlar kilitliyken `log` geri çağrısıyla `AofHandle` → yanıt
+`write_*` ile doğrudan `out`'a → soket. Çerçeve (protokol) hatasında hata yanıtı yazılır ve
+bağlantı, yanıtlar boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler
+atılır. İki arka uç da `handle_input`'u paylaşır.
 
 - `src/net.rs` (varsayılan arka uç, mio): `run_shard`, `available_parallelism()` kadar iş
   parçacığı açar. Her biri `bind_reuseport` (SO_REUSEPORT) ile aynı portu kendi dinleyicisiyle
@@ -51,8 +53,11 @@ boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler 
   Son olaydan sonra worker uyumadan önce `ServerOptions::busy_poll` (varsayılan 50 µs,
   `--busy-poll-us=N`, `0` kapatır) boyunca engellemeden yoklar; VM'de uyuyan iş parçacığını
   uyandırmak istekten pahalıdır. `run_shard` varsayılanlarla `run_server`'ı çağırır.
+  `run_server` bağlandıktan sonra `spawn_active_expiry` ile süre sonu iş parçacığını başlatır ve
+  `ServerOptions::requirepass` parolasını her oturuma verir.
 - `src/net_uring.rs`: Linux'a özgü io_uring arka ucu (`#![cfg(target_os = "linux")]`); tek iş
-  parçacığı, SO_REUSEPORT yok, `unsafe` SQE gönderimleri. `--backend=uring` ile seçilir.
+  parçacığı, SO_REUSEPORT yok, `unsafe` SQE gönderimleri. `--backend uring` ile seçilir;
+  `run_server(addr, shard, options)` (`requirepass` geçerli, `busy_poll` değil).
 - `src/protocol.rs`: `Cmd` ve `Value` enum'ları (`#[non_exhaustive]`); çerçeve okuma
   (`read_frame`, `read_int_line`, Redis `string2ll` karşılığı `parse_canonical_i64`; komut adı
   kopyalanmaz, tampondaki yeri tutulur), komut ve argüman denetimi (`command_from_frame`, Redis
@@ -162,9 +167,10 @@ Bugünkü `main` için geçerlidir. Görevin konusu değilse düzeltmeye kalkma;
   `lsof -nP -iTCP:7379 -sTCP:LISTEN` ile portun boş olduğunu doğrula.
   `benchmarks/run_*.sh` port doluysa başlamaz ve yalnızca kendi başlattığı süreçleri durdurur.
 - **Protokol kapsamı:** RESP2 ve `HELLO 3` sonrası RESP3 (`Session::protocol`; null `_`, map
-  `%` olur); istekler yalnızca RESP dizisi biçiminde, satır içi (inline) komutlar yok. Geçersiz komut `-ERR ...` alır ve bağlantı sürer; bozuk RESP
-  `-ERR Protocol error: ...` alır ve bağlantı kapanır (Redis gibi). Hata metinleri Redis 7 ile
-  aynıdır. Seçeneksiz `SET k v` sıcak yol olarak `Cmd::Set` kalır; seçenekli hâli `Cmd::SetWith`.
+  `%` olur); istekler yalnızca RESP dizisi biçiminde, satır içi (inline) komutlar yok. Geçersiz
+  komut `-ERR ...` alır ve bağlantı sürer; bozuk RESP `-ERR Protocol error: ...` alır ve
+  bağlantı kapanır (Redis gibi). Hata metinleri Redis 7 ile aynıdır. Seçeneksiz `SET k v` sıcak
+  yol olarak `Cmd::Set` kalır; seçenekli hâli `Cmd::SetWith`.
 - **AOF yalnızca yazılır:** açılışta geri yüklenmez. Kayıtlar ikili güvenlidir ve DEL de
   yazılır. Her kayıt, değişen anahtarların kilidi tutulurken `Dict`'in `log` geri çağrısından
   gönderilir (`set_logged`, `del_many(.., log)`, ...; kodlama kilitten önce): bir anahtarın

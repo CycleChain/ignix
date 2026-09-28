@@ -10,8 +10,10 @@ Installation:
 
 Usage:
     python examples/python_client.py
+    IGNIX_PASSWORD=secret python examples/python_client.py   # ignix --requirepass secret
 """
 
+import os
 import redis
 import time
 import sys
@@ -26,6 +28,8 @@ def main():
         client = redis.Redis(
             host='localhost',
             port=7379,
+            # Sent with HELLO or AUTH when the server runs with --requirepass
+            password=os.environ.get('IGNIX_PASSWORD'),
             decode_responses=True,  # Automatically decode bytes to strings
             socket_connect_timeout=5,
             socket_timeout=5
@@ -106,17 +110,32 @@ def main():
         deleted = client.delete('greeting')
         print(f"✅ DEL greeting: {deleted} key(s) deleted")
         
+        print("\n⏳ Expiry:")
+        print("-" * 10)
+        
+        # SET with an expiry, then read and remove it
+        client.set('session:1', 'token', ex=60)
+        print(f"✅ SET session:1 EX 60, TTL: {client.ttl('session:1')} s")
+        client.persist('session:1')
+        print(f"✅ PERSIST session:1, TTL: {client.ttl('session:1')} (no expiry)")
+        client.set('session:1', 'token', px=100)
+        time.sleep(0.2)
+        print(f"✅ After PX 100 and 200 ms: session:1 = {client.get('session:1')}")
+        
         print("\n📊 Statistics:")
         print("-" * 15)
         
-        # Count the keys this example created (Ignix does not implement KEYS)
-        known_keys = ['counter', 'user:1:name', 'user:1:age',
-                      'fruit:1', 'fruit:2', 'fruit:3', 'greeting']
-        existing = client.exists(*known_keys)
-        print(f"✅ {existing} of {len(known_keys)} example keys exist")
+        # The keys this example created, found with SCAN
+        found = sorted(client.scan_iter(match='*:*'))
+        print(f"✅ SCAN MATCH *:* found {len(found)} keys: {found}")
+        print(f"✅ DBSIZE: {client.dbsize()}")
         
         print("\n✅ All operations completed successfully!")
         
+    except redis.AuthenticationError as e:
+        print(f"❌ Authentication Error: {e}")
+        print("The server runs with --requirepass: set IGNIX_PASSWORD to its password")
+        sys.exit(1)
     except redis.ConnectionError as e:
         print(f"❌ Connection Error: {e}")
         print("Make sure Ignix server is running: cargo run --release")

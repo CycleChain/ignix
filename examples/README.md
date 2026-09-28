@@ -39,7 +39,8 @@ node nodejs_client.js
    ```bash
    cargo run --release
    ```
-   The server will start on `localhost:7379`
+   The server will start on `localhost:7379`. If you start it with `--requirepass PASSWORD`,
+   run the Python and Node.js examples with `IGNIX_PASSWORD=PASSWORD` so they authenticate.
 
 2. **Install Client Dependencies** (for Python/Node.js examples, see above)
 
@@ -56,6 +57,9 @@ All examples demonstrate these Redis-compatible operations:
 - `RENAME oldkey newkey` - Rename a key
 - `MSET key1 value1 key2 value2` - Set multiple keys
 - `MGET key1 key2 key3` - Get multiple values
+
+The Python and Node.js examples also show expiries (`SET key value EX 60`, `TTL`, `PERSIST`,
+`SET key value PX 100`) and list their keys with `SCAN MATCH *:*` and `DBSIZE`.
 
 ## Example Output
 

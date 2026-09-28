@@ -2,7 +2,23 @@
 
 When using the Python and Node.js client examples, you might wonder: "How do I know I'm actually connecting to my Ignix server and not to some other Redis instance?"
 
-Here are **5 definitive ways** to verify your connection:
+Here are **6 definitive ways** to verify your connection:
+
+## 🔍 Method 0: Ask the Server
+
+Ignix reports itself as Redis 7.0 (`redis_version:7.0.0`, and `server` is `redis` in the `HELLO`
+reply) so that clients treat it like Redis, but its INFO has a field Redis does not:
+
+```bash
+redis-cli -p 7379 INFO server | grep ignix_version
+```
+
+**Expected output:**
+```
+ignix_version:0.3.2
+```
+
+If the server was started with `--requirepass PASSWORD`, add `-a PASSWORD`.
 
 ## 🔍 Method 1: Process Verification
 
@@ -21,7 +37,7 @@ If you see `target/release/ignix`, that's **your Ignix server**!
 
 ## 🔍 Method 2: Port Verification
 
-Check what's listening on port 7379:
+Check what's listening on port 7379 (or on the port given with `--port`):
 
 ```bash
 lsof -i :7379
@@ -49,7 +65,7 @@ tail ignix.aof
 -rw-r--r--  1 user  staff  714 Sep 22 18:06 ignix.aof
 ```
 
-The file contains the commands that changed data, in RESP format: SET, MSET, DEL, RENAME, INCR, INCRBY, DECR and DECRBY. Reads such as GET are not logged.
+The file contains the commands that changed data, in RESP format, the way Redis writes its AOF: SET (with an absolute `PXAT` time for an expiry, or `KEEPTTL`), MSET, DEL (also for keys that expired), RENAME, INCR, INCRBY (also for DECR and DECRBY), PEXPIREAT (for the EXPIRE family), PERSIST, FLUSHDB and FLUSHALL. Reads such as GET are not logged.
 
 ## 🔍 Method 4: Stop/Start Test
 
@@ -151,6 +167,10 @@ If you accidentally connect to a Redis server instead of Ignix, you'll see:
 - Ignix is not running
 - Start it: `cargo run --release`
 - Check for port conflicts
+
+**"NOAUTH Authentication required."**
+- The server runs with `--requirepass`: pass the password (`redis-cli -a PASSWORD`,
+  `redis://:PASSWORD@localhost:7379`, or `IGNIX_PASSWORD=PASSWORD` for the examples)
 
 ---
 
