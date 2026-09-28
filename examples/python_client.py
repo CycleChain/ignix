@@ -26,7 +26,6 @@ def main():
         client = redis.Redis(
             host='localhost',
             port=7379,
-            protocol=2,  # Ignix speaks RESP2; recent redis-py versions default to RESP3
             decode_responses=True,  # Automatically decode bytes to strings
             socket_connect_timeout=5,
             socket_timeout=5

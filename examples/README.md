@@ -103,9 +103,6 @@ cargo run --release
 ```
 **Solution**: The command is not implemented in Ignix yet. Check the [supported commands list](../README.md#-supported-commands).
 
-### Python: `unknown command 'HELLO'`
-Recent redis-py versions (8.x) default to the RESP3 protocol and send `HELLO 3` when connecting. Ignix speaks RESP2, so create the client with `protocol=2`, as `python_client.py` does.
-
 ### Python Issues
 If you get import errors:
 ```bash
@@ -126,7 +123,7 @@ Ignix implements the Redis Serialization Protocol (RESP), so any Redis client li
 ### Python (redis-py)
 ```python
 import redis
-client = redis.Redis(host='localhost', port=7379, protocol=2, decode_responses=True)
+client = redis.Redis(host='localhost', port=7379, decode_responses=True)
 client.set('key', 'value')
 print(client.get('key'))
 ```

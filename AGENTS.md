@@ -62,7 +62,8 @@ boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler 
 - `src/commands.rs`: statik komut tablosu (`CommandSpec { name, arity, kind }`, tek listeden
   `commands!` makrosuyla); `lookup` adı küçük harfe indirgenmiş bir `u128`'e paketleyip eşler.
   Yeni komut önce buraya eklenir.
-- `src/session.rs`: `Session`, bağlantı başına durum (şimdilik QUIT'in kapanış bayrağı).
+- `src/session.rs`: `Session`, bağlantı başına durum: istemci kimliği (bağlantı başına bir kez
+  genel sayaçtan), protokol (RESP2/RESP3), istemci adı, QUIT'in kapanış bayrağı.
 - `src/shard.rs`: `Shard { id, dict, aof }`, 64 bayta hizalı (`test_shard_alignment` sınar);
   komut semantiği `exec_session` içinde (`exec` yeni bir oturumla onu çağırır). Sunucuda tek
   bir `Arc<Shard>` paylaşılır.
@@ -81,8 +82,8 @@ boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler 
 - `src/bin/ignix.rs`: giriş noktası; mimalloc global ayırıcı, `--backend=uring` argümanı, AOF
   (`ignix.aof` açılamazsa AOF'suz sürer).
 
-Desteklenen komutlar: PING, ECHO, QUIT, SELECT (yalnızca 0), GET, SET, DEL, EXISTS, INCR,
-INCRBY, DECR, DECRBY, RENAME, MGET, MSET.
+Desteklenen komutlar: PING, ECHO, QUIT, SELECT (yalnızca 0), HELLO, GET, SET, DEL, EXISTS,
+INCR, INCRBY, DECR, DECRBY, RENAME, MGET, MSET.
 
 ## Dizin haritası
 
@@ -111,8 +112,8 @@ Bugünkü `main` için geçerlidir. Görevin konusu değilse düzeltmeye kalkma;
   yüzünden aynı makinedeki ikinci bir `ignix` hata vermeden aynı portu paylaşır; sunucu
   başlatmadan önce `lsof -nP -iTCP:7379 -sTCP:LISTEN` ile portun boş olduğunu doğrula.
   `benchmarks/run_*.sh` port doluysa başlamaz ve yalnızca kendi başlattığı süreçleri durdurur.
-- **Protokol kapsamı:** yalnızca RESP2 ve RESP dizisi biçimindeki istekler; satır içi (inline)
-  komutlar ve RESP3/`HELLO` yok. Geçersiz komut `-ERR ...` alır ve bağlantı sürer; bozuk RESP
+- **Protokol kapsamı:** RESP2 ve `HELLO 3` sonrası RESP3 (`Session::protocol`; null `_`, map
+  `%` olur); istekler yalnızca RESP dizisi biçiminde, satır içi (inline) komutlar yok. Geçersiz komut `-ERR ...` alır ve bağlantı sürer; bozuk RESP
   `-ERR Protocol error: ...` alır ve bağlantı kapanır (Redis gibi). Hata metinleri Redis 7 ile
   aynıdır; SET seçenekleri (EX, PX, NX, XX, GET...) açık bir hatayla reddedilir.
 - **AOF yalnızca yazılır:** açılışta geri yüklenmez. Kayıtlar ikili güvenlidir ve DEL de

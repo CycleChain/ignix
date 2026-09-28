@@ -7,7 +7,7 @@
 #![allow(dead_code)]
 
 use bytes::BytesMut;
-use ignix::{protocol, Shard};
+use ignix::{protocol, Session, Shard};
 
 /// Encode `args` as a RESP array of bulk strings, the way clients send commands.
 pub fn req(args: &[&[u8]]) -> Vec<u8> {
@@ -44,4 +44,19 @@ pub fn exec_resp(shard: &Shard, request: &[u8]) -> Vec<u8> {
 /// Build a request from `args` and execute it on `shard`.
 pub fn exec(shard: &Shard, args: &[&[u8]]) -> Vec<u8> {
     exec_resp(shard, &req(args))
+}
+
+/// Build a request from `args` and execute it on `shard` for the connection
+/// of `session`, so connection state such as the protocol carries over.
+pub fn exec_in(shard: &Shard, session: &mut Session, args: &[&[u8]]) -> Vec<u8> {
+    let request = req(args);
+    match protocol::parse_one(&request) {
+        Ok(Some((_, cmd))) => {
+            let mut out = BytesMut::new();
+            shard.exec_session(cmd, session, &mut out);
+            out.to_vec()
+        }
+        Ok(None) => panic!("incomplete request"),
+        Err(e) => format!("-{}\r\n", e.to_string().replace(['\r', '\n'], " ")).into_bytes(),
+    }
 }

@@ -40,7 +40,7 @@ fn unique_key(name: &str) -> String {
     )
 }
 
-/// Read one complete RESP reply of any type and return its raw bytes.
+/// Read one complete RESP2 or RESP3 reply and return its raw bytes.
 fn read_reply(reader: &mut impl BufRead) -> Vec<u8> {
     let mut line = Vec::new();
     reader.read_until(b'\n', &mut line).expect("read reply");
@@ -57,8 +57,10 @@ fn read_reply(reader: &mut impl BufRead) -> Vec<u8> {
             .unwrap()
     };
     match line[0] {
-        b'+' | b'-' | b':' => {}
-        b'$' => {
+        // Simple string, error, integer, RESP3 null, double, boolean, big number
+        b'+' | b'-' | b':' | b'_' | b',' | b'#' | b'(' => {}
+        // Bulk string, RESP3 verbatim string
+        b'$' | b'=' => {
             let len = number();
             if len >= 0 {
                 let mut body = vec![0; len as usize + 2];
@@ -66,8 +68,15 @@ fn read_reply(reader: &mut impl BufRead) -> Vec<u8> {
                 reply.extend_from_slice(&body);
             }
         }
-        b'*' => {
+        // Array, RESP3 set and push
+        b'*' | b'~' | b'>' => {
             for _ in 0..number().max(0) {
+                reply.extend(read_reply(reader));
+            }
+        }
+        // RESP3 map: keys and values
+        b'%' => {
+            for _ in 0..2 * number().max(0) {
                 reply.extend(read_reply(reader));
             }
         }
@@ -207,6 +216,26 @@ fn quit_closes_the_connection_and_drops_the_rest_of_the_pipeline() {
 
     let replies = roundtrip(&req(&[b"GET", key.as_bytes()]), 1);
     assert_eq!(replies[0], b"$-1\r\n");
+}
+
+#[test]
+#[ignore = "requires a running ignix server on 127.0.0.1:7379"]
+fn hello_3_switches_the_connection_to_resp3() {
+    let key = unique_key("resp3-missing");
+    let mut data = req(&[b"HELLO", b"3"]);
+    data.extend(req(&[b"GET", key.as_bytes()]));
+    data.extend(req(&[b"HELLO", b"2"]));
+    data.extend(req(&[b"GET", key.as_bytes()]));
+    let replies = roundtrip(&data, 4);
+    assert!(
+        replies[0].starts_with(b"%7\r\n$6\r\nserver\r\n$5\r\nredis\r\n"),
+        "{:?}",
+        String::from_utf8_lossy(&replies[0])
+    );
+    assert!(replies[0].ends_with(b"$7\r\nmodules\r\n*0\r\n"));
+    assert_eq!(replies[1], b"_\r\n");
+    assert!(replies[2].starts_with(b"*14\r\n"));
+    assert_eq!(replies[3], b"$-1\r\n");
 }
 
 #[test]

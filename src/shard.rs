@@ -12,7 +12,7 @@ use crate::aof::{
 };
 use crate::protocol::{
     fmt_i64, parse_canonical_i64, write_array_len, write_bulk, write_error, write_integer,
-    write_null, write_simple, Cmd, Value,
+    write_map_len, write_nil, write_simple, Cmd, Protocol, Value,
 };
 use crate::session::Session;
 use crate::storage::Dict;
@@ -36,17 +36,21 @@ fn encode_value(v: Bytes) -> Value {
 /// the lock is released, so a long copy never holds up writers.
 const COPY_UNDER_LOCK_MAX: usize = 16 * 1024;
 
+/// The Redis version whose commands and replies Ignix follows, reported by
+/// `HELLO`
+const REDIS_VERSION: &str = "7.0.0";
+
 /// Write a stored value, or null when the key is missing, as a GET reply.
 ///
 /// Integers are sent as bulk strings, as Redis does for GET.
-fn write_value(value: Option<&Value>, out: &mut BytesMut) {
+fn write_value(value: Option<&Value>, protocol: Protocol, out: &mut BytesMut) {
     match value {
         Some(Value::Str(v)) | Some(Value::Blob(v)) => write_bulk(v, out),
         Some(Value::Int(i)) => {
             let mut digits = [0u8; 20];
             write_bulk(fmt_i64(*i, &mut digits), out);
         }
-        None => write_null(out),
+        None => write_nil(protocol, out),
     }
 }
 
@@ -55,13 +59,13 @@ fn write_value(value: Option<&Value>, out: &mut BytesMut) {
 /// Small values are copied straight from the dictionary, which avoids the
 /// two atomic reference-count updates of cloning `Bytes` (contended when
 /// many connections read the same key).
-fn write_get(dict: &Dict, key: &[u8], out: &mut BytesMut) {
+fn write_get(dict: &Dict, key: &[u8], protocol: Protocol, out: &mut BytesMut) {
     let large = dict.read(key, |value| match value {
         Some(Value::Str(v)) | Some(Value::Blob(v)) if v.len() > COPY_UNDER_LOCK_MAX => {
             Some(v.clone())
         }
         small => {
-            write_value(small, out);
+            write_value(small, protocol, out);
             None
         }
     });
@@ -75,7 +79,7 @@ fn write_get(dict: &Dict, key: &[u8], out: &mut BytesMut) {
 ///
 /// Values are copied like in [`write_get`] up to the first large one; from
 /// there on they are cloned and written after the locks are released.
-fn write_mget(dict: &Dict, keys: &[Bytes], out: &mut BytesMut) {
+fn write_mget(dict: &Dict, keys: &[Bytes], protocol: Protocol, out: &mut BytesMut) {
     let mut later = Vec::new();
     dict.read_many(keys, |value| {
         let large = matches!(
@@ -85,12 +89,65 @@ fn write_mget(dict: &Dict, keys: &[Bytes], out: &mut BytesMut) {
         if large || !later.is_empty() {
             later.push(value.cloned());
         } else {
-            write_value(value, out);
+            write_value(value, protocol, out);
         }
     });
     for value in &later {
-        write_value(value.as_ref(), out);
+        write_value(value.as_ref(), protocol, out);
     }
+}
+
+/// Run HELLO's options in order, stopping at the first that fails (Redis
+/// applies each one as it goes), then switch to `protocol` and describe the
+/// server.
+fn hello(protocol: Option<Protocol>, options: &[Bytes], session: &mut Session, out: &mut BytesMut) {
+    let mut i = 0;
+    while i < options.len() {
+        let option = &options[i];
+        let more = options.len() - 1 - i;
+        if option.eq_ignore_ascii_case(b"AUTH") && more >= 2 {
+            // No password is set, so only the default user exists and it
+            // accepts any password (Redis `nopass`).
+            if options[i + 1] != b"default"[..] {
+                write_error(
+                    "WRONGPASS invalid username-password pair or user is disabled.",
+                    out,
+                );
+                return;
+            }
+            i += 3;
+        } else if option.eq_ignore_ascii_case(b"SETNAME") && more >= 1 {
+            if let Err(error) = session.set_name(options[i + 1].clone()) {
+                write_error(error, out);
+                return;
+            }
+            i += 2;
+        } else {
+            let option = String::from_utf8_lossy(option);
+            write_error(&format!("ERR Syntax error in HELLO option '{option}'"), out);
+            return;
+        }
+    }
+    if let Some(protocol) = protocol {
+        session.set_protocol(protocol);
+    }
+
+    let protocol = session.protocol();
+    write_map_len(protocol, 7, out);
+    for (field, value) in [("server", "redis"), ("version", REDIS_VERSION)] {
+        write_bulk(field.as_bytes(), out);
+        write_bulk(value.as_bytes(), out);
+    }
+    write_bulk(b"proto", out);
+    write_integer(if protocol == Protocol::Resp3 { 3 } else { 2 }, out);
+    write_bulk(b"id", out);
+    write_integer(session.id() as i64, out);
+    for (field, value) in [("mode", "standalone"), ("role", "master")] {
+        write_bulk(field.as_bytes(), out);
+        write_bulk(value.as_bytes(), out);
+    }
+    write_bulk(b"modules", out);
+    write_array_len(0, out);
 }
 
 /// A shard represents a single execution unit
@@ -149,7 +206,7 @@ impl Shard {
             Cmd::Ping(Some(message)) => write_bulk(&message, out),
 
             // GET key - retrieve value for key
-            Cmd::Get(k) => write_get(&self.dict, &k, out),
+            Cmd::Get(k) => write_get(&self.dict, &k, session.protocol(), out),
 
             // SET key value - store key-value pair
             Cmd::Set(k, v) => {
@@ -234,7 +291,7 @@ impl Shard {
             // MGET key1 key2 ... - get multiple keys
             Cmd::MGet(keys) => {
                 write_array_len(keys.len(), out);
-                write_mget(&self.dict, &keys, out);
+                write_mget(&self.dict, &keys, session.protocol(), out);
             }
 
             // MSET key1 value1 key2 value2 ... - set multiple key-value pairs
@@ -262,6 +319,9 @@ impl Shard {
             // SELECT index - there is a single database, number 0
             Cmd::Select(0) => write_simple("OK", out),
             Cmd::Select(_) => write_error("ERR DB index is out of range", out),
+
+            // HELLO [protover [AUTH username password] [SETNAME clientname]]
+            Cmd::Hello { protocol, options } => hello(protocol, &options, session, out),
         }
     }
 }

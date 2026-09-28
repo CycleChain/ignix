@@ -5,8 +5,8 @@
 
 mod common;
 
-use common::exec;
-use ignix::Shard;
+use common::{exec, exec_in};
+use ignix::{Protocol, Session, Shard};
 
 fn shard() -> Shard {
     Shard::new(0, None)
@@ -74,6 +74,153 @@ fn quit_replies_ok_and_takes_any_arguments() {
     let s = shard();
     assert_eq!(exec(&s, &[b"QUIT"]), b"+OK\r\n");
     assert_eq!(exec(&s, &[b"QUIT", b"now"]), b"+OK\r\n");
+}
+
+/// The HELLO reply Redis 7 sends, with Ignix's version and client `id`
+fn hello_reply(protocol: u8, id: u64) -> Vec<u8> {
+    let header = if protocol == 3 { "%7" } else { "*14" };
+    format!(
+        "{header}\r\n$6\r\nserver\r\n$5\r\nredis\r\n$7\r\nversion\r\n$5\r\n7.0.0\r\n\
+         $5\r\nproto\r\n:{protocol}\r\n$2\r\nid\r\n:{id}\r\n$4\r\nmode\r\n$10\r\nstandalone\r\n\
+         $4\r\nrole\r\n$6\r\nmaster\r\n$7\r\nmodules\r\n*0\r\n"
+    )
+    .into_bytes()
+}
+
+#[test]
+fn hello_describes_the_server_in_the_chosen_protocol() {
+    let s = shard();
+    let mut session = Session::new();
+    let id = session.id();
+    assert_eq!(exec_in(&s, &mut session, &[b"HELLO"]), hello_reply(2, id));
+    assert_eq!(
+        exec_in(&s, &mut session, &[b"HELLO", b"3"]),
+        hello_reply(3, id)
+    );
+    assert_eq!(session.protocol(), Protocol::Resp3);
+    // Without a version HELLO keeps the protocol
+    assert_eq!(exec_in(&s, &mut session, &[b"HELLO"]), hello_reply(3, id));
+    assert_eq!(
+        exec_in(&s, &mut session, &[b"HELLO", b"2"]),
+        hello_reply(2, id)
+    );
+    assert_eq!(session.protocol(), Protocol::Resp2);
+}
+
+#[test]
+fn resp3_sends_null_as_an_underscore() {
+    let s = shard();
+    let mut session = Session::new();
+    exec_in(&s, &mut session, &[b"SET", b"k", b"v"]);
+    exec_in(&s, &mut session, &[b"HELLO", b"3"]);
+    assert_eq!(exec_in(&s, &mut session, &[b"GET", b"missing"]), b"_\r\n");
+    assert_eq!(
+        exec_in(&s, &mut session, &[b"MGET", b"k", b"missing"]),
+        b"*2\r\n$1\r\nv\r\n_\r\n"
+    );
+    exec_in(&s, &mut session, &[b"HELLO", b"2"]);
+    assert_eq!(exec_in(&s, &mut session, &[b"GET", b"missing"]), b"$-1\r\n");
+}
+
+#[test]
+fn hello_rejects_unknown_versions_and_options_like_redis() {
+    let s = shard();
+    let noproto = b"-NOPROTO unsupported protocol version\r\n";
+    assert_eq!(exec(&s, &[b"HELLO", b"4"]), noproto);
+    assert_eq!(exec(&s, &[b"HELLO", b"1"]), noproto);
+    assert_eq!(exec(&s, &[b"HELLO", b"-1"]), noproto);
+    let not_an_integer = b"-ERR Protocol version is not an integer or out of range\r\n";
+    assert_eq!(exec(&s, &[b"HELLO", b"abc"]), not_an_integer);
+    assert_eq!(exec(&s, &[b"HELLO", b"03"]), not_an_integer);
+    assert_eq!(exec(&s, &[b"HELLO", b"SETNAME", b"x"]), not_an_integer);
+    assert_eq!(
+        exec(&s, &[b"HELLO", b"3", b"FOO"]),
+        b"-ERR Syntax error in HELLO option 'FOO'\r\n"
+    );
+    // AUTH needs two arguments and SETNAME one
+    assert_eq!(
+        exec(&s, &[b"HELLO", b"3", b"AUTH", b"default"]),
+        b"-ERR Syntax error in HELLO option 'AUTH'\r\n"
+    );
+    assert_eq!(
+        exec(&s, &[b"HELLO", b"3", b"SETNAME"]),
+        b"-ERR Syntax error in HELLO option 'SETNAME'\r\n"
+    );
+    assert_eq!(
+        exec(&s, &[b"HELLO", b"3", b"SETNAME", b"a b"]),
+        b"-ERR Client names cannot contain spaces, newlines or special characters.\r\n"
+    );
+}
+
+#[test]
+fn hello_auth_accepts_only_the_default_user_without_a_password() {
+    let s = shard();
+    let mut session = Session::new();
+    let id = session.id();
+    assert_eq!(
+        exec_in(
+            &s,
+            &mut session,
+            &[b"HELLO", b"3", b"AUTH", b"default", b"any"]
+        ),
+        hello_reply(3, id)
+    );
+    let wrongpass = b"-WRONGPASS invalid username-password pair or user is disabled.\r\n";
+    assert_eq!(
+        exec(&s, &[b"HELLO", b"3", b"AUTH", b"DEFAULT", b"x"]),
+        wrongpass
+    );
+    assert_eq!(
+        exec(&s, &[b"HELLO", b"3", b"AUTH", b"other", b"x"]),
+        wrongpass
+    );
+}
+
+#[test]
+fn hello_applies_options_in_order_until_one_fails() {
+    let s = shard();
+    let mut session = Session::new();
+    let id = session.id();
+    // The last SETNAME wins
+    let reply = exec_in(
+        &s,
+        &mut session,
+        &[b"HELLO", b"3", b"setname", b"n1", b"SETNAME", b"n2"],
+    );
+    assert_eq!(reply, hello_reply(3, id));
+    assert_eq!(session.name().map(|n| &n[..]), Some(&b"n2"[..]));
+    // A failing option stops HELLO, but the options before it stay applied
+    // and the protocol does not change
+    let mut session = Session::new();
+    let reply = exec_in(
+        &s,
+        &mut session,
+        &[b"HELLO", b"3", b"SETNAME", b"good", b"FOO"],
+    );
+    assert_eq!(reply, b"-ERR Syntax error in HELLO option 'FOO'\r\n");
+    assert_eq!(session.name().map(|n| &n[..]), Some(&b"good"[..]));
+    assert_eq!(session.protocol(), Protocol::Resp2);
+    // AUTH is checked where it appears, before a later SETNAME
+    let reply = exec_in(
+        &s,
+        &mut session,
+        &[
+            b"HELLO",
+            b"3",
+            b"AUTH",
+            b"other",
+            b"pw",
+            b"SETNAME",
+            b"bad name",
+        ],
+    );
+    assert_eq!(
+        reply,
+        b"-WRONGPASS invalid username-password pair or user is disabled.\r\n"
+    );
+    // An empty name removes the name
+    exec_in(&s, &mut session, &[b"HELLO", b"2", b"SETNAME", b""]);
+    assert_eq!(session.name(), None);
 }
 
 #[test]

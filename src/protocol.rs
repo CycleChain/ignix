@@ -22,6 +22,17 @@ const MIN_ELEMENT_LEN: usize = 6;
 const INVALID_MULTIBULK: &str = "ERR Protocol error: invalid multibulk length";
 const INVALID_BULK: &str = "ERR Protocol error: invalid bulk length";
 
+/// The RESP version a connection speaks, chosen with `HELLO`
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Protocol {
+    /// RESP2, which every connection starts with
+    #[default]
+    Resp2,
+    /// RESP3
+    Resp3,
+}
+
 /// Redis-compatible commands supported by Ignix
 ///
 /// Each variant represents a specific Redis command with its parameters.
@@ -58,6 +69,17 @@ pub enum Cmd {
     Quit,
     /// SELECT index - switch to database `index`; only database 0 exists
     Select(i32),
+    /// HELLO \[protover \[AUTH username password\] \[SETNAME clientname\]\] -
+    /// switch the connection to `protocol` if given, and describe the server
+    #[non_exhaustive]
+    Hello {
+        /// The protocol to switch to
+        protocol: Option<Protocol>,
+        /// The options after `protover`. Like Redis, they are applied in
+        /// order when the command runs, so an option takes effect even if a
+        /// later one fails.
+        options: Vec<Bytes>,
+    },
 }
 
 /// Value types that can be stored in Ignix
@@ -351,6 +373,26 @@ fn command_from_frame(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String>
             Cmd::Echo(message)
         }
         Kind::Quit => Cmd::Quit,
+        Kind::Hello => {
+            let mut args = items.into_iter();
+            let protocol = match args.next() {
+                None => None,
+                Some(version) => match parse_canonical_i64(&version) {
+                    Some(2) => Some(Protocol::Resp2),
+                    Some(3) => Some(Protocol::Resp3),
+                    Some(_) => return Err("NOPROTO unsupported protocol version".to_string()),
+                    None => {
+                        return Err(
+                            "ERR Protocol version is not an integer or out of range".to_string()
+                        )
+                    }
+                },
+            };
+            Cmd::Hello {
+                protocol,
+                options: args.collect(),
+            }
+        }
         Kind::Select => {
             let [index] = <[Bytes; 1]>::try_from(items).map_err(|_| arity_error())?;
             let index = parse_canonical_i64(&index)
@@ -594,6 +636,15 @@ pub fn write_null(out: &mut BytesMut) {
     out.extend_from_slice(b"$-1\r\n");
 }
 
+/// Write the null reply of `protocol`, as for a missing key: `$-1\r\n` in
+/// RESP2 (see [`write_null`]) and `_\r\n` in RESP3
+pub fn write_nil(protocol: Protocol, out: &mut BytesMut) {
+    match protocol {
+        Protocol::Resp2 => write_null(out),
+        Protocol::Resp3 => out.extend_from_slice(b"_\r\n"),
+    }
+}
+
 /// Write an integer response (`:<number>\r\n`) directly to buffer
 pub fn write_integer(i: i64, out: &mut BytesMut) {
     let mut digits = [0u8; 20];
@@ -630,12 +681,27 @@ pub(crate) fn fmt_i64(n: i64, buf: &mut [u8; 20]) -> &[u8] {
     }
 }
 
-/// Write array length header (`*<count>\r\n`) directly to buffer
-pub fn write_array_len(n: usize, out: &mut BytesMut) {
+/// Write an aggregate header such as `*<count>\r\n`
+fn write_header(kind: u8, n: usize, out: &mut BytesMut) {
     let mut digits = [0u8; 20];
     let digits = fmt_u64(n as u64, &mut digits);
     out.reserve(1 + digits.len() + 2);
-    out.put_u8(b'*');
+    out.put_u8(kind);
     out.put_slice(digits);
     out.put_slice(b"\r\n");
+}
+
+/// Write array length header (`*<count>\r\n`) directly to buffer
+pub fn write_array_len(n: usize, out: &mut BytesMut) {
+    write_header(b'*', n, out);
+}
+
+/// Write the header of a map with `n` entries, each written after it as a
+/// key and a value: `%<n>\r\n` in RESP3, and in RESP2, which has no maps,
+/// the header of an array of `2n` elements (as Redis does)
+pub fn write_map_len(protocol: Protocol, n: usize, out: &mut BytesMut) {
+    match protocol {
+        Protocol::Resp2 => write_header(b'*', 2 * n, out),
+        Protocol::Resp3 => write_header(b'%', n, out),
+    }
 }

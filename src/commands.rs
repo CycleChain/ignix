@@ -24,6 +24,7 @@ pub(crate) enum Kind {
     Echo,
     Quit,
     Select,
+    Hello,
 }
 
 /// The static description of a command
@@ -118,6 +119,7 @@ commands! {
     ECHO = "echo", 2, Echo;
     QUIT = "quit", -1, Quit;
     SELECT = "select", 2, Select;
+    HELLO = "hello", -1, Hello;
 }
 
 #[cfg(test)]

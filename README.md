@@ -10,7 +10,7 @@ Ignix (from "Ignite" + "Index") is a Redis-protocol compatible, in-memory key-va
 ## ✨ Features
 
 - 🚀 **Multi-core**: one event loop per CPU core, sharing the listening port with `SO_REUSEPORT`
-- 🔌 **Redis protocol (RESP2)**: works with `redis-cli` and Redis client libraries (redis-py, node-redis, ...) for the supported commands
+- 🔌 **Redis protocol (RESP2 and RESP3)**: works with `redis-cli` and Redis client libraries (redis-py, node-redis, ...) for the supported commands
 - 🧵 **Async I/O**: `mio` (epoll/kqueue) by default, optional `io_uring` backend on Linux
 - ⚡ **Busy-polling**: a worker keeps polling for 50 µs after its last event before it sleeps, so requests rarely wait for a thread to wake up (`--busy-poll-us`)
 - 💾 **AOF**: every write is appended to `ignix.aof` by a background thread and synced at most once per second
@@ -75,6 +75,7 @@ world
 | `ECHO message` | Reply with the message | `ECHO hi` → `$2\r\nhi` |
 | `SELECT index` | Select a database; only database 0 exists | `SELECT 0` → `+OK` |
 | `QUIT` | Reply, then close the connection; requests sent after it are dropped | `QUIT` → `+OK` |
+| `HELLO [protover [AUTH username password] [SETNAME clientname]]` | Switch to RESP2 or RESP3 and describe the server | `HELLO 3` → `%7\r\n$6\r\nserver...` |
 | `SET key value` | Set a value | `SET key value` → `+OK` |
 | `GET key` | Get a value | `GET key` → `$5\r\nvalue` |
 | `DEL key [key ...]` | Delete keys, reply with the number removed | `DEL a b` → `:2` |
@@ -144,13 +145,13 @@ OK
 
 ### Using Any Redis Client Library
 
-Ignix speaks RESP2. Clients that default to RESP3, such as redis-py 8, must be created with RESP2:
+Ignix speaks RESP2 and, after `HELLO 3`, RESP3, so clients work with their default settings:
 
 ```python
 import redis
 
 # Connect to Ignix
-r = redis.Redis(host='localhost', port=7379, protocol=2, decode_responses=True)
+r = redis.Redis(host='localhost', port=7379, decode_responses=True)
 
 # Use like Redis
 r.set('hello', 'world')
@@ -299,7 +300,7 @@ Monitor AOF: `tail -f ignix.aof`
 
 - Limited command set compared with Redis (no `KEYS`, `INFO`, `CLIENT`, `CONFIG`, ...).
 - A single database: `SELECT` accepts only index 0.
-- RESP2 only: no RESP3 or `HELLO`, and no inline commands (plain text lines such as `PING` typed into telnet).
+- No inline commands (plain text lines such as `PING` typed into telnet); requests must be RESP arrays.
 - No key expiry: `SET` options and `EXPIRE` are not implemented.
 - The AOF is write-only: it is not loaded on startup, so data does not survive a restart, and it is never compacted, so it grows with every write. In one of our benchmark sessions `ignix.aof` grew to 13.8 GB while Redis, which rewrites its AOF, used 2.3 GB.
 - No authentication, and the server listens on the fixed address `0.0.0.0:7379`; do not expose it to untrusted networks.
