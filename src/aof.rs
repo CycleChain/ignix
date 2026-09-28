@@ -13,6 +13,15 @@ use std::io::Write;
 use std::result::Result::{Err, Ok};
 use std::time::{Duration, Instant};
 
+/// How often written records are synced to disk
+const SYNC_INTERVAL: Duration = Duration::from_secs(1);
+
+/// How long the writer may block waiting for the next record: until the next
+/// sync is due while written records are unsynced, otherwise indefinitely.
+fn receive_timeout(unsynced: bool, since_sync: Duration) -> Option<Duration> {
+    unsynced.then(|| SYNC_INTERVAL.saturating_sub(since_sync))
+}
+
 /// Handle for writing to the AOF (Append-Only File)
 ///
 /// This handle allows async writing to the AOF file through a background
@@ -38,8 +47,9 @@ pub struct AofHandle {
 ///
 /// # Behavior
 /// * Each record is written to the file as soon as it is received
-/// * Written data is synced to disk at most one second later, also when no
-///   more writes arrive
+/// * Written data is synced to disk about one second after the previous sync
+///   at the latest, so no record stays unsynced for more than a second, also
+///   when no more writes arrive
 /// * Thread continues until every handle is dropped, then syncs and exits
 pub fn spawn_aof_writer(path: &str) -> Result<AofHandle> {
     // Open the file here, so a path that cannot be used is reported to the
@@ -58,13 +68,19 @@ pub fn spawn_aof_writer(path: &str) -> Result<AofHandle> {
     std::thread::Builder::new()
         .name("aof-writer".into())
         .spawn(move || {
-            let sync_interval = Duration::from_millis(1000);
             let mut last_sync = Instant::now();
             let mut unsynced = false;
             let mut write_failing = false;
 
             loop {
-                match rx.recv_timeout(sync_interval) {
+                // Wake up when the next sync is due, not a full interval after
+                // the last record: that left records unsynced for up to two
+                // intervals.
+                let received = match receive_timeout(unsynced, last_sync.elapsed()) {
+                    Some(timeout) => rx.recv_timeout(timeout),
+                    None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+                };
+                match received {
                     Ok(buf) => match file.write_all(&buf) {
                         Ok(()) => {
                             unsynced = true;
@@ -87,7 +103,7 @@ pub fn spawn_aof_writer(path: &str) -> Result<AofHandle> {
                     }
                 }
 
-                if unsynced && last_sync.elapsed() >= sync_interval {
+                if unsynced && last_sync.elapsed() >= SYNC_INTERVAL {
                     if let Err(e) = file.sync_data() {
                         log::error!("AOF sync failed: {e}");
                     }
@@ -218,4 +234,26 @@ pub fn emit_aof_mset(pairs: &[(Bytes, Bytes)]) -> Vec<u8> {
 /// * `keys` - Keys that were removed
 pub fn emit_aof_del(keys: &[Bytes]) -> Vec<u8> {
     encode(b"DEL", keys.iter().map(|k| &k[..]))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn writer_wakes_up_when_the_next_sync_is_due() {
+        // Nothing to sync: wait for the next record however long it takes
+        assert_eq!(receive_timeout(false, Duration::from_millis(300)), None);
+        // Unsynced data: wake up one interval after the previous sync
+        assert_eq!(receive_timeout(true, Duration::ZERO), Some(SYNC_INTERVAL));
+        assert_eq!(
+            receive_timeout(true, Duration::from_millis(300)),
+            Some(Duration::from_millis(700))
+        );
+        // Overdue: do not wait at all
+        assert_eq!(
+            receive_timeout(true, Duration::from_secs(5)),
+            Some(Duration::ZERO)
+        );
+    }
 }
