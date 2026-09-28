@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-09-28
+
 ### Security
 - **Remote crash on malformed requests**: a negative or oversized bulk length (e.g. `*1\r\n$-5\r\n`) made the parser overflow, and a huge element count (`*9223372036854775807\r\n`) made it try to allocate that many elements. Because the release profile uses `panic = "abort"`, a single packet from any client terminated the whole server. Lengths are now parsed with checked arithmetic, bulk strings are limited to 512 MiB and element counts to `INT_MAX` (as in Redis), and malformed input is answered with `ERR Protocol error: ...`.
 
@@ -46,6 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Logging**: diagnostics (accept errors, stopped workers, backend fallback) go through the `log` crate, so `RUST_LOG` now controls them; the default level is `info`. Previously nothing was logged and `RUST_LOG` had no effect.
 - **Performance numbers re-measured**: the README tables for v0.3.1 could not be reproduced (their scripts did not check replies or count errors) and were replaced with measurements from `redis-benchmark` (one client thread, pipelined, and a server-bound setup with two client threads; with and without busy-polling) and the corrected Python suite against Redis 7.0.15 with AOF enabled, including the runs where Ignix is slower. README, `examples/README.md` and `HOW_TO_VERIFY_CONNECTION.md` now describe the actual commands, errors and limitations (such as the AOF not being loaded on startup).
 - **Stricter request framing**: length lines are parsed like Redis `string2ll` (no leading zeros, `+`, spaces or lines longer than 20 characters). Unlike Redis, a bulk payload must be followed by CRLF instead of skipping two bytes blindly, which stops a miscounted length from desynchronising the stream. Empty requests (`*0\r\n`, `*-1\r\n`) are ignored like in Redis instead of being an error.
+- **Smaller crate package**: the crates.io package no longer includes the agent configuration (`.agents/`, `.claude/`, `.hub/`, `AGENTS.md`, `CLAUDE.md`) or a stray `flamegraph.svg`.
 
 ### Performance
 - **Requests are parsed without copying the command name**: the parser leaves the name in the read buffer and copies only the arguments, finds the command with a perfect hash of its name built at compile time (reading the name with a few loads instead of byte by byte) instead of a chain of comparisons, and no longer moves each parsed command through an intermediate enum. Commands without arguments, such as `PING`, now parse without allocating. This removes the slowdown that the larger command table and the split of invalid requests for `AUTH` had brought. Criterion medians of five alternating runs, previous commit → this one (commit before the sharded keyspace in brackets): `resp/parse_many_1k` 109.9 → 103.5 µs (104.2), `resp/parse_many_mixed` 114.6 → 91.8 µs (98.6), `resp/parse_large_bulk` unchanged; callgrind counts 19% fewer instructions for parsing `SET` requests.
@@ -82,6 +85,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Call `dict.incr(Bytes::copy_from_slice(key))` (or pass an owned `Bytes`) and handle the `IncrError` result.
 - Build `Cmd::Ping(None)`, `Cmd::Del(vec![key])` and `Cmd::Exists(vec![key])` where the old unit/single-key variants were used, and add a wildcard arm to exhaustive matches on `Cmd` and `Value`.
 - Errors from `parse_one` and `parse_many` are now complete Redis error lines that already start with `ERR`; send them with `write_error(&e.to_string(), out)` instead of adding an `ERR` prefix and writing a status reply.
+- Start the server only with the options it knows: unknown options (they used to be ignored) and invalid values now print the usage to stderr and exit with code 2. `ignix --help` lists the options; `--backend=uring` keeps working.
 
 ## [0.3.2] - 2025-12-04
 

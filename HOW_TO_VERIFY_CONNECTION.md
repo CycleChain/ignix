@@ -15,7 +15,7 @@ redis-cli -p 7379 INFO server | grep ignix_version
 
 **Expected output:**
 ```
-ignix_version:0.3.2
+ignix_version:0.4.0
 ```
 
 If the server was started with `--requirepass PASSWORD`, add `-a PASSWORD`.

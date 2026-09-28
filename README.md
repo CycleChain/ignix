@@ -201,7 +201,7 @@ See [examples/](examples/) for complete Rust, Python and Node.js clients.
 
 ## 📊 Performance
 
-Measured on the unreleased code on a shared cloud VM: 4 vCPUs (Intel Xeon @ 2.10 GHz, one thread per core), 15 GB RAM, Linux 6.18, with servers and clients on the same machine. Redis 7.0.15 ran with `--appendonly yes --appendfsync everysec --save ""`, so both servers append every write to a file and sync it about once per second. Ignix used its defaults: one worker thread per core and a 50 µs busy-poll window; the "no busy-poll" column is `--busy-poll-us=0`. Redis executes commands on one thread. The servers ran one after another in two rounds (in alternating order, with a 3 s pause between each SET and GET run); cells show `round 1 / round 2`.
+Measured on Ignix v0.4.0 on a shared cloud VM: 4 vCPUs (Intel Xeon @ 2.10 GHz, one thread per core), 15 GB RAM, Linux 6.18, with servers and clients on the same machine. Redis 7.0.15 ran with `--appendonly yes --appendfsync everysec --save ""`, so both servers append every write to a file and sync it about once per second. Ignix used its defaults: one worker thread per core and a 50 µs busy-poll window; the "no busy-poll" column is `--busy-poll-us=0`. Redis executes commands on one thread. The servers ran one after another in two rounds (in alternating order, with a 3 s pause between each SET and GET run); cells show `round 1 / round 2`.
 
 ### redis-benchmark, one client thread
 

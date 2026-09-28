@@ -8,7 +8,7 @@ için tek kaynaktır. Claude Code bunu `CLAUDE.md` üzerinden okur. Ayrıntılı
 
 Ignix, Rust ile yazılmış, Redis protokolü (RESP) uyumlu, bellek içi bir anahtar-değer
 sunucusudur. `ignix` crate'i aynı pakette bir kütüphane (`src/lib.rs`) ve sunucu ikilisi
-(`src/bin/ignix.rs`) içerir; sürüm `Cargo.toml`'dadır (0.3.2), lisans MIT, crates.io'da
+(`src/bin/ignix.rs`) içerir; sürüm `Cargo.toml`'dadır (0.4.0), lisans MIT, crates.io'da
 yayımlanır. Veritabanı, dış servis ya da gizli yapılandırma yoktur; tek ortam değişkeni
 `RUST_LOG`'dur.
 
