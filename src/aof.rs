@@ -58,8 +58,9 @@ pub struct AofHandle {
 ///
 /// # Behavior
 /// * Records are appended in the order they were sent. The writer collects
-///   every queued record into one write, then pauses for 200 µs so that the
-///   next write covers the records sent meanwhile
+///   the queued records into as few writes as possible and, once the queue
+///   is empty, pauses for 200 µs so that the next write covers the records
+///   sent meanwhile
 /// * Written data is synced to disk about one second after the previous sync
 ///   at the latest, so no record stays unsynced for more than a second, also
 ///   when no more writes arrive
@@ -189,30 +190,8 @@ fn run_writer<W: AofSink>(mut aof: AofFile<W>, rx: Receiver<Vec<u8>>) {
             Some(timeout) => rx.recv_timeout(timeout),
             None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
         };
-        let wrote = match received {
-            Ok(record) => {
-                // Take the records queued behind it too, so one write covers
-                // them all.
-                let mut next = Some(record);
-                while let Some(record) = next {
-                    if record.len() >= MAX_BATCH {
-                        // Keep the order without copying the large record
-                        aof.write(&batch);
-                        batch.clear();
-                        aof.write(&record);
-                    } else {
-                        batch.extend_from_slice(&record);
-                    }
-                    next = if batch.len() < MAX_BATCH {
-                        rx.try_recv().ok()
-                    } else {
-                        None
-                    };
-                }
-                aof.write(&batch);
-                batch.clear();
-                true
-            }
+        let drained = match received {
+            Ok(record) => write_queued(&mut aof, &mut batch, record, &rx),
             Err(RecvTimeoutError::Timeout) => false,
             // Every handle is gone and every record has been received: sync
             // what was written and exit
@@ -227,10 +206,48 @@ fn run_writer<W: AofSink>(mut aof: AofFile<W>, rx: Receiver<Vec<u8>>) {
         if aof.unsynced && aof.last_sync.elapsed() >= SYNC_INTERVAL {
             aof.sync();
         }
-        if wrote {
+        // Pause only after everything queued has been written: when the
+        // batch limit cut a write short, keep draining at full speed.
+        if drained {
             std::thread::sleep(GROUP_COMMIT_DELAY);
         }
     }
+}
+
+/// Write `first` and the records queued behind it, collected into as few
+/// writes as possible (up to `MAX_BATCH` bytes each; a larger record is
+/// written on its own, in order).
+///
+/// Returns whether the queue was drained, i.e. false when the batch limit
+/// stopped the collection with records still queued.
+fn write_queued<W: AofSink>(
+    aof: &mut AofFile<W>,
+    batch: &mut Vec<u8>,
+    first: Vec<u8>,
+    rx: &Receiver<Vec<u8>>,
+) -> bool {
+    let mut next = Some(first);
+    let mut drained = false;
+    while let Some(record) = next {
+        if record.len() >= MAX_BATCH {
+            // Keep the order without copying the large record
+            aof.write(batch);
+            batch.clear();
+            aof.write(&record);
+        } else {
+            batch.extend_from_slice(&record);
+        }
+        next = if batch.len() < MAX_BATCH {
+            let queued = rx.try_recv().ok();
+            drained = queued.is_none();
+            queued
+        } else {
+            None
+        };
+    }
+    aof.write(batch);
+    batch.clear();
+    drained
 }
 
 impl AofHandle {
@@ -439,6 +456,27 @@ mod tests {
         aof.file.fail_truncate = false;
         aof.write(b"fourth");
         assert_eq!(aof.file.data, b"firstfourth");
+    }
+
+    #[test]
+    fn writer_keeps_draining_while_the_batch_limit_leaves_records_queued() {
+        let (tx, rx) = bounded::<Vec<u8>>(16);
+        let mut aof = AofFile::new(FakeSink::default(), 0);
+        let mut batch = Vec::new();
+
+        // Three records of 600 KiB: the second one fills the 1 MiB batch
+        for _ in 0..3 {
+            tx.send(vec![b'x'; 600 << 10]).unwrap();
+        }
+        let first = rx.recv().unwrap();
+        assert!(!write_queued(&mut aof, &mut batch, first, &rx));
+        assert_eq!(aof.file.data.len(), 1200 << 10);
+        assert_eq!(rx.len(), 1, "the record after the limit is still queued");
+
+        // The last one drains the queue
+        let first = rx.recv().unwrap();
+        assert!(write_queued(&mut aof, &mut batch, first, &rx));
+        assert_eq!(aof.file.data.len(), 1800 << 10);
     }
 
     #[test]
