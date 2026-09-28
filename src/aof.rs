@@ -333,6 +333,26 @@ pub fn emit_aof_set(k: &[u8], v: &[u8]) -> Vec<u8> {
     encode(b"SET", [k, v].into_iter())
 }
 
+/// Generate AOF entry for SET with an expiry, which SET EX, PX, EXAT and
+/// PXAT, SETEX and PSETEX are logged as (`SET key value PXAT at`)
+///
+/// # Arguments
+/// * `k` - Key bytes
+/// * `v` - Value bytes
+/// * `at` - Expiry as a unix time in milliseconds
+pub fn emit_aof_set_pxat(k: &[u8], v: &[u8], at: i64) -> Vec<u8> {
+    let mut digits = [0u8; 20];
+    encode(
+        b"SET",
+        [k, v, b"PXAT", fmt_i64(at, &mut digits)].into_iter(),
+    )
+}
+
+/// Generate AOF entry for SET KEEPTTL (`SET key value KEEPTTL`)
+pub fn emit_aof_set_keepttl(k: &[u8], v: &[u8]) -> Vec<u8> {
+    encode(b"SET", [k, v, b"KEEPTTL"].into_iter())
+}
+
 /// Generate AOF entry for RENAME command
 ///
 /// # Arguments

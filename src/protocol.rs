@@ -42,6 +42,57 @@ pub enum FlushMode {
     Async,
 }
 
+/// Whether SET only sets a key that is missing (NX) or one that exists (XX)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetCondition {
+    /// `NX`: only if the key does not exist
+    Nx,
+    /// `XX`: only if the key exists
+    Xx,
+}
+
+/// What SET does with the key's expiry
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SetExpiry {
+    /// Remove it, the default
+    #[default]
+    Clear,
+    /// Keep it (`KEEPTTL`)
+    Keep,
+    /// Set it to this unix time in milliseconds (`EX`, `PX`, `EXAT` or
+    /// `PXAT`, converted when parsing); a time that has passed makes the new
+    /// value expire at once
+    At(i64),
+}
+
+/// Options of SET
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SetOptions {
+    /// `NX` or `XX`
+    pub condition: Option<SetCondition>,
+    /// `GET`: reply with the old value instead of OK
+    pub get: bool,
+    /// What happens to the key's expiry
+    pub expiry: SetExpiry,
+}
+
+/// The option of GETEX. The times are kept as given: like Redis, they are
+/// only checked when the key exists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum GetExOption {
+    /// `EX seconds`
+    Ex(Bytes),
+    /// `PX milliseconds`
+    Px(Bytes),
+    /// `EXAT unix-time-seconds`
+    ExAt(Bytes),
+    /// `PXAT unix-time-milliseconds`
+    PxAt(Bytes),
+    /// `PERSIST`: remove the expiry
+    Persist,
+}
+
 /// Conditions of EXPIRE and its variants; with none set the expiry is
 /// always set
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -74,6 +125,9 @@ pub enum ClientInfo {
 /// wildcard arm.
 #[derive(Debug, Clone, PartialEq)]
 #[non_exhaustive]
+// A tag byte of its own: without it the compiler hides the tag in spare
+// values of a field (`SetExpiry`), and every match on a command decodes it
+#[repr(u8)]
 pub enum Cmd {
     /// PING \[message\] - test connectivity; echoes `message` when given
     Ping(Option<Bytes>),
@@ -179,6 +233,21 @@ pub enum Cmd {
     PExpireTime(Bytes),
     /// PERSIST key - remove the key's expiry
     Persist(Bytes),
+    /// SET key value with options; also SETEX and PSETEX, which set an
+    /// expiry
+    SetWith(Bytes, Bytes, SetOptions),
+    /// SETNX key value - set the key if it does not exist
+    SetNx(Bytes, Bytes),
+    /// GETSET key value - set the key and reply with its old value
+    GetSet(Bytes, Bytes),
+    /// GETDEL key - reply with the value and delete the key
+    GetDel(Bytes),
+    /// GETEX key \[EX|PX|EXAT|PXAT time | PERSIST\] - reply with the value
+    /// and change the key's expiry
+    GetEx(Bytes, Option<GetExOption>),
+    /// MSETNX key value \[key value ...\] - set every pair if none of the
+    /// keys exists
+    MSetNx(Vec<(Bytes, Bytes)>),
 }
 
 /// Value types that can be stored in Ignix
@@ -392,10 +461,6 @@ impl RequestParser {
     }
 }
 
-/// SET options that Redis supports but Ignix does not implement yet.
-const UNSUPPORTED_SET_OPTIONS: [&str; 8] =
-    ["NX", "XX", "GET", "EX", "PX", "EXAT", "PXAT", "KEEPTTL"];
-
 /// Build a command from the arguments of one request frame.
 ///
 /// On failure returns a complete RESP error line worded like Redis 7.
@@ -413,14 +478,11 @@ fn command_from_frame(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String>
     // Limits Redis checks in the commands themselves, with the same error
     let arity_ok = match kind {
         Kind::Ping => argc <= 2,
-        Kind::MSet => argc % 2 == 1,
+        Kind::MSet | Kind::MSetNx => argc % 2 == 1,
         _ => true,
     };
     if !arity_ok {
         return Err(arity_error());
-    }
-    if matches!(kind, Kind::Set) && argc > 3 {
-        return Err(set_option_error(&items[3]));
     }
 
     // Drop the command name; what is left are the arguments.
@@ -449,13 +511,17 @@ fn command_from_frame(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String>
         }
         Kind::Exists => Cmd::Exists(items),
         Kind::MGet => Cmd::MGet(items),
-        Kind::MSet => {
+        Kind::MSet | Kind::MSetNx => {
             let mut pairs = Vec::with_capacity(items.len() / 2);
             let mut args = items.into_iter();
             while let (Some(key), Some(value)) = (args.next(), args.next()) {
                 pairs.push((key, value));
             }
-            Cmd::MSet(pairs)
+            if kind == Kind::MSet {
+                Cmd::MSet(pairs)
+            } else {
+                Cmd::MSetNx(pairs)
+            }
         }
         Kind::Get | Kind::Incr | Kind::Decr => {
             let [key] = <[Bytes; 1]>::try_from(items).map_err(|_| arity_error())?;
@@ -478,9 +544,69 @@ fn command_from_frame(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String>
             };
             Cmd::IncrBy(key, delta)
         }
-        Kind::Set => {
+        Kind::Set if items.len() == 2 => {
             let [key, value] = <[Bytes; 2]>::try_from(items).map_err(|_| arity_error())?;
             Cmd::Set(key, value)
+        }
+        Kind::Set => {
+            let parsed = string_options(&items[2..], true)?;
+            let expiry = match parsed.time {
+                Some((time, value)) => SetExpiry::At(resolve_expiry(time, &value, "set")?),
+                None if parsed.keepttl => SetExpiry::Keep,
+                None => SetExpiry::Clear,
+            };
+            let condition = match (parsed.nx, parsed.xx) {
+                (true, _) => Some(SetCondition::Nx),
+                (_, true) => Some(SetCondition::Xx),
+                _ => None,
+            };
+            let options = SetOptions {
+                condition,
+                get: parsed.get,
+                expiry,
+            };
+            let mut items = items;
+            items.truncate(2);
+            let [key, value] = <[Bytes; 2]>::try_from(items).map_err(|_| arity_error())?;
+            Cmd::SetWith(key, value, options)
+        }
+        Kind::SetEx | Kind::PSetEx => {
+            let [key, time, value] = <[Bytes; 3]>::try_from(items).map_err(|_| arity_error())?;
+            let unit = if kind == Kind::SetEx {
+                TimeOption::Ex
+            } else {
+                TimeOption::Px
+            };
+            let options = SetOptions {
+                expiry: SetExpiry::At(resolve_expiry(unit, &time, spec.name)?),
+                ..SetOptions::default()
+            };
+            Cmd::SetWith(key, value, options)
+        }
+        Kind::SetNx | Kind::GetSet => {
+            let [key, value] = <[Bytes; 2]>::try_from(items).map_err(|_| arity_error())?;
+            if kind == Kind::SetNx {
+                Cmd::SetNx(key, value)
+            } else {
+                Cmd::GetSet(key, value)
+            }
+        }
+        Kind::GetDel => {
+            let [key] = <[Bytes; 1]>::try_from(items).map_err(|_| arity_error())?;
+            Cmd::GetDel(key)
+        }
+        Kind::GetEx => {
+            let parsed = string_options(&items[1..], false)?;
+            let option = match parsed.time {
+                Some((TimeOption::Ex, time)) => Some(GetExOption::Ex(time)),
+                Some((TimeOption::Px, time)) => Some(GetExOption::Px(time)),
+                Some((TimeOption::ExAt, time)) => Some(GetExOption::ExAt(time)),
+                Some((TimeOption::PxAt, time)) => Some(GetExOption::PxAt(time)),
+                None => parsed.persist.then_some(GetExOption::Persist),
+            };
+            let mut items = items;
+            items.truncate(1);
+            Cmd::GetEx(items.pop().unwrap_or_default(), option)
         }
         Kind::Rename => {
             let [from, to] = <[Bytes; 2]>::try_from(items).map_err(|_| arity_error())?;
@@ -761,15 +887,100 @@ fn unknown_command_error(items: &[Bytes]) -> String {
     String::from_utf8_lossy(&msg).into_owned()
 }
 
-/// Error for the first extra `SET` argument: options Redis knows are reported
-/// as unsupported, anything else is a syntax error (as in Redis).
-fn set_option_error(option: &[u8]) -> String {
-    match UNSUPPORTED_SET_OPTIONS
-        .iter()
-        .find(|name| option.eq_ignore_ascii_case(name.as_bytes()))
-    {
-        Some(name) => format!("ERR SET option '{name}' is not supported"),
-        None => "ERR syntax error".to_string(),
+/// The time options of SET and GETEX
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TimeOption {
+    /// `EX seconds`
+    Ex,
+    /// `PX milliseconds`
+    Px,
+    /// `EXAT unix-time-seconds`
+    ExAt,
+    /// `PXAT unix-time-milliseconds`
+    PxAt,
+}
+
+/// The options of SET or GETEX, before the time is checked
+#[derive(Default)]
+struct StringOptions {
+    nx: bool,
+    xx: bool,
+    get: bool,
+    keepttl: bool,
+    persist: bool,
+    time: Option<(TimeOption, Bytes)>,
+}
+
+/// Parse the options of SET (`set`) or GETEX with Redis's rules: NX, XX,
+/// GET and KEEPTTL are for SET and PERSIST for GETEX; NX and XX exclude each
+/// other; one of EX, PX, EXAT and PXAT may be given (repeatedly), but not
+/// with KEEPTTL or PERSIST. Anything else is a syntax error.
+fn string_options(options: &[Bytes], set: bool) -> std::result::Result<StringOptions, String> {
+    let mut parsed = StringOptions::default();
+    let mut i = 0;
+    while i < options.len() {
+        let option = options[i].to_ascii_lowercase();
+        let time = match option.as_slice() {
+            b"ex" => Some(TimeOption::Ex),
+            b"px" => Some(TimeOption::Px),
+            b"exat" => Some(TimeOption::ExAt),
+            b"pxat" => Some(TimeOption::PxAt),
+            _ => None,
+        };
+        let other_time = |kind| {
+            parsed
+                .time
+                .as_ref()
+                .is_some_and(|(given, _)| *given != kind)
+        };
+        match (option.as_slice(), time) {
+            (b"nx", _) if set && !parsed.xx => parsed.nx = true,
+            (b"xx", _) if set && !parsed.nx => parsed.xx = true,
+            (b"get", _) if set => parsed.get = true,
+            (b"keepttl", _) if set && !parsed.persist && parsed.time.is_none() => {
+                parsed.keepttl = true
+            }
+            (b"persist", _) if !set && !parsed.keepttl && parsed.time.is_none() => {
+                parsed.persist = true
+            }
+            (_, Some(kind)) if !parsed.keepttl && !parsed.persist && !other_time(kind) => {
+                let Some(value) = options.get(i + 1) else {
+                    return Err("ERR syntax error".to_string());
+                };
+                parsed.time = Some((kind, value.clone()));
+                i += 1;
+            }
+            _ => return Err("ERR syntax error".to_string()),
+        }
+        i += 1;
+    }
+    Ok(parsed)
+}
+
+/// The unix time in milliseconds a SET, SETEX, PSETEX or GETEX time stands
+/// for, checked like Redis: the number must be positive and the result must
+/// not overflow. `command` names the command in the error.
+pub(crate) fn resolve_expiry(
+    kind: TimeOption,
+    time: &[u8],
+    command: &str,
+) -> std::result::Result<i64, String> {
+    let value = parse_canonical_i64(time)
+        .ok_or_else(|| "ERR value is not an integer or out of range".to_string())?;
+    let invalid = || format!("ERR invalid expire time in '{command}' command");
+    if value <= 0 {
+        return Err(invalid());
+    }
+    let millis = match kind {
+        TimeOption::Ex | TimeOption::ExAt => value.checked_mul(1000).ok_or_else(invalid)?,
+        TimeOption::Px | TimeOption::PxAt => value,
+    };
+    match kind {
+        TimeOption::Ex | TimeOption::Px => {
+            let now = i64::try_from(crate::storage::unix_ms()).unwrap_or(i64::MAX);
+            millis.checked_add(now).ok_or_else(invalid)
+        }
+        TimeOption::ExAt | TimeOption::PxAt => Ok(millis),
     }
 }
 

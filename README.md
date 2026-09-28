@@ -79,8 +79,13 @@ world
 | `CLIENT ID\|GETNAME\|SETNAME\|SETINFO\|HELP` | The connection's id and name, the client library's name and version | `CLIENT SETNAME app` → `+OK` |
 | `INFO [section ...]` | Server, clients, persistence, stats, replication and keyspace sections, in Redis's format | `INFO keyspace` → `# Keyspace\r\ndb0:keys=2,...` |
 | `CONFIG GET parameter [parameter ...]` | Configuration parameters matching names or glob patterns | `CONFIG GET save` → `*2\r\n$4\r\nsave\r\n$0\r\n` |
-| `SET key value` | Set a value | `SET key value` → `+OK` |
+| `SET key value [NX\|XX] [GET] [EX\|PX\|EXAT\|PXAT time\|KEEPTTL]` | Set a value, if the condition holds, with an expiry | `SET key value EX 60` → `+OK` |
+| `SETEX`/`PSETEX key time value` | Set a value that expires after `time` seconds or milliseconds | `SETEX key 60 value` → `+OK` |
+| `SETNX key value` | Set a value if the key does not exist | `SETNX key value` → `:1` |
 | `GET key` | Get a value | `GET key` → `$5\r\nvalue` |
+| `GETSET key value` | Set a value and return the old one | `GETSET key new` → `$5\r\nvalue` |
+| `GETDEL key` | Get a value and delete the key | `GETDEL key` → `$3\r\nnew` |
+| `GETEX key [EX\|PX\|EXAT\|PXAT time\|PERSIST]` | Get a value and change its expiry | `GETEX key EX 60` → `$5\r\nvalue` |
 | `DEL key [key ...]` | Delete keys, reply with the number removed | `DEL a b` → `:2` |
 | `UNLINK key [key ...]` | Delete keys, like `DEL` | `UNLINK a b` → `:2` |
 | `EXISTS key [key ...]` | Count how many of the keys exist | `EXISTS a b` → `:1` |
@@ -91,6 +96,7 @@ world
 | `RENAME key newkey` | Rename a key | `RENAME old new` → `+OK` |
 | `MGET key [key ...]` | Get multiple values | `MGET k1 k2` → `*2\r\n...` |
 | `MSET key value [key value ...]` | Set multiple values | `MSET k1 v1 k2 v2` → `+OK` |
+| `MSETNX key value [key value ...]` | Set multiple values if none of the keys exists | `MSETNX k1 v1 k2 v2` → `:1` |
 | `TYPE key` | Type of the value (`string`), or `none` | `TYPE k1` → `+string` |
 | `EXPIRE`/`PEXPIRE key time [NX\|XX\|GT\|LT]` | Expire a key after `time` seconds or milliseconds | `EXPIRE k1 60` → `:1` |
 | `EXPIREAT`/`PEXPIREAT key time [NX\|XX\|GT\|LT]` | Expire a key at a unix time in seconds or milliseconds | `EXPIREAT k1 4102444800` → `:1` |
@@ -103,8 +109,6 @@ world
 | `FLUSHDB [ASYNC\|SYNC]`, `FLUSHALL [ASYNC\|SYNC]` | Delete every key (with `ASYNC` the memory is freed in the background) | `FLUSHDB` → `+OK` |
 
 Replies and error messages match Redis 7, for example `-ERR wrong number of arguments for 'get' command`, `-ERR unknown command 'FOO', with args beginning with: ...` and `-ERR value is not an integer or out of range`. After an invalid command the connection keeps working; after malformed RESP the server replies `-ERR Protocol error: ...` and closes the connection, as Redis does.
-
-`SET` options (`EX`, `PX`, `NX`, `XX`, `GET`, `EXAT`, `PXAT`, `KEEPTTL`) are not implemented yet; they are rejected with `-ERR SET option '<NAME>' is not supported` instead of being ignored.
 
 ## 🔧 Configuration
 
@@ -317,7 +321,6 @@ Monitor AOF: `tail -f ignix.aof`
 - `SCAN` visits the keyspace one shard (1/1024 of the keys) at a time, so with many keys a step returns more keys than `COUNT`; like in Redis, every key that exists during the whole iteration is returned, and here exactly once.
 - A single database: `SELECT` accepts only index 0.
 - No inline commands (plain text lines such as `PING` typed into telnet); requests must be RESP arrays.
-- `SET` options (`EX`, `PX`, `NX`, `XX`, `GET`, ...) are not implemented yet.
 - Expired keys are removed when they are next accessed, so they still count in `DBSIZE` until then (as in Redis between its expiry cycles).
 - The AOF is write-only: it is not loaded on startup, so data does not survive a restart, and it is never compacted, so it grows with every write. In one of our benchmark sessions `ignix.aof` grew to 13.8 GB while Redis, which rewrites its AOF, used 2.3 GB.
 - No authentication, and the server listens on the fixed address `0.0.0.0:7379`; do not expose it to untrusted networks.

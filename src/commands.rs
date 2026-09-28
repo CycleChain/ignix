@@ -44,6 +44,13 @@ pub(crate) enum Kind {
     ExpireTime,
     PExpireTime,
     Persist,
+    SetEx,
+    PSetEx,
+    SetNx,
+    GetSet,
+    GetDel,
+    GetEx,
+    MSetNx,
 }
 
 /// The static description of a command
@@ -158,6 +165,13 @@ commands! {
     EXPIRETIME = "expiretime", 2, ExpireTime;
     PEXPIRETIME = "pexpiretime", 2, PExpireTime;
     PERSIST = "persist", 2, Persist;
+    SETEX = "setex", 4, SetEx;
+    PSETEX = "psetex", 4, PSetEx;
+    SETNX = "setnx", 3, SetNx;
+    GETSET = "getset", 3, GetSet;
+    GETDEL = "getdel", 2, GetDel;
+    GETEX = "getex", -2, GetEx;
+    MSETNX = "msetnx", -3, MSetNx;
 }
 
 #[cfg(test)]

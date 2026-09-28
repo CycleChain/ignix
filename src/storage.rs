@@ -7,7 +7,9 @@
  */
 
 use crate::glob::Pattern;
-use crate::protocol::{parse_canonical_i64, ExpireOptions, Value};
+use crate::protocol::{
+    parse_canonical_i64, ExpireOptions, SetCondition, SetExpiry, SetOptions, Value,
+};
 use bytes::Bytes;
 use crossbeam::utils::CachePadded;
 use hashbrown::hash_map::RawEntryMut;
@@ -70,6 +72,44 @@ impl Clock {
 /// `replaced` set when the command replaces the key anyway (SET, MSET, the
 /// target of RENAME), so that only the removal of other keys needs a record
 pub(crate) type ExpiredHook = Box<dyn Fn(&Bytes, bool) + Send + Sync>;
+
+/// How GETEX changes a key's expiry
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GetExChange {
+    /// Leave it
+    Keep,
+    /// Remove it
+    Persist,
+    /// Set it to `at` (unix ms); an `absolute` time (EXAT, PXAT) that has
+    /// passed deletes the key, as in Redis
+    ExpireAt { at: i64, absolute: bool },
+}
+
+/// What [`Dict::get_ex`] found and did
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum GetExResult {
+    /// The key does not exist
+    Missing,
+    /// The key exists but the change is invalid (Redis only checks it then)
+    Invalid(String),
+    /// The value, and what happened to the expiry
+    Done(Value, GetExEffect),
+}
+
+/// What GETEX did to the expiry, for the AOF
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GetExEffect {
+    Unchanged,
+    ExpiresAt(i64),
+    Persisted,
+    Deleted,
+}
+
+/// A SET expiry time as stored: a time not after 0 has passed, so it is
+/// stored as 1 (0 means no expiry)
+fn stored_expiry(at: i64) -> u64 {
+    u64::try_from(at).ok().filter(|&at| at > 0).unwrap_or(1)
+}
 
 /// What [`Dict::expire`] did
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,6 +231,8 @@ impl Dict {
 
     /// Remove `key` if it has expired. Readers call this after finding the
     /// key expired under a read lock; it may have been written since.
+    #[cold]
+    #[inline(never)]
     fn remove_expired(&self, key: &[u8], hash: u64) {
         let mut table = self.write_shard(shard_of(hash));
         if let RawEntryMut::Occupied(slot) =
@@ -383,7 +425,7 @@ impl Dict {
     /// Call `f` with the entry stored under `k`, or `None` if it is missing
     /// or expired, while its shard's read lock is held. `f` must not use the
     /// dictionary.
-    #[inline]
+    #[inline(always)]
     fn read_entry<R>(&self, k: &[u8], f: impl FnOnce(Option<&Entry>) -> R) -> R {
         let (hash, shard) = self.locate(k);
         let table = self.read_shard(shard);
@@ -403,7 +445,7 @@ impl Dict {
     /// Call `f` with the value stored under `k` while its shard's read lock
     /// is held, e.g. to copy it into a reply without cloning it. `f` must not
     /// use the dictionary.
-    #[inline]
+    #[inline(always)]
     pub(crate) fn read<R>(&self, k: &[u8], f: impl FnOnce(Option<&Value>) -> R) -> R {
         self.read_entry(k, |entry| f(entry.map(|entry| &entry.value)))
     }
@@ -454,16 +496,16 @@ impl Dict {
     /// # Arguments
     /// * `k` - Key as owned Bytes
     /// * `v` - Value to store
-    #[inline]
+    #[inline(always)]
     pub fn set(&self, k: Bytes, v: Value) {
         let (hash, shard) = self.locate(&k);
         let mut table = self.write_shard(shard);
         match table.raw_entry_mut().from_key_hashed_nocheck(hash, &k[..]) {
             RawEntryMut::Occupied(mut slot) => {
-                let old = std::mem::replace(slot.get_mut(), Entry::new(v));
-                if old.expired(&mut Clock::default()) {
+                if slot.get().expired(&mut Clock::default()) {
                     self.expired(slot.key(), true);
                 }
+                *slot.get_mut() = Entry::new(v);
             }
             RawEntryMut::Vacant(slot) => {
                 slot.insert_hashed_nocheck(hash, k, Entry::new(v));
@@ -479,6 +521,144 @@ impl Dict {
         for (i, (k, v)) in pairs.into_iter().enumerate() {
             locked.insert(i, k, Entry::new(encode(v)));
         }
+    }
+
+    /// SET with options, done atomically: returns the old value when
+    /// `options.get` asks for it, and whether the key was set. Like Redis,
+    /// an expired key counts as missing.
+    pub(crate) fn set_with(
+        &self,
+        key: Bytes,
+        value: Value,
+        options: SetOptions,
+    ) -> (Option<Value>, bool) {
+        let (hash, shard) = self.locate(&key);
+        let mut table = self.write_shard(shard);
+        match table
+            .raw_entry_mut()
+            .from_key_hashed_nocheck(hash, &key[..])
+        {
+            RawEntryMut::Occupied(mut slot) => {
+                let expired = slot.get().expired(&mut Clock::default());
+                let old = (options.get && !expired).then(|| slot.get().value.clone());
+                if options.condition == Some(SetCondition::Nx) && !expired {
+                    return (old, false);
+                }
+                if options.condition == Some(SetCondition::Xx) && expired {
+                    let (key, _) = slot.remove_entry();
+                    self.expired(&key, false);
+                    return (old, false);
+                }
+                let expires_at = match options.expiry {
+                    SetExpiry::Clear => 0,
+                    SetExpiry::Keep if expired => 0,
+                    SetExpiry::Keep => slot.get().expires_at,
+                    SetExpiry::At(at) => stored_expiry(at),
+                };
+                if expired {
+                    self.expired(slot.key(), true);
+                }
+                *slot.get_mut() = Entry { value, expires_at };
+                (old, true)
+            }
+            RawEntryMut::Vacant(slot) => {
+                if options.condition == Some(SetCondition::Xx) {
+                    return (None, false);
+                }
+                let expires_at = match options.expiry {
+                    SetExpiry::At(at) => stored_expiry(at),
+                    SetExpiry::Clear | SetExpiry::Keep => 0,
+                };
+                slot.insert_hashed_nocheck(hash, key, Entry { value, expires_at });
+                (None, true)
+            }
+        }
+    }
+
+    /// Set every pair if none of the keys exists (MSETNX), atomically;
+    /// returns whether they were set. Like Redis, expired keys met while
+    /// checking are removed.
+    pub(crate) fn set_many_if_absent<V>(
+        &self,
+        pairs: Vec<(Bytes, V)>,
+        encode: impl Fn(V) -> Value,
+    ) -> bool {
+        let mut locked = self.lock_keys(pairs.iter().map(|(k, _)| &k[..]));
+        for (i, (key, _)) in pairs.iter().enumerate() {
+            if locked.contains(i, key) {
+                return false;
+            }
+        }
+        for (i, (k, v)) in pairs.into_iter().enumerate() {
+            locked.insert(i, k, Entry::new(encode(v)));
+        }
+        true
+    }
+
+    /// Remove `key` and return its value (GETDEL)
+    pub(crate) fn take(&self, key: &[u8]) -> Option<Value> {
+        let (hash, shard) = self.locate(key);
+        let mut table = self.write_shard(shard);
+        let RawEntryMut::Occupied(slot) = table.raw_entry_mut().from_key_hashed_nocheck(hash, key)
+        else {
+            return None;
+        };
+        let (key, entry) = slot.remove_entry();
+        if entry.expired(&mut Clock::default()) {
+            self.expired(&key, false);
+            return None;
+        }
+        Some(entry.value)
+    }
+
+    /// Read `key` and change its expiry (GETEX), atomically. `change` is
+    /// only called if the key exists, since Redis only checks the time then.
+    pub(crate) fn get_ex(
+        &self,
+        key: &[u8],
+        change: impl FnOnce() -> Result<GetExChange, String>,
+    ) -> GetExResult {
+        let (hash, shard) = self.locate(key);
+        let mut table = self.write_shard(shard);
+        let RawEntryMut::Occupied(mut slot) =
+            table.raw_entry_mut().from_key_hashed_nocheck(hash, key)
+        else {
+            return GetExResult::Missing;
+        };
+        let mut clock = Clock::default();
+        if slot.get().expired(&mut clock) {
+            let (key, _) = slot.remove_entry();
+            self.expired(&key, false);
+            return GetExResult::Missing;
+        }
+        let change = match change() {
+            Ok(change) => change,
+            Err(error) => return GetExResult::Invalid(error),
+        };
+        let value = slot.get().value.clone();
+        let effect = match change {
+            GetExChange::Keep => GetExEffect::Unchanged,
+            GetExChange::Persist => {
+                let entry = slot.get_mut();
+                let had_expiry = entry.expires_at != 0;
+                entry.expires_at = 0;
+                if had_expiry {
+                    GetExEffect::Persisted
+                } else {
+                    GetExEffect::Unchanged
+                }
+            }
+            GetExChange::ExpireAt { at, absolute } => {
+                if absolute && u64::try_from(at).map_or(true, |at| at <= clock.now()) {
+                    slot.remove();
+                    GetExEffect::Deleted
+                } else {
+                    slot.get_mut().expires_at = stored_expiry(at);
+                    GetExEffect::ExpiresAt(at)
+                }
+            }
+        };
+        GetExResult::Done(value, effect)
     }
 
     /// Delete a key
@@ -740,6 +920,21 @@ impl LockedKeys<'_> {
                 Some(entry)
             }
             RawEntryMut::Vacant(_) => None,
+        }
+    }
+
+    /// Whether key `i` exists; an expired entry is removed
+    pub(crate) fn contains(&mut self, i: usize, key: &[u8]) -> bool {
+        let dict = self.dict;
+        let (hash, table) = self.table(i, key);
+        match table.raw_entry_mut().from_key_hashed_nocheck(hash, key) {
+            RawEntryMut::Occupied(slot) if slot.get().expired(&mut Clock::default()) => {
+                let (key, _) = slot.remove_entry();
+                dict.expired(&key, false);
+                false
+            }
+            RawEntryMut::Occupied(_) => true,
+            RawEntryMut::Vacant(_) => false,
         }
     }
 

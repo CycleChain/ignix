@@ -8,17 +8,19 @@
 
 use crate::aof::{
     emit_aof_del, emit_aof_flushall, emit_aof_flushdb, emit_aof_incr, emit_aof_incrby,
-    emit_aof_mset, emit_aof_persist, emit_aof_pexpireat, emit_aof_rename, emit_aof_set, AofHandle,
+    emit_aof_mset, emit_aof_persist, emit_aof_pexpireat, emit_aof_rename, emit_aof_set,
+    emit_aof_set_keepttl, emit_aof_set_pxat, AofHandle,
 };
 use crate::glob::Pattern;
 use crate::info::{write_config_get, write_info, REDIS_VERSION};
 use crate::protocol::{
-    fmt_i64, fmt_u64, parse_canonical_i64, write_array_len, write_bulk, write_error, write_integer,
-    write_map_len, write_nil, write_simple, Cmd, FlushMode, Protocol, Value,
+    fmt_i64, fmt_u64, parse_canonical_i64, resolve_expiry, write_array_len, write_bulk,
+    write_error, write_integer, write_map_len, write_nil, write_simple, Cmd, FlushMode,
+    GetExOption, Protocol, SetCondition, SetExpiry, SetOptions, TimeOption, Value,
 };
 use crate::session::Session;
 use crate::stats::Stats;
-use crate::storage::{unix_ms, Dict, ExpireResult};
+use crate::storage::{unix_ms, Dict, ExpireResult, GetExChange, GetExEffect, GetExResult};
 use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
 
@@ -59,6 +61,7 @@ fn write_value(value: Option<&Value>, protocol: Protocol, out: &mut BytesMut) {
 /// Small values are copied straight from the dictionary, which avoids the
 /// two atomic reference-count updates of cloning `Bytes` (contended when
 /// many connections read the same key).
+#[inline(always)]
 fn write_get(dict: &Dict, key: &[u8], protocol: Protocol, out: &mut BytesMut) {
     let large = dict.read(key, |value| match value {
         Some(Value::Str(v)) | Some(Value::Blob(v)) if v.len() > COPY_UNDER_LOCK_MAX => {
@@ -233,6 +236,22 @@ impl Shard {
         }
     }
 
+    /// SET with options (also SETNX, GETSET, SETEX and PSETEX): sets the key
+    /// if the condition allows, logs the SET as a replay needs it, and
+    /// returns the old value (if asked for) and whether the key was set
+    fn set_with(&self, key: Bytes, value: Bytes, options: SetOptions) -> (Option<Value>, bool) {
+        let record = self.aof.as_ref().map(|_| match options.expiry {
+            SetExpiry::Clear => emit_aof_set(&key, &value),
+            SetExpiry::Keep => emit_aof_set_keepttl(&key, &value),
+            SetExpiry::At(at) => emit_aof_set_pxat(&key, &value, at),
+        });
+        let (old, set) = self.dict.set_with(key, encode_value(value), options);
+        if let (Some(a), Some(record), true) = (&self.aof, record, set) {
+            a.write_owned(record);
+        }
+        (old, set)
+    }
+
     /// Write the TTL family's reply for `key`: the time left, or the expiry
     /// itself if `absolute`, in milliseconds or rounded seconds
     fn ttl(&self, key: &[u8], millis: bool, absolute: bool, out: &mut BytesMut) {
@@ -266,7 +285,9 @@ impl Shard {
     /// * `cmd` - Parsed Redis command to execute
     /// * `out` - Buffer to write response to
     pub fn exec(&self, cmd: Cmd, out: &mut BytesMut) {
-        self.exec_session(cmd, &mut Session::default(), out)
+        self.exec_frequent(cmd, Protocol::default(), out, |cmd, out| {
+            self.exec_other(cmd, &mut Session::default(), out)
+        });
     }
 
     /// Remove every key, logging `record()` while the keys are locked so
@@ -290,40 +311,138 @@ impl Shard {
     /// running any later request.
     pub fn exec_session(&self, cmd: Cmd, session: &mut Session, out: &mut BytesMut) {
         session.count_command();
+        self.exec_frequent(cmd, session.protocol(), out, |cmd, out| {
+            self.exec_other(cmd, session, out)
+        });
+    }
+
+    /// Run `cmd` if it is one of the most frequent commands, which need no
+    /// session, or hand it to `other`.
+    ///
+    /// They are kept out of the large match in `exec_other`: its big stack
+    /// frame and the decoding of the command there would cost each of them
+    /// dozens of instructions.
+    #[inline(always)]
+    fn exec_frequent(
+        &self,
+        cmd: Cmd,
+        protocol: Protocol,
+        out: &mut BytesMut,
+        other: impl FnOnce(Cmd, &mut BytesMut),
+    ) {
         match cmd {
             // PING [message] - connectivity test; echoes the message when given
             Cmd::Ping(None) => write_simple("PONG", out),
             Cmd::Ping(Some(message)) => write_bulk(&message, out),
 
             // GET key - retrieve value for key
-            Cmd::Get(k) => write_get(&self.dict, &k, session.protocol(), out),
+            Cmd::Get(k) => write_get(&self.dict, &k, protocol, out),
 
             // SET key value - store key-value pair
-            Cmd::Set(k, v) => {
-                // Log to AOF if persistence is enabled
-                // We do this before moving k and v into the dictionary
-                if let Some(a) = &self.aof {
-                    a.write_owned(emit_aof_set(&k, &v));
-                }
-
-                self.dict.set(k, encode_value(v));
-
-                write_simple("OK", out);
-            }
+            Cmd::Set(k, v) => self.set(k, v, out),
 
             // DEL / UNLINK key [key ...] - delete keys, reply with the number
             // removed (UNLINK is logged as DEL)
-            Cmd::Del(mut keys) | Cmd::Unlink(mut keys) => {
-                // Keep only the keys that were removed; a repeated key is
-                // removed (and counted) once, like in Redis.
-                self.dict.del_many(&mut keys);
-                if let Some(a) = &self.aof {
-                    if !keys.is_empty() {
-                        a.write_owned(emit_aof_del(&keys));
-                    }
-                }
-                write_integer(keys.len() as i64, out);
+            Cmd::Del(keys) | Cmd::Unlink(keys) => self.del(keys, out),
+
+            // EXISTS key [key ...] - count existing keys; repeated keys count
+            // every time, like in Redis
+            Cmd::Exists(keys) => {
+                let mut existing = 0;
+                self.dict
+                    .read_many(&keys, |value| existing += value.is_some() as i64);
+                write_integer(existing, out);
             }
+
+            // INCR key, INCRBY / DECRBY / DECR - add to a numeric value
+            Cmd::Incr(k) => self.incr_by(k, None, out),
+            Cmd::IncrBy(k, delta) => self.incr_by(k, Some(delta), out),
+
+            // MGET key1 key2 ... - get multiple keys
+            Cmd::MGet(keys) => {
+                write_array_len(keys.len(), out);
+                write_mget(&self.dict, &keys, protocol, out);
+            }
+
+            // MSET key1 value1 key2 value2 ... - set multiple key-value pairs
+            Cmd::MSet(pairs) => self.mset(pairs, out),
+
+            cmd => other(cmd, out),
+        }
+    }
+
+    /// SET key value
+    #[inline(always)]
+    fn set(&self, k: Bytes, v: Bytes, out: &mut BytesMut) {
+        // Log to AOF if persistence is enabled, before moving k and v into
+        // the dictionary
+        if let Some(a) = &self.aof {
+            a.write_owned(emit_aof_set(&k, &v));
+        }
+        self.dict.set(k, encode_value(v));
+        write_simple("OK", out);
+    }
+
+    /// DEL key [key ...]
+    fn del(&self, mut keys: Vec<Bytes>, out: &mut BytesMut) {
+        // Keep only the keys that were removed; a repeated key is removed
+        // (and counted) once, like in Redis.
+        self.dict.del_many(&mut keys);
+        if let Some(a) = &self.aof {
+            if !keys.is_empty() {
+                a.write_owned(emit_aof_del(&keys));
+            }
+        }
+        write_integer(keys.len() as i64, out);
+    }
+
+    /// INCR key, or INCRBY key delta (also DECRBY and DECR)
+    fn incr_by(&self, k: Bytes, delta: Option<i64>, out: &mut BytesMut) {
+        // Keep the key for the AOF record only when persistence is on.
+        let aof_key = self.aof.is_some().then(|| k.clone());
+        match self.dict.incr_by(k, delta.unwrap_or(1)) {
+            Ok(v) => {
+                // Log only successful increments
+                if let (Some(a), Some(key)) = (&self.aof, &aof_key) {
+                    a.write_owned(match delta {
+                        None => emit_aof_incr(key),
+                        Some(delta) => emit_aof_incrby(key, delta),
+                    });
+                }
+                write_integer(v, out);
+            }
+            Err(e) => write_error(e.as_str(), out),
+        }
+    }
+
+    /// MSET key value [key value ...]
+    fn mset(&self, pairs: Vec<(Bytes, Bytes)>, out: &mut BytesMut) {
+        // Log all sets to AOF as a single operation
+        if let Some(a) = &self.aof {
+            a.write_owned(emit_aof_mset(&pairs));
+        }
+        // Set all key-value pairs at once
+        self.dict.set_many(pairs, encode_value);
+        write_simple("OK", out);
+    }
+
+    /// Execute every command but the most frequent ones, which
+    /// `exec_frequent` runs
+    #[inline(never)]
+    fn exec_other(&self, cmd: Cmd, session: &mut Session, out: &mut BytesMut) {
+        match cmd {
+            // The most frequent commands, which `exec_frequent` runs before
+            // any command gets here
+            Cmd::Ping(_)
+            | Cmd::Get(_)
+            | Cmd::Set(..)
+            | Cmd::Del(_)
+            | Cmd::Unlink(_)
+            | Cmd::Exists(_)
+            | Cmd::Incr(_)
+            | Cmd::IncrBy(..)
+            | Cmd::MGet(_)
+            | Cmd::MSet(_) => self.exec_frequent(cmd, session.protocol(), out, |_, _| ()),
 
             // RENAME oldkey newkey - rename a key
             Cmd::Rename(from, to) => {
@@ -338,64 +457,6 @@ impl Shard {
                 } else {
                     write_error("ERR no such key", out);
                 }
-            }
-
-            // EXISTS key [key ...] - count existing keys; repeated keys count
-            // every time, like in Redis
-            Cmd::Exists(keys) => {
-                let mut existing = 0;
-                self.dict
-                    .read_many(&keys, |value| existing += value.is_some() as i64);
-                write_integer(existing, out);
-            }
-
-            // INCR key - increment numeric value
-            Cmd::Incr(k) => {
-                // Keep the key for the AOF record only when persistence is on.
-                let aof_key = self.aof.is_some().then(|| k.clone());
-                match self.dict.incr(k) {
-                    Ok(v) => {
-                        // Log only successful increments
-                        if let (Some(a), Some(key)) = (&self.aof, aof_key) {
-                            a.write_owned(emit_aof_incr(&key));
-                        }
-                        write_integer(v, out);
-                    }
-                    Err(e) => write_error(e.as_str(), out),
-                }
-            }
-
-            // INCRBY / DECRBY / DECR - add a delta to a numeric value
-            Cmd::IncrBy(k, delta) => {
-                let aof_key = self.aof.is_some().then(|| k.clone());
-                match self.dict.incr_by(k, delta) {
-                    Ok(v) => {
-                        if let (Some(a), Some(key)) = (&self.aof, aof_key) {
-                            a.write_owned(emit_aof_incrby(&key, delta));
-                        }
-                        write_integer(v, out);
-                    }
-                    Err(e) => write_error(e.as_str(), out),
-                }
-            }
-
-            // MGET key1 key2 ... - get multiple keys
-            Cmd::MGet(keys) => {
-                write_array_len(keys.len(), out);
-                write_mget(&self.dict, &keys, session.protocol(), out);
-            }
-
-            // MSET key1 value1 key2 value2 ... - set multiple key-value pairs
-            Cmd::MSet(pairs) => {
-                // Log all sets to AOF as a single operation
-                if let Some(a) = &self.aof {
-                    a.write_owned(emit_aof_mset(&pairs));
-                }
-
-                // Set all key-value pairs at once
-                self.dict.set_many(pairs, encode_value);
-
-                write_simple("OK", out);
             }
 
             // ECHO message
@@ -500,6 +561,95 @@ impl Shard {
             Cmd::PTtl(key) => self.ttl(&key, true, false, out),
             Cmd::ExpireTime(key) => self.ttl(&key, false, true, out),
             Cmd::PExpireTime(key) => self.ttl(&key, true, true, out),
+
+            // SET key value [NX|XX] [GET] [EX|PX|EXAT|PXAT time|KEEPTTL],
+            // SETEX and PSETEX
+            Cmd::SetWith(key, value, options) => {
+                let (old, set) = self.set_with(key, value, options);
+                if options.get {
+                    write_value(old.as_ref(), session.protocol(), out);
+                } else if set {
+                    write_simple("OK", out);
+                } else {
+                    write_nil(session.protocol(), out);
+                }
+            }
+
+            // SETNX key value
+            Cmd::SetNx(key, value) => {
+                let options = SetOptions {
+                    condition: Some(SetCondition::Nx),
+                    ..SetOptions::default()
+                };
+                let (_, set) = self.set_with(key, value, options);
+                write_integer(i64::from(set), out);
+            }
+
+            // GETSET key value
+            Cmd::GetSet(key, value) => {
+                let options = SetOptions {
+                    get: true,
+                    ..SetOptions::default()
+                };
+                let (old, _) = self.set_with(key, value, options);
+                write_value(old.as_ref(), session.protocol(), out);
+            }
+
+            // GETDEL key, logged as DEL
+            Cmd::GetDel(key) => {
+                let value = self.dict.take(&key);
+                if let (Some(a), Some(_)) = (&self.aof, &value) {
+                    a.write_owned(emit_aof_del(std::slice::from_ref(&key)));
+                }
+                write_value(value.as_ref(), session.protocol(), out);
+            }
+
+            // GETEX key [EX|PX|EXAT|PXAT time|PERSIST], logged as
+            // PEXPIREAT, PERSIST or DEL
+            Cmd::GetEx(key, option) => {
+                let change = || {
+                    let (unit, time) = match &option {
+                        None => return Ok(GetExChange::Keep),
+                        Some(GetExOption::Persist) => return Ok(GetExChange::Persist),
+                        Some(GetExOption::Ex(time)) => (TimeOption::Ex, time),
+                        Some(GetExOption::Px(time)) => (TimeOption::Px, time),
+                        Some(GetExOption::ExAt(time)) => (TimeOption::ExAt, time),
+                        Some(GetExOption::PxAt(time)) => (TimeOption::PxAt, time),
+                    };
+                    let absolute = matches!(unit, TimeOption::ExAt | TimeOption::PxAt);
+                    let at = resolve_expiry(unit, time, "getex")?;
+                    Ok(GetExChange::ExpireAt { at, absolute })
+                };
+                match self.dict.get_ex(&key, change) {
+                    GetExResult::Missing => write_nil(session.protocol(), out),
+                    GetExResult::Invalid(error) => write_error(&error, out),
+                    GetExResult::Done(value, effect) => {
+                        if let Some(a) = &self.aof {
+                            match effect {
+                                GetExEffect::ExpiresAt(at) => {
+                                    a.write_owned(emit_aof_pexpireat(&key, at))
+                                }
+                                GetExEffect::Persisted => a.write_owned(emit_aof_persist(&key)),
+                                GetExEffect::Deleted => {
+                                    a.write_owned(emit_aof_del(std::slice::from_ref(&key)))
+                                }
+                                GetExEffect::Unchanged => {}
+                            }
+                        }
+                        write_value(Some(&value), session.protocol(), out);
+                    }
+                }
+            }
+
+            // MSETNX key value [key value ...], logged as MSET
+            Cmd::MSetNx(pairs) => {
+                let record = self.aof.as_ref().map(|_| emit_aof_mset(&pairs));
+                let set = self.dict.set_many_if_absent(pairs, encode_value);
+                if let (Some(a), Some(record), true) = (&self.aof, record, set) {
+                    a.write_owned(record);
+                }
+                write_integer(i64::from(set), out);
+            }
 
             // PERSIST key
             Cmd::Persist(key) => {

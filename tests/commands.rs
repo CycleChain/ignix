@@ -952,31 +952,191 @@ fn unknown_command_error_truncates_like_redis() {
 }
 
 #[test]
-fn set_with_expiry_option_is_rejected_and_key_not_written() {
+fn set_nx_xx_and_get_follow_redis() {
     let s = shard();
+    exec(&s, &[b"SET", b"b", b"v1"]);
+    // NX with GET replies with the old value and leaves the key
     assert_eq!(
-        exec(&s, &[b"SET", b"k", b"v", b"EX", b"10"]),
-        b"-ERR SET option 'EX' is not supported\r\n"
+        exec(&s, &[b"SET", b"b", b"v2", b"NX", b"GET"]),
+        b"$2\r\nv1\r\n"
     );
-    assert_eq!(exec(&s, &[b"GET", b"k"]), b"$-1\r\n");
+    assert_eq!(exec(&s, &[b"GET", b"b"]), b"$2\r\nv1\r\n");
+    assert_eq!(exec(&s, &[b"SET", b"c", b"v", b"nx", b"get"]), b"$-1\r\n");
+    assert_eq!(exec(&s, &[b"GET", b"c"]), b"$1\r\nv\r\n");
+    assert_eq!(exec(&s, &[b"SET", b"d", b"v", b"XX"]), b"$-1\r\n");
+    assert_eq!(exec(&s, &[b"EXISTS", b"d"]), b":0\r\n");
+    assert_eq!(
+        exec(&s, &[b"SET", b"b", b"v3", b"XX", b"GET"]),
+        b"$2\r\nv1\r\n"
+    );
+    assert_eq!(exec(&s, &[b"GET", b"b"]), b"$2\r\nv3\r\n");
+    assert_eq!(exec(&s, &[b"SET", b"b", b"v4", b"NX"]), b"$-1\r\n");
+    assert_eq!(exec(&s, &[b"SET", b"e", b"v", b"NX", b"NX"]), b"+OK\r\n");
 }
 
 #[test]
-fn set_options_are_matched_case_insensitively() {
+fn set_expiry_options_follow_redis() {
+    let s = shard();
+    exec(&s, &[b"SET", b"k", b"v", b"EX", b"10"]);
+    assert_eq!(exec(&s, &[b"TTL", b"k"]), b":10\r\n");
+    exec(&s, &[b"SET", b"k", b"v2", b"KEEPTTL"]);
+    assert_eq!(exec(&s, &[b"TTL", b"k"]), b":10\r\n");
+    exec(&s, &[b"SET", b"k", b"v3"]);
+    assert_eq!(exec(&s, &[b"TTL", b"k"]), b":-1\r\n");
+    exec(&s, &[b"SET", b"k", b"v", b"PX", b"5000"]);
+    assert_eq!(exec(&s, &[b"TTL", b"k"]), b":5\r\n");
+    exec(&s, &[b"SET", b"k", b"v", b"EXAT", b"4102444800"]);
+    assert_eq!(exec(&s, &[b"EXPIRETIME", b"k"]), b":4102444800\r\n");
+    exec(&s, &[b"SET", b"k", b"v", b"PXAT", b"4102444800123"]);
+    assert_eq!(exec(&s, &[b"PEXPIRETIME", b"k"]), b":4102444800123\r\n");
+    // A repeated time option is fine; the last one counts
+    exec(&s, &[b"SET", b"k", b"v", b"EX", b"10", b"EX", b"20"]);
+    assert_eq!(exec(&s, &[b"TTL", b"k"]), b":20\r\n");
+    // A time that has passed makes the new value expire at once
+    assert_eq!(exec(&s, &[b"SET", b"a", b"v", b"PXAT", b"1"]), b"+OK\r\n");
+    assert_eq!(exec(&s, &[b"EXISTS", b"a"]), b":0\r\n");
+}
+
+#[test]
+fn set_option_errors_match_redis() {
+    let s = shard();
+    let syntax = b"-ERR syntax error\r\n";
+    let invalid = b"-ERR invalid expire time in 'set' command\r\n";
+    let cases: [(&[&[u8]], &[u8]); 14] = [
+        (&[b"SET", b"k", b"v", b"NX", b"XX"], syntax),
+        (&[b"SET", b"k", b"v", b"EX", b"10", b"PX", b"100"], syntax),
+        (&[b"SET", b"k", b"v", b"EX", b"10", b"KEEPTTL"], syntax),
+        (&[b"SET", b"k", b"v", b"KEEPTTL", b"EX", b"1"], syntax),
+        (&[b"SET", b"k", b"v", b"EX"], syntax),
+        (&[b"SET", b"k", b"v", b"FOO"], syntax),
+        (&[b"SET", b"k", b"v", b"PERSIST"], syntax),
+        // Options are checked before the time
+        (&[b"SET", b"k", b"v", b"EX", b"abc", b"FOO"], syntax),
+        (
+            &[b"SET", b"k", b"v", b"EX", b"abc"],
+            b"-ERR value is not an integer or out of range\r\n",
+        ),
+        (&[b"SET", b"k", b"v", b"EX", b"0"], invalid),
+        (&[b"SET", b"k", b"v", b"PX", b"-1"], invalid),
+        (&[b"SET", b"k", b"v", b"EXAT", b"0"], invalid),
+        (&[b"SET", b"k", b"v", b"EX", b"9223372036854775"], invalid),
+        (&[b"SET", b"k", b"v", b"EX", b"9223372036854776"], invalid),
+    ];
+    for (args, expected) in cases {
+        assert_eq!(exec(&s, args), expected, "{args:?}");
+    }
+    // None of them wrote the key
+    assert_eq!(exec(&s, &[b"EXISTS", b"k"]), b":0\r\n");
+}
+
+#[test]
+fn setex_psetex_setnx_getset_and_getdel() {
+    let s = shard();
+    assert_eq!(exec(&s, &[b"SETEX", b"k", b"10", b"v"]), b"+OK\r\n");
+    assert_eq!(exec(&s, &[b"TTL", b"k"]), b":10\r\n");
+    assert_eq!(exec(&s, &[b"PSETEX", b"k", b"5000", b"v"]), b"+OK\r\n");
+    assert_eq!(exec(&s, &[b"TTL", b"k"]), b":5\r\n");
     assert_eq!(
-        exec(&shard(), &[b"SET", b"k", b"v", b"nx"]),
-        b"-ERR SET option 'NX' is not supported\r\n"
+        exec(&s, &[b"SETEX", b"k", b"0", b"v"]),
+        b"-ERR invalid expire time in 'setex' command\r\n"
+    );
+    assert_eq!(
+        exec(&s, &[b"PSETEX", b"k", b"-5", b"v"]),
+        b"-ERR invalid expire time in 'psetex' command\r\n"
+    );
+    assert_eq!(
+        exec(&s, &[b"SETEX", b"k", b"abc", b"v"]),
+        b"-ERR value is not an integer or out of range\r\n"
+    );
+    assert_eq!(exec(&s, &[b"SETNX", b"n", b"1"]), b":1\r\n");
+    assert_eq!(exec(&s, &[b"SETNX", b"n", b"2"]), b":0\r\n");
+    assert_eq!(exec(&s, &[b"GETSET", b"n", b"3"]), b"$1\r\n1\r\n");
+    assert_eq!(exec(&s, &[b"GETSET", b"newkey", b"x"]), b"$-1\r\n");
+    // GETSET removes the expiry, like SET
+    assert_eq!(exec(&s, &[b"GETSET", b"k", b"w"]), b"$1\r\nv\r\n");
+    assert_eq!(exec(&s, &[b"TTL", b"k"]), b":-1\r\n");
+    assert_eq!(exec(&s, &[b"GETDEL", b"n"]), b"$1\r\n3\r\n");
+    assert_eq!(exec(&s, &[b"GETDEL", b"n"]), b"$-1\r\n");
+    for name in ["getdel", "getex", "setnx", "getset", "setex"] {
+        let upper = name.to_uppercase();
+        assert_eq!(exec(&s, &[upper.as_bytes()]), arity_error(name));
+    }
+}
+
+#[test]
+fn getex_reads_and_changes_the_expiry() {
+    let s = shard();
+    exec(&s, &[b"SET", b"g", b"v"]);
+    assert_eq!(exec(&s, &[b"GETEX", b"g", b"EX", b"100"]), b"$1\r\nv\r\n");
+    assert_eq!(exec(&s, &[b"TTL", b"g"]), b":100\r\n");
+    assert_eq!(exec(&s, &[b"GETEX", b"g", b"PERSIST"]), b"$1\r\nv\r\n");
+    assert_eq!(exec(&s, &[b"TTL", b"g"]), b":-1\r\n");
+    assert_eq!(exec(&s, &[b"GETEX", b"g"]), b"$1\r\nv\r\n");
+    assert_eq!(
+        exec(&s, &[b"GETEX", b"g", b"EX", b"10", b"EX", b"20"]),
+        b"$1\r\nv\r\n"
+    );
+    assert_eq!(exec(&s, &[b"TTL", b"g"]), b":20\r\n");
+    // The time is only checked when the key exists
+    assert_eq!(exec(&s, &[b"GETEX", b"missing", b"EX", b"abc"]), b"$-1\r\n");
+    assert_eq!(
+        exec(&s, &[b"GETEX", b"g", b"EX", b"abc"]),
+        b"-ERR value is not an integer or out of range\r\n"
+    );
+    assert_eq!(
+        exec(&s, &[b"GETEX", b"g", b"EX", b"0"]),
+        b"-ERR invalid expire time in 'getex' command\r\n"
+    );
+    // The options are checked first
+    for args in [
+        &[&b"GETEX"[..], b"missing", b"NX"][..],
+        &[b"GETEX", b"g", b"KEEPTTL"],
+        &[b"GETEX", b"g", b"EX", b"10", b"PERSIST"],
+    ] {
+        assert_eq!(exec(&s, args), b"-ERR syntax error\r\n");
+    }
+    // An absolute time that has passed deletes the key after replying
+    assert_eq!(exec(&s, &[b"GETEX", b"g", b"PXAT", b"1"]), b"$1\r\nv\r\n");
+    assert_eq!(exec(&s, &[b"EXISTS", b"g"]), b":0\r\n");
+}
+
+#[test]
+fn msetnx_sets_every_pair_only_if_no_key_exists() {
+    let s = shard();
+    assert_eq!(exec(&s, &[b"MSETNX", b"m1", b"1", b"m2", b"2"]), b":1\r\n");
+    assert_eq!(exec(&s, &[b"MSETNX", b"m2", b"x", b"m3", b"3"]), b":0\r\n");
+    assert_eq!(exec(&s, &[b"EXISTS", b"m3"]), b":0\r\n");
+    assert_eq!(exec(&s, &[b"GET", b"m2"]), b"$1\r\n2\r\n");
+    assert_eq!(exec(&s, &[b"MSETNX", b"m4"]), arity_error("msetnx"));
+    assert_eq!(
+        exec(&s, &[b"MSETNX", b"m4", b"1", b"m5"]),
+        arity_error("msetnx")
     );
 }
 
 #[test]
-fn set_with_unknown_token_is_a_syntax_error() {
-    let s = shard();
-    assert_eq!(
-        exec(&s, &[b"SET", b"k", b"v", b"FOO"]),
-        b"-ERR syntax error\r\n"
-    );
-    assert_eq!(exec(&s, &[b"GET", b"k"]), b"$-1\r\n");
+fn concurrent_msetnx_with_a_shared_key_has_one_winner() {
+    for round in 0..200 {
+        let s = std::sync::Arc::new(shard());
+        let shared = format!("shared:{round}");
+        let replies: Vec<Vec<u8>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..2)
+                .map(|t| {
+                    let (s, shared) = (&s, &shared);
+                    scope.spawn(move || {
+                        let own = format!("own:{t}");
+                        exec(
+                            s,
+                            &[b"MSETNX", own.as_bytes(), b"1", shared.as_bytes(), b"1"],
+                        )
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        });
+        let winners = replies.iter().filter(|r| r.as_slice() == b":1\r\n").count();
+        assert_eq!(winners, 1, "round {round}: {replies:?}");
+    }
 }
 
 #[test]

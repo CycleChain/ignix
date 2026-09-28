@@ -223,6 +223,107 @@ fn passed_expiry_and_persist_are_logged_and_no_ops_are_not() {
     assert!(!contains(&data, b"missing"), "{text}");
 }
 
+/// The PXAT time of the `SET key value PXAT time` record for `key`
+fn set_pxat_time(data: &[u8], key: &[u8], value: &[u8]) -> i64 {
+    let head = [
+        b"*5\r\n$3\r\nSET\r\n$".as_slice(),
+        key.len().to_string().as_bytes(),
+        b"\r\n",
+        key,
+        b"\r\n$",
+        value.len().to_string().as_bytes(),
+        b"\r\n",
+        value,
+        b"\r\n$4\r\nPXAT\r\n$",
+    ]
+    .concat();
+    let start = data
+        .windows(head.len())
+        .position(|w| w == head.as_slice())
+        .unwrap_or_else(|| {
+            panic!(
+                "no SET PXAT for {key:?}: {:?}",
+                String::from_utf8_lossy(data)
+            )
+        })
+        + head.len();
+    let rest = &data[start..];
+    let header_end = rest.windows(2).position(|w| w == b"\r\n").unwrap();
+    let len: usize = std::str::from_utf8(&rest[..header_end])
+        .unwrap()
+        .parse()
+        .unwrap();
+    let time = &rest[header_end + 2..header_end + 2 + len];
+    std::str::from_utf8(time).unwrap().parse().unwrap()
+}
+
+#[test]
+fn set_with_an_expiry_is_logged_with_an_absolute_pxat() {
+    let before = unix_ms();
+    let data = aof_after(
+        "set-pxat",
+        &[
+            &[b"SET", b"s", b"1", b"EX", b"100"],
+            &[b"SETEX", b"x", b"100", b"2"],
+            &[b"PSETEX", b"p", b"5000", b"3"],
+            &[b"SET", b"a", b"4", b"PXAT", b"4102444800000"],
+        ],
+    );
+    let after = unix_ms();
+    let within = |key: &[u8], value: &[u8], offset: i64| {
+        let at = set_pxat_time(&data, key, value);
+        assert!(before + offset <= at && at <= after + offset, "{at}");
+    };
+    within(b"s", b"1", 100_000);
+    within(b"x", b"2", 100_000);
+    within(b"p", b"3", 5_000);
+    assert_eq!(set_pxat_time(&data, b"a", b"4"), 4_102_444_800_000);
+}
+
+#[test]
+fn set_family_logs_what_a_replay_needs() {
+    let data = aof_after(
+        "set-family",
+        &[
+            &[b"SET", b"k", b"1", b"KEEPTTL"],
+            &[b"SET", b"k", b"2", b"NX"],
+            &[b"SETNX", b"k", b"3"],
+            &[b"SETNX", b"n", b"4"],
+            &[b"GETSET", b"g", b"5"],
+            &[b"GETDEL", b"g"],
+            &[b"GETDEL", b"missing"],
+            &[b"GETEX", b"n", b"PXAT", b"4102444800000"],
+            &[b"GETEX", b"n", b"PERSIST"],
+            &[b"GETEX", b"n", b"PXAT", b"1"],
+            &[b"MSETNX", b"m1", b"6", b"m2", b"7"],
+            &[b"MSETNX", b"m2", b"8", b"m3", b"9"],
+        ],
+    );
+    let text = String::from_utf8_lossy(&data);
+    let has = |record: &[u8]| contains(&data, record);
+    assert!(
+        has(b"*4\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\n1\r\n$7\r\nKEEPTTL\r\n"),
+        "{text}"
+    );
+    // Commands that did not set anything are not logged
+    assert!(
+        !has(b"$1\r\nk\r\n$1\r\n2\r\n") && !has(b"$1\r\nk\r\n$1\r\n3\r\n"),
+        "{text}"
+    );
+    assert!(has(b"*3\r\n$3\r\nSET\r\n$1\r\nn\r\n$1\r\n4\r\n"), "{text}");
+    assert!(has(b"*3\r\n$3\r\nSET\r\n$1\r\ng\r\n$1\r\n5\r\n"), "{text}");
+    assert!(has(b"*2\r\n$3\r\nDEL\r\n$1\r\ng\r\n"), "{text}");
+    assert!(!has(b"missing"), "{text}");
+    assert_eq!(pexpireat_time(&data, b"n"), 4_102_444_800_000);
+    assert!(has(b"*2\r\n$7\r\nPERSIST\r\n$1\r\nn\r\n"), "{text}");
+    assert!(has(b"*2\r\n$3\r\nDEL\r\n$1\r\nn\r\n"), "{text}");
+    assert!(
+        has(b"*5\r\n$4\r\nMSET\r\n$2\r\nm1\r\n$1\r\n6\r\n$2\r\nm2\r\n$1\r\n7\r\n"),
+        "{text}"
+    );
+    assert!(!has(b"$2\r\nm3\r\n"), "{text}");
+}
+
 #[test]
 fn failed_incr_is_not_logged() {
     let data = aof_after("incr", &[&[b"SET", b"t", b"abc"], &[b"INCR", b"t"]]);

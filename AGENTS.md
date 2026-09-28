@@ -74,9 +74,14 @@ boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler 
 - `src/session.rs`: `Session`, bağlantı başına durum: istemci kimliği (bağlantı başına bir kez
   genel sayaçtan), protokol (RESP2/RESP3), istemci adı, kütüphane adı ve sürümü (`CLIENT
   SETINFO`), QUIT'in kapanış bayrağı.
-- `src/shard.rs`: `Shard { id, dict, aof }`, 64 bayta hizalı (`test_shard_alignment` sınar);
-  komut semantiği `exec_session` içinde (`exec` yeni bir oturumla onu çağırır). Sunucuda tek
-  bir `Arc<Shard>` paylaşılır.
+- `src/shard.rs`: `Shard { id, dict, aof, stats }`, 64 bayta hizalı (`test_shard_alignment`
+  sınar). Komut semantiği iki eşleşmede: sık komutlar (PING, GET, SET, DEL/UNLINK, EXISTS,
+  INCR ailesi, MGET, MSET) her zaman inline edilen `exec_frequent`'te, diğerleri
+  `#[inline(never)]` `exec_other`'da; `exec` ve `exec_session` önce `exec_frequent`'i dener.
+  Tek büyük eşleşmenin yığın çerçevesi ve drop bayrakları GET'e ~50 komut ekliyordu (callgrind);
+  `Cmd`'nin `#[repr(u8)]` olması da etiketi bir alanın boş değerlerine gizlemeyi önler. Sık bir
+  komut eklerken ya da bu yapıyı değiştirirken callgrind ile ölç. Sunucuda tek bir
+  `Arc<Shard>` paylaşılır.
 - `src/storage.rs`: `Dict` = 1024 × `CachePadded<RwLock<hashbrown::HashMap<Bytes, Entry>>>`
   (anahtar bir kez hash'lenir, parça ve yuva aynı hash'ten; `Entry { value, expires_at }`);
   `get`, `set`, `del`, `rename`, `exists`, `len`, `clear`, `incr`/`incr_by` (parçanın yazma
@@ -102,7 +107,8 @@ boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler 
 Desteklenen komutlar: PING, ECHO, QUIT, SELECT (yalnızca 0), HELLO, CLIENT (ID, GETNAME,
 SETNAME, SETINFO, HELP), INFO, CONFIG (GET, HELP), GET, SET, DEL, UNLINK, EXISTS, TYPE, DBSIZE,
 KEYS, SCAN, FLUSHDB, FLUSHALL, INCR, INCRBY, DECR, DECRBY, RENAME, MGET, MSET, EXPIRE, PEXPIRE,
-EXPIREAT, PEXPIREAT, TTL, PTTL, EXPIRETIME, PEXPIRETIME, PERSIST.
+EXPIREAT, PEXPIREAT, TTL, PTTL, EXPIRETIME, PEXPIRETIME, PERSIST; SET seçenekleri (NX, XX, GET, EX,
+PX, EXAT, PXAT, KEEPTTL), SETEX, PSETEX, SETNX, GETSET, GETDEL, GETEX, MSETNX.
 
 ## Dizin haritası
 
@@ -134,7 +140,7 @@ Bugünkü `main` için geçerlidir. Görevin konusu değilse düzeltmeye kalkma;
 - **Protokol kapsamı:** RESP2 ve `HELLO 3` sonrası RESP3 (`Session::protocol`; null `_`, map
   `%` olur); istekler yalnızca RESP dizisi biçiminde, satır içi (inline) komutlar yok. Geçersiz komut `-ERR ...` alır ve bağlantı sürer; bozuk RESP
   `-ERR Protocol error: ...` alır ve bağlantı kapanır (Redis gibi). Hata metinleri Redis 7 ile
-  aynıdır; SET seçenekleri (EX, PX, NX, XX, GET...) açık bir hatayla reddedilir.
+  aynıdır. Seçeneksiz `SET k v` sıcak yol olarak `Cmd::Set` kalır; seçenekli hâli `Cmd::SetWith`.
 - **AOF yalnızca yazılır:** açılışta geri yüklenmez. Kayıtlar ikili güvenlidir ve DEL de
   yazılır, ama iş parçacıkları arasında AOF'a yazma sırası ile uygulama sırası aynı
   olmayabilir (geri yükleme eklenirse ele alınmalı).
