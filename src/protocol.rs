@@ -9,6 +9,7 @@
 use crate::commands::{self, CommandSpec, Kind, SubcommandSpec};
 use anyhow::{bail, Result};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
+use std::ops::Range;
 
 /// Largest element count accepted in one request (Redis rejects counts above `INT_MAX`).
 const MAX_MULTIBULK_LEN: i64 = i32::MAX as i64;
@@ -374,13 +375,22 @@ fn read_int_line(data: &[u8], pos: usize, invalid: &'static str) -> Result<Optio
     }
 }
 
+/// A complete request frame at the start of a buffer
+struct Frame {
+    /// Its length in bytes
+    len: usize,
+    /// Where its command name is in the buffer, and the arguments after it;
+    /// `None` for a frame of no elements, which Redis ignores
+    request: Option<(Range<usize>, Vec<Bytes>)>,
+}
+
 /// Read one complete request frame: `*<n>\r\n` followed by `n` bulk strings.
 ///
-/// Returns `Ok(None)` when more data is needed and the consumed length with
-/// the arguments otherwise. Malformed input is an error whose message is a
-/// complete RESP error line (`ERR Protocol error: ...`). A frame with `n <= 0`
-/// has no arguments; Redis ignores such requests.
-fn read_frame(data: &[u8]) -> Result<Option<(usize, Vec<Bytes>)>> {
+/// Returns `Ok(None)` when more data is needed. Malformed input is an error
+/// whose message is a complete RESP error line (`ERR Protocol error: ...`).
+/// The command name is left in `data`, and only the arguments are copied:
+/// looking the command up needs no copy of its own.
+fn read_frame(data: &[u8]) -> Result<Option<Frame>> {
     RequestParser::default().next_frame(data)
 }
 
@@ -398,8 +408,11 @@ pub struct RequestParser {
     cursor: usize,
     /// Elements of the current request still to be read
     remaining: usize,
-    /// Elements of the current request read so far
-    items: Vec<Bytes>,
+    /// Where the command name of the current request is in the buffer, once
+    /// it has been read
+    name: Option<Range<usize>>,
+    /// Arguments of the current request read so far, after the name
+    args: Vec<Bytes>,
 }
 
 impl RequestParser {
@@ -415,7 +428,7 @@ impl RequestParser {
     /// they are. After an error, or when the buffer is cleared, call
     /// [`RequestParser::reset`] before parsing again.
     pub fn parse(&mut self, buf: &mut BytesMut, out: &mut Vec<Request>) -> Result<()> {
-        self.parse_with(buf, out, Parsed::into_request)
+        self.parse_with(buf, out, into_request)
     }
 
     /// Like [`RequestParser::parse`], but keeps apart the invalid requests
@@ -431,14 +444,13 @@ impl RequestParser {
         convert: impl Fn(Parsed) -> T,
     ) -> Result<()> {
         loop {
-            let Some((consumed, items)) = self.next_frame(&buf[..])? else {
+            let Some(frame) = self.next_frame(&buf[..])? else {
                 return Ok(());
             };
-            buf.advance(consumed);
-            if items.is_empty() {
-                continue;
+            if let Some((name, args)) = frame.request {
+                out.push(convert(command_from_frame(&buf[name], args)));
             }
-            out.push(convert(command_from_frame(items)));
+            buf.advance(frame.len);
         }
     }
 
@@ -448,7 +460,7 @@ impl RequestParser {
     }
 
     /// Continue reading the frame at the start of `data`; see [`read_frame`].
-    fn next_frame(&mut self, data: &[u8]) -> Result<Option<(usize, Vec<Bytes>)>> {
+    fn next_frame(&mut self, data: &[u8]) -> Result<Option<Frame>> {
         // The caller removed bytes it should have kept: start over.
         if self.cursor > data.len() {
             self.reset();
@@ -470,13 +482,17 @@ impl RequestParser {
                 bail!(INVALID_MULTIBULK);
             }
             if count <= 0 {
-                return Ok(Some((cursor, Vec::new())));
+                return Ok(Some(Frame {
+                    len: cursor,
+                    request: None,
+                }));
             }
             let count = count as usize;
-            // Do not trust the announced count for preallocation: every
-            // element needs at least MIN_ELEMENT_LEN bytes of input that must
-            // actually arrive.
-            self.items = Vec::with_capacity(count.min((data.len() - cursor) / MIN_ELEMENT_LEN + 1));
+            // Room for the arguments after the name. Do not trust the
+            // announced count for preallocation: every element needs at least
+            // MIN_ELEMENT_LEN bytes of input that must actually arrive.
+            self.args =
+                Vec::with_capacity((count - 1).min((data.len() - cursor) / MIN_ELEMENT_LEN));
             self.remaining = count;
             self.cursor = cursor;
         }
@@ -504,70 +520,91 @@ impl RequestParser {
             if terminator != b"\r\n" {
                 bail!(INVALID_BULK);
             }
-            self.items.push(Bytes::copy_from_slice(&data[start..end]));
+            if self.name.is_none() {
+                self.name = Some(start..end);
+            } else {
+                self.args.push(Bytes::copy_from_slice(&data[start..end]));
+            }
             self.cursor = end + 2;
             self.remaining -= 1;
         }
-        let consumed = std::mem::take(&mut self.cursor);
-        Ok(Some((consumed, std::mem::take(&mut self.items))))
+        let len = std::mem::take(&mut self.cursor);
+        let request = self
+            .name
+            .take()
+            .map(|name| (name, std::mem::take(&mut self.args)));
+        Ok(Some(Frame { len, request }))
     }
 }
 
-/// A request as the server sees it: like [`Request`], with the invalid
-/// requests split by when Redis rejects them
+/// Why a well-formed request is not a valid command, split by when Redis
+/// rejects it. Holds the complete error line to reply with.
 #[derive(Debug, Clone, PartialEq)]
-pub(crate) enum Parsed {
-    Cmd(Cmd),
+pub(crate) enum Refusal {
     /// Rejected whether or not the client has authenticated: an unknown
     /// command or subcommand, a wrong number of arguments, or an invalid
-    /// argument of a command allowed before authenticating. Holds the
-    /// complete error line.
+    /// argument of a command allowed before authenticating
     Invalid(String),
     /// Rejected by the command's own checks, which Redis only reaches for an
     /// authenticated client; another client gets `NOAUTH` instead
     Rejected(String),
 }
 
-impl Parsed {
-    fn into_request(self) -> Request {
+impl Refusal {
+    /// The error line
+    fn into_message(self) -> String {
         match self {
-            Parsed::Cmd(cmd) => Request::Cmd(cmd),
-            Parsed::Invalid(message) | Parsed::Rejected(message) => Request::Invalid(message),
+            Refusal::Invalid(message) | Refusal::Rejected(message) => message,
         }
     }
 
-    fn into_result(self) -> Result<Cmd> {
-        match self {
-            Parsed::Cmd(cmd) => Ok(cmd),
-            Parsed::Invalid(message) | Parsed::Rejected(message) => {
-                Err(anyhow::Error::msg(message))
-            }
-        }
+    /// The error as `parse_one` and `parse_many` return it
+    fn into_error(self) -> anyhow::Error {
+        anyhow::Error::msg(self.into_message())
     }
 }
 
-/// Build a command from the arguments of one request frame, or the complete
-/// RESP error line to reply with, worded like Redis 7.
+/// The errors of a command's own checks are [`Refusal::Rejected`]
+impl From<String> for Refusal {
+    fn from(message: String) -> Self {
+        Refusal::Rejected(message)
+    }
+}
+
+/// A request as the server sees it: like [`Request`], with the invalid
+/// requests split by when Redis rejects them
+///
+/// A plain `Result`, so that the command the parser builds is written in
+/// place: moving it into another enum copies all of it.
+pub(crate) type Parsed = std::result::Result<Cmd, Refusal>;
+
+/// The public form of a parsed request
+fn into_request(parsed: Parsed) -> Request {
+    match parsed {
+        Ok(cmd) => Request::Cmd(cmd),
+        Err(refusal) => Request::Invalid(refusal.into_message()),
+    }
+}
+
+/// Build a command from the name and the other arguments (`items`) of one
+/// request frame, or say why it is refused with the error line Redis 7
+/// replies with.
 ///
 /// The command name, the number of arguments and the subcommand are checked
 /// first, as Redis does before it checks authentication.
-fn command_from_frame(items: Vec<Bytes>) -> Parsed {
-    let Some(spec) = commands::lookup(&items[0]) else {
-        return Parsed::Invalid(unknown_command_error(&items));
+fn command_from_frame(name: &[u8], items: Vec<Bytes>) -> Parsed {
+    let Some(spec) = commands::lookup(name) else {
+        return Err(Refusal::Invalid(unknown_command_error(name, &items)));
     };
-    if !spec.arity_matches(items.len()) {
-        return Parsed::Invalid(arity_error(spec.name));
+    if !spec.arity_matches(items.len() + 1) {
+        return Err(Refusal::Invalid(arity_error(spec.name)));
     }
-    if matches!(spec.kind, Kind::Client | Kind::Config | Kind::Command) && items.len() > 1 {
-        if let Err(error) = subcommand(spec, &items[1..]) {
-            return Parsed::Invalid(error);
+    if matches!(spec.kind, Kind::Client | Kind::Config | Kind::Command) && !items.is_empty() {
+        if let Err(error) = subcommand(spec, &items) {
+            return Err(Refusal::Invalid(error));
         }
     }
-    match build_command(spec, items) {
-        Ok(cmd) => Parsed::Cmd(cmd),
-        Err(error) if spec.kind.allowed_before_auth() => Parsed::Invalid(error),
-        Err(error) => Parsed::Rejected(error),
-    }
+    build_command(spec, items)
 }
 
 /// `ERR wrong number of arguments for '<name>' command`
@@ -575,13 +612,18 @@ fn arity_error(name: &str) -> String {
     format!("ERR wrong number of arguments for '{name}' command")
 }
 
-/// Build the command `spec` from the arguments of its request frame, whose
-/// number `command_from_frame` has checked, with the checks Redis makes in
-/// the command itself.
+/// Build the command `spec` from the arguments after its name, whose number
+/// `command_from_frame` has checked, with the checks Redis makes in the
+/// command itself.
+///
+/// Their errors are [`Refusal::Rejected`], except for the commands allowed
+/// before authenticating (`AUTH`, `HELLO`, `QUIT`): Redis reports those to any
+/// client.
 #[inline(always)]
-fn build_command(spec: &CommandSpec, mut items: Vec<Bytes>) -> std::result::Result<Cmd, String> {
+fn build_command(spec: &CommandSpec, mut items: Vec<Bytes>) -> Parsed {
     let kind = spec.kind;
-    let argc = items.len();
+    // Counted like Redis, with the command name
+    let argc = items.len() + 1;
     let arity_error = || arity_error(spec.name);
     // Limits Redis checks in the commands themselves, with the same error
     let arity_ok = match kind {
@@ -590,11 +632,9 @@ fn build_command(spec: &CommandSpec, mut items: Vec<Bytes>) -> std::result::Resu
         _ => true,
     };
     if !arity_ok {
-        return Err(arity_error());
+        return Err(arity_error().into());
     }
 
-    // Drop the command name; what is left are the arguments.
-    items.remove(0);
     let cmd = match kind {
         Kind::Ping => Cmd::Ping(items.pop()),
         Kind::Del => Cmd::Del(items),
@@ -609,7 +649,7 @@ fn build_command(spec: &CommandSpec, mut items: Vec<Bytes>) -> std::result::Resu
                 [] => FlushMode::Sync,
                 [option] if option.eq_ignore_ascii_case(b"sync") => FlushMode::Sync,
                 [option] if option.eq_ignore_ascii_case(b"async") => FlushMode::Async,
-                _ => return Err("ERR syntax error".to_string()),
+                _ => return Err("ERR syntax error".to_string().into()),
             };
             if kind == Kind::FlushDb {
                 Cmd::FlushDb(mode)
@@ -754,11 +794,15 @@ fn build_command(spec: &CommandSpec, mut items: Vec<Bytes>) -> std::result::Resu
                 Some(version) => match parse_canonical_i64(&version) {
                     Some(2) => Some(Protocol::Resp2),
                     Some(3) => Some(Protocol::Resp3),
-                    Some(_) => return Err("NOPROTO unsupported protocol version".to_string()),
+                    Some(_) => {
+                        return Err(Refusal::Invalid(
+                            "NOPROTO unsupported protocol version".to_string(),
+                        ))
+                    }
                     None => {
-                        return Err(
-                            "ERR Protocol version is not an integer or out of range".to_string()
-                        )
+                        return Err(Refusal::Invalid(
+                            "ERR Protocol version is not an integer or out of range".to_string(),
+                        ))
                     }
                 },
             };
@@ -778,7 +822,7 @@ fn build_command(spec: &CommandSpec, mut items: Vec<Bytes>) -> std::result::Resu
                     username: Some(username),
                     password,
                 },
-                _ => return Err("ERR syntax error".to_string()),
+                _ => return Err(Refusal::Invalid("ERR syntax error".to_string())),
             }
         }
         Kind::Select => {
@@ -1014,15 +1058,14 @@ pub(crate) fn is_printable_ascii(value: &[u8]) -> bool {
 /// `ERR unknown command ...`, truncated like Redis: the name is cut to 128
 /// bytes, and quoted arguments are appended while that part is shorter than
 /// 128 bytes (each one cut to the remaining room).
-fn unknown_command_error(items: &[Bytes]) -> String {
+fn unknown_command_error(name: &[u8], args: &[Bytes]) -> String {
     const LIMIT: usize = 128;
-    let name = &items[0];
     let mut msg = Vec::with_capacity(96);
     msg.extend_from_slice(b"ERR unknown command '");
     msg.extend_from_slice(&name[..name.len().min(LIMIT)]);
     msg.extend_from_slice(b"', with args beginning with: ");
     let args_start = msg.len();
-    for arg in &items[1..] {
+    for arg in args {
         let used = msg.len() - args_start;
         if used >= LIMIT {
             break;
@@ -1146,14 +1189,15 @@ pub(crate) fn resolve_expiry(
 pub fn parse_one(data: &[u8]) -> Result<Option<(usize, Cmd)>> {
     let mut consumed = 0;
     loop {
-        let Some((len, items)) = read_frame(&data[consumed..])? else {
+        let rest = &data[consumed..];
+        let Some(frame) = read_frame(rest)? else {
             return Ok(None);
         };
-        consumed += len;
-        if items.is_empty() {
+        consumed += frame.len;
+        let Some((name, items)) = frame.request else {
             continue;
-        }
-        let cmd = command_from_frame(items).into_result()?;
+        };
+        let cmd = command_from_frame(&rest[name], items).map_err(Refusal::into_error)?;
         return Ok(Some((consumed, cmd)));
     }
 }
@@ -1173,14 +1217,19 @@ pub fn parse_one(data: &[u8]) -> Result<Option<(usize, Cmd)>> {
 /// * `out` - Vector to store parsed commands
 pub fn parse_many(buf: &mut BytesMut, out: &mut Vec<Cmd>) -> Result<()> {
     loop {
-        let Some((consumed, items)) = read_frame(&buf[..])? else {
+        let Some(frame) = read_frame(&buf[..])? else {
             return Ok(());
         };
-        buf.advance(consumed);
-        if items.is_empty() {
-            continue;
+        if let Some((name, items)) = frame.request {
+            match command_from_frame(&buf[name], items) {
+                Ok(cmd) => out.push(cmd),
+                Err(refusal) => {
+                    buf.advance(frame.len);
+                    return Err(refusal.into_error());
+                }
+            }
         }
-        out.push(command_from_frame(items).into_result()?);
+        buf.advance(frame.len);
     }
 }
 

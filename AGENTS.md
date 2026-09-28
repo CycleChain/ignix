@@ -54,14 +54,17 @@ boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler 
 - `src/net_uring.rs`: Linux'a özgü io_uring arka ucu (`#![cfg(target_os = "linux")]`); tek iş
   parçacığı, SO_REUSEPORT yok, `unsafe` SQE gönderimleri. `--backend=uring` ile seçilir.
 - `src/protocol.rs`: `Cmd` ve `Value` enum'ları (`#[non_exhaustive]`); çerçeve okuma
-  (`read_frame`, `read_int_line`, Redis `string2ll` karşılığı `parse_canonical_i64`), komut ve
-  argüman denetimi (`command_from_frame`, Redis hata metinleri), `parse_one`, `parse_many`,
+  (`read_frame`, `read_int_line`, Redis `string2ll` karşılığı `parse_canonical_i64`; komut adı
+  kopyalanmaz, tampondaki yeri tutulur), komut ve argüman denetimi (`command_from_frame`, Redis
+  hata metinleri), `parse_one`, `parse_many`,
   `parse_requests` ve `Request`; ayırmasız yanıt yazıcıları (`write_simple`, `write_error`,
   `write_bulk`, `write_null`, `write_integer`, `write_array_len`); eski, `Vec<u8>` döndüren
   `resp_*`.
 - `src/commands.rs`: statik komut tablosu (`CommandSpec { name, arity, kind, flags, keys, acl,
   tips }`, tek listeden `commands!` makrosuyla) ve CLIENT, CONFIG, COMMAND alt komut tablosu
-  (`SubcommandSpec`); `lookup` adı küçük harfe indirgenmiş bir `u128`'e paketleyip eşler.
+  (`SubcommandSpec`); `lookup` adı küçük harfe indirgenmiş bir `u128`'e paketler ve derleme
+  zamanında kurulan kusursuz bir hash tablosunda arar (her istekte çalışır; değiştirirken
+  callgrind ile ölç).
   Argüman sayıları, alt komutların varlığı ve COMMAND INFO buradan gelir; bayrak, anahtar
   konumu, ACL kategorisi ve ipuçları Redis 7.0.15'in `COMMAND INFO` çıktısıyla aynıdır. Yeni
   komut önce buraya, Redis'in o komut için verdiği değerlerle eklenir. `COMMAND DOCS` bilerek
@@ -80,9 +83,9 @@ boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler 
   SETINFO`), QUIT'in kapanış bayrağı, istenen parola (`Password`, sabit zamanlı karşılaştırma,
   `Debug`'da gizli) ve `needs_auth`. Kimlik doğrulama sırası Redis 7 gibidir: bilinmeyen komut
   ya da alt komut ve argüman sayısı hatası NOAUTH'tan önce, komutun kendi argüman denetimleri
-  sonra gelir. Ayrıştırıcı bunun için içte `Parsed::{Cmd, Invalid, Rejected}` üretir
-  (`RequestParser::parse_split`); genel `Request` değişmedi. NOAUTH kapısı `exec_session`'da,
-  `Rejected` için `handle_input`'ta.
+  sonra gelir. Ayrıştırıcı bunun için içte `Parsed` = `Result<Cmd, Refusal>` üretir
+  (`Refusal::{Invalid, Rejected}`, `RequestParser::parse_split`); genel `Request` değişmedi.
+  NOAUTH kapısı `exec_session`'da, `Refusal::Rejected` için `handle_input`'ta.
 - `src/shard.rs`: `Shard { id, dict, aof, stats }`, 64 bayta hizalı (`test_shard_alignment`
   sınar). Komut semantiği iki eşleşmede: sık komutlar (PING, GET, SET, DEL/UNLINK, EXISTS,
   INCR ailesi, MGET, MSET) her zaman inline edilen `exec_frequent`'te, diğerleri

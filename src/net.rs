@@ -6,7 +6,7 @@
  * using mio for async I/O operations.
  */
 
-use crate::protocol::{write_error, Parsed, RequestParser};
+use crate::protocol::{write_error, Parsed, Refusal, RequestParser};
 use crate::session::{Password, Session, NOAUTH};
 use crate::shard::{spawn_active_expiry, Shard};
 use crate::stats::{Listener, LocalCounter};
@@ -236,11 +236,12 @@ pub(crate) fn handle_input(
     let parsed = parser.parse_split(rbuf, reqs);
     for req in reqs.drain(..) {
         match req {
-            Parsed::Cmd(cmd) => shard.exec_session(cmd, session, wbuf),
-            Parsed::Invalid(message) => write_error(&message, wbuf),
+            Ok(cmd) => shard.exec_session(cmd, session, wbuf),
             // Redis checks authentication before the command's own checks
-            Parsed::Rejected(_) if !session.is_authenticated() => write_error(NOAUTH, wbuf),
-            Parsed::Rejected(message) => write_error(&message, wbuf),
+            Err(Refusal::Rejected(_)) if !session.is_authenticated() => write_error(NOAUTH, wbuf),
+            Err(Refusal::Invalid(message) | Refusal::Rejected(message)) => {
+                write_error(&message, wbuf)
+            }
         }
         if session.is_closing() {
             // Dropping the iterator drops the requests after QUIT
@@ -546,7 +547,7 @@ mod tests {
     fn before_auth_errors_come_in_redis_order() {
         let shard = Shard::new(0, None);
         let mut session = Session::with_password(b"secret");
-        let requests: [&[&[u8]]; 12] = [
+        let requests: [&[&[u8]]; 13] = [
             // The command's own checks come after authentication...
             &[b"SET", b"k", b"v", b"EX", b"abc"],
             &[b"MSET", b"a", b"b", b"c"],
@@ -559,6 +560,7 @@ mod tests {
             &[b"CLIENT", b"SETNAME"],
             // Commands allowed before authentication check everything
             &[b"HELLO", b"4"],
+            &[b"HELLO", b"x"],
             &[b"AUTH", b"a", b"b", b"c"],
             &[b"AUTH", b"secret"],
             &[b"SET", b"k", b"v", b"EX", b"abc"],
@@ -574,6 +576,7 @@ mod tests {
             "-ERR unknown subcommand 'FOO'. Try CLIENT HELP.",
             "-ERR wrong number of arguments for 'client|setname' command",
             "-NOPROTO unsupported protocol version",
+            "-ERR Protocol version is not an integer or out of range",
             "-ERR syntax error",
             "+OK",
             "-ERR value is not an integer or out of range",

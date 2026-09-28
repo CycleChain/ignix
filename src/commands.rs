@@ -55,14 +55,6 @@ pub(crate) enum Kind {
     Command,
 }
 
-impl Kind {
-    /// Whether a client that has not authenticated yet may run the command
-    /// (Redis `no-auth` commands)
-    pub(crate) fn allowed_before_auth(self) -> bool {
-        matches!(self, Kind::Auth | Kind::Hello | Kind::Quit)
-    }
-}
-
 /// The static description of a command
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct CommandSpec {
@@ -215,14 +207,86 @@ const MAX_NAME_LEN: usize = 16;
 /// matched as numbers. Setting bit 5 lowercases ASCII letters and turns no
 /// other byte into a letter, so a name made of letters (as every command
 /// name is) matches in any case and nothing else.
+///
+/// Runs for every request, so it reads the name with a few loads that may
+/// overlap rather than byte by byte.
+#[inline(always)]
 const fn pack(name: &[u8]) -> u128 {
-    let mut bytes = [0u8; MAX_NAME_LEN];
+    /// Bit 5 of eight bytes
+    const CASE: u64 = 0x2020_2020_2020_2020;
+    let len = name.len();
+    // At most eight bytes, from two loads that may overlap
+    let low = match len {
+        0 => return 0,
+        1 => name[0] as u64,
+        2..=3 => le16(name, 0) | le16(name, len - 2) << ((len - 2) * 8),
+        4..=8 => le32(name, 0) | le32(name, len - 4) << ((len - 4) * 8),
+        _ => {
+            let high = (le64(name, len - 8) | CASE) >> ((MAX_NAME_LEN - len) * 8);
+            return (high as u128) << 64 | (le64(name, 0) | CASE) as u128;
+        }
+    };
+    (low | CASE >> ((8 - len) * 8)) as u128
+}
+
+/// Bytes `at..at + 2` of `name`, first byte lowest
+const fn le16(name: &[u8], at: usize) -> u64 {
+    u16::from_le_bytes([name[at], name[at + 1]]) as u64
+}
+
+/// Bytes `at..at + 4` of `name`, first byte lowest
+const fn le32(name: &[u8], at: usize) -> u64 {
+    u32::from_le_bytes([name[at], name[at + 1], name[at + 2], name[at + 3]]) as u64
+}
+
+/// Bytes `at..at + 8` of `name`, first byte lowest
+const fn le64(name: &[u8], at: usize) -> u64 {
+    le32(name, at) | le32(name, at + 4) << 32
+}
+
+/// Slots of the table `lookup` finds commands in: a power of two with room
+/// for a perfect hash of every name
+const SLOTS: usize = 256;
+
+/// No command in this slot
+const EMPTY: u8 = u8::MAX;
+
+/// The slot of a packed name for the multiplier `k` (a multiplicative hash
+/// of the name's two halves, keeping the top bits)
+const fn slot(packed: u128, k: u64) -> usize {
+    let folded = (packed as u64) ^ ((packed >> 64) as u64).rotate_left(31);
+    (folded.wrapping_mul(k) >> (64 - SLOTS.trailing_zeros())) as usize
+}
+
+/// The first multiplier that gives each of `names` a slot of its own,
+/// searched for at compile time
+const fn perfect_multiplier(names: &[u128]) -> u64 {
+    let mut k: u64 = 0x9e37_79b9_7f4a_7c15;
+    'search: loop {
+        let mut used = [false; SLOTS];
+        let mut i = 0;
+        while i < names.len() {
+            let s = slot(names[i], k);
+            if used[s] {
+                k = k.wrapping_add(0x6a09_e667_f3bc_c908);
+                continue 'search;
+            }
+            used[s] = true;
+            i += 1;
+        }
+        return k;
+    }
+}
+
+/// The index in `names` of the name in each slot, `EMPTY` for none
+const fn slot_table(names: &[u128], k: u64) -> [u8; SLOTS] {
+    let mut table = [EMPTY; SLOTS];
     let mut i = 0;
-    while i < name.len() && i < MAX_NAME_LEN {
-        bytes[i] = name[i] | 0x20;
+    while i < names.len() {
+        table[slot(names[i], k)] = i as u8;
         i += 1;
     }
-    u128::from_le_bytes(bytes)
+    table
 }
 
 /// Define the command table: one constant per command, `COMMANDS` and
@@ -247,18 +311,31 @@ macro_rules! commands {
         /// Every command
         pub(crate) static COMMANDS: &[&CommandSpec] = &[$(&$spec),*];
 
-        /// Each command's packed name
-        mod packed {
-            $(pub(super) const $spec: u128 = super::pack(super::$spec.name.as_bytes());)*
-        }
+        /// Each command's packed name, in the order of `COMMANDS`
+        const PACKED: &[u128] = &[$(pack($spec.name.as_bytes())),*];
 
-        /// Find a command by name, ignoring ASCII case
+        // Indexes are stored as `u8`, with `EMPTY` for no command
+        const _: () = assert!(PACKED.len() < EMPTY as usize);
+
+        /// The multiplier of `slot` that gives every command its own slot
+        const MULTIPLIER: u64 = perfect_multiplier(PACKED);
+
+        /// The index in `COMMANDS` of the command in each slot
+        static SLOT_TABLE: [u8; SLOTS] = slot_table(PACKED, MULTIPLIER);
+
+        /// Find a command by name, ignoring ASCII case: the only command
+        /// the name can be is the one in its slot
+        ///
+        /// Always inlined: the parser calls it for every request.
+        #[inline(always)]
         pub(crate) fn lookup(name: &[u8]) -> Option<&'static CommandSpec> {
             if name.len() > MAX_NAME_LEN {
                 return None;
             }
-            match pack(name) {
-                $(packed::$spec => Some(&$spec),)*
+            let packed = pack(name);
+            let index = usize::from(SLOT_TABLE[slot(packed, MULTIPLIER)]);
+            match PACKED.get(index) {
+                Some(&candidate) if candidate == packed => Some(COMMANDS[index]),
                 _ => None,
             }
         }
@@ -409,15 +486,39 @@ mod tests {
     }
 
     #[test]
-    fn no_auth_commands_are_the_ones_with_the_flag() {
-        for &spec in COMMANDS {
-            assert_eq!(
-                spec.kind.allowed_before_auth(),
-                spec.flags.contains(&"no_auth"),
-                "{}",
-                spec.name
-            );
+    fn pack_reads_every_byte_of_every_length() {
+        // Byte by byte, as its documentation describes it
+        fn by_byte(name: &[u8]) -> u128 {
+            let mut bytes = [0u8; MAX_NAME_LEN];
+            for (packed, &byte) in bytes.iter_mut().zip(name) {
+                *packed = byte | 0x20;
+            }
+            u128::from_le_bytes(bytes)
         }
+        // Varied bytes, zeros and high bytes included
+        let bytes: Vec<u8> = (0u32..600)
+            .map(|i| (i.wrapping_mul(2_654_435_761) >> 13) as u8)
+            .chain(0..=255)
+            .collect();
+        assert_eq!(pack(b""), 0);
+        for len in 1..=MAX_NAME_LEN {
+            for name in bytes.windows(len) {
+                assert_eq!(pack(name), by_byte(name), "{name:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_auth_commands_are_auth_hello_and_quit() {
+        // `Cmd::allowed_before_auth` and the parser's errors for commands
+        // allowed before authenticating assume these three
+        let mut no_auth: Vec<&str> = COMMANDS
+            .iter()
+            .filter(|spec| spec.flags.contains(&"no_auth"))
+            .map(|spec| spec.name)
+            .collect();
+        no_auth.sort_unstable();
+        assert_eq!(no_auth, ["auth", "hello", "quit"]);
     }
 
     #[test]
