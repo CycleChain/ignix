@@ -158,48 +158,60 @@ See [examples/](examples/) for complete Rust, Python and Node.js clients.
 
 ## 📊 Performance
 
-Measured on the unreleased code on a shared cloud VM: 4 vCPUs (Intel Xeon @ 2.10 GHz, one thread per core), 15 GB RAM, Linux 6.18, with servers and clients on the same machine. Redis 7.0.15 ran with `--appendonly yes --appendfsync everysec --save ""`, so both servers append every write to a file and sync it about once per second. Ignix used its default one worker thread per core (4); Redis executes commands on one thread. Every configuration ran on both servers back to back, in two rounds; cells show `round 1 / round 2`.
+Measured on the unreleased code on a shared cloud VM: 4 vCPUs (Intel Xeon @ 2.10 GHz, one thread per core), 15 GB RAM, Linux 6.18, with servers and clients on the same machine. Redis 7.0.15 ran with `--appendonly yes --appendfsync everysec --save ""`, so both servers append every write to a file and sync it about once per second. Ignix used its defaults: one worker thread per core and a 50 µs busy-poll window; the "no busy-poll" column is `--busy-poll-us=0`. Redis executes commands on one thread. The servers ran one after another in two rounds (in alternating order, with a 3 s pause between each SET and GET run); cells show `round 1 / round 2`.
 
-### redis-benchmark (C client)
+### redis-benchmark, one client thread
 
-`redis-benchmark -t set,get -c 50` with `-n 200000`, or `-n 1000000 -P 16` (16 pipelined requests per connection):
+`redis-benchmark -t set,get -c 50 -n 500000 -d 64` (or `-d 1024`), and `-n 1000000 -P 16` (16 pipelined requests per connection); nothing pinned to CPUs, 4 Ignix workers:
 
-| Test | Redis (req/s) | Ignix (req/s) | Ignix/Redis |
-|------|---------------|---------------|-------------|
-| SET 64 B | 110,254 / 107,009 | 73,260 / 67,408 | 0.66x / 0.63x |
-| GET 64 B | 97,276 / 103,040 | 83,612 / 80,321 | 0.86x / 0.78x |
-| SET 1 KB | 98,184 / 99,602 | 71,048 / 74,627 | 0.72x / 0.75x |
-| GET 1 KB | 88,456 / 100,100 | 78,094 / 79,872 | 0.88x / 0.80x |
-| SET 64 B, pipelined | 790,514 / 846,740 | 1,262,626 / 1,240,695 | 1.60x / 1.47x |
-| GET 64 B, pipelined | 1,422,475 / 1,577,287 | 1,351,351 / 1,129,944 | 0.95x / 0.72x |
+| Test | Redis (req/s) | Ignix (req/s) | Ignix/Redis | Ignix, no busy-poll |
+|------|---------------|---------------|-------------|---------------------|
+| SET 64 B | 79,378 / 79,239 | 62,846 / 82,645 | 0.79x / 1.04x | 65,488 / 55,157 |
+| GET 64 B | 72,359 / 76,254 | 67,458 / 88,842 | 0.93x / 1.17x | 67,222 / 55,928 |
+| SET 1 KB | 81,090 / 72,296 | 75,850 / 67,705 | 0.94x / 0.94x | 58,316 / 61,312 |
+| GET 1 KB | 74,427 / 76,092 | 77,316 / 78,309 | 1.04x / 1.03x | 59,446 / 65,198 |
+| SET 64 B, pipelined | 517,063 / 573,723 | 905,797 / 760,456 | 1.75x / 1.33x | 746,826 / 790,514 |
+| GET 64 B, pipelined | 853,971 / 934,579 | 1,186,240 / 1,142,857 | 1.39x / 1.22x | 777,605 / 897,666 |
 
-Without pipelining every request is one round trip and Redis is faster. Turning the Ignix AOF off only raised non-pipelined SET to 74,878 / 77,279 req/s, so the append-only file is not the main cost. With pipelining Ignix spreads the connections over its threads and sustains about 1.5x Redis for SET.
+With a single client thread on a 4-vCPU machine the client is the bottleneck, and a large part of each request's cost is waking the server thread that handles it. Busy-polling keeps Ignix's workers awake while requests keep coming, which puts it about level with Redis without pipelining and ahead of it with pipelining. These runs vary a lot because the busy-polling workers share the four CPUs with the client.
+
+### redis-benchmark, server-bound
+
+Both servers pinned to CPUs 0-1 (`taskset -c 0-1`, so Ignix runs 2 workers) and `redis-benchmark --threads 2 -c 50 -n 1000000 -d 64` on CPUs 2-3:
+
+| Test | Redis (req/s) | Ignix (req/s) | Ignix/Redis | Ignix, no busy-poll |
+|------|---------------|---------------|-------------|---------------------|
+| SET 64 B | 97,523 / 108,061 | 121,080 / 190,404 | 1.24x / 1.76x | 124,891 / 137,874 |
+| GET 64 B | 124,938 / 133,262 | 159,923 / 181,719 | 1.28x / 1.36x | 97,494 / 133,280 |
+
+When the client is not the bottleneck, Ignix's two workers serve 1.2-1.8x as many requests as Redis's single thread on the same two CPUs, with half the median latency (0.13-0.17 ms against 0.27-0.39 ms).
 
 ### Python suite (`benchmarks/`)
 
-`benchmarks/run_all.py`, where every reply is checked; all runs had 0 errors. The client is Python with one thread per connection, so for small values these numbers show the client's limit rather than the servers'.
+`benchmarks/scripts/comprehensive_benchmark.py` and `real_world_benchmark.py`, with both servers running at the same time; every reply is checked and all runs had 0 errors. The client is Python with one thread per connection, so these numbers show the client's limit more than the servers'.
 
 | Operation | Size | Conns | Redis (ops/s) | Ignix (ops/s) | Ignix/Redis |
 |-----------|------|-------|---------------|---------------|-------------|
-| SET | 64 B | 50 | 15,102 / 15,126 | 14,815 / 15,215 | 0.98x / 1.01x |
-| GET | 64 B | 50 | 13,803 / 14,228 | 14,109 / 14,289 | 1.02x / 1.00x |
-| SET | 1 KB | 50 | 16,675 / 14,716 | 15,328 / 13,618 | 0.92x / 0.93x |
-| GET | 1 KB | 50 | 14,526 / 14,674 | 14,559 / 13,751 | 1.00x / 0.94x |
-| SET | 32 KB | 20 | 7,897 / 10,646 | 12,061 / 14,243 | 1.53x / 1.34x |
-| GET | 32 KB | 20 | 13,032 / 11,945 | 12,757 / 11,730 | 0.98x / 0.98x |
-| SET | 256 KB | 20 | 1,624 / 2,862 | 2,084 / 6,708 | 1.28x / 2.34x |
-| GET | 256 KB | 20 | 4,990 / 4,850 | 4,216 / 4,600 | 0.84x / 0.95x |
-| SET | 2 MB | 10 | 95 / 90 | 190 / 299 | 1.99x / 3.32x |
-| GET | 2 MB | 10 | 755 / 970 | 1,132 / 1,176 | 1.50x / 1.21x |
+| SET | 64 B | 50 | 13,236 / 12,353 | 13,062 / 12,376 | 0.99x / 1.00x |
+| GET | 64 B | 50 | 13,945 / 10,652 | 12,736 / 10,684 | 0.91x / 1.00x |
+| SET | 1 KB | 50 | 13,199 / 10,173 | 10,334 / 12,142 | 0.78x / 1.19x |
+| GET | 1 KB | 50 | 11,464 / 10,175 | 9,717 / 11,268 | 0.85x / 1.11x |
+| SET | 32 KB | 20 | 8,138 / 10,733 | 8,910 / 7,730 | 1.09x / 0.72x |
+| GET | 32 KB | 20 | 7,570 / 10,555 | 10,275 / 10,058 | 1.36x / 0.95x |
+| SET | 256 KB | 20 | 751 / 516 | 1,066 / 1,830 | 1.42x / 3.55x |
+| GET | 256 KB | 20 | 4,234 / 4,052 | 4,124 / 3,804 | 0.97x / 0.94x |
+| SET | 2 MB | 10 | 39 / 40 | 106 / 67 | 2.69x / 1.66x |
+| GET | 2 MB | 10 | 712 / 766 | 751 / 907 | 1.05x / 1.18x |
 
 Real-world scenario (session store: 80% GET / 20% SET, 10,000 keys, Zipfian access, 1-2 KB values, 50 connections):
 
 | Metric | Redis | Ignix | Ignix/Redis |
 |--------|-------|-------|-------------|
-| Throughput | 13,954 / 14,350 ops/s | 13,876 / 13,802 ops/s | 0.99x / 0.96x |
-| Avg latency | 3.50 / 3.40 ms | 3.52 / 3.55 ms | 1.00x / 1.04x |
+| Throughput | 10,167 / 11,002 ops/s | 10,922 / 4,477 ops/s | 1.07x / 0.41x |
+| Avg latency | 4.78 / 4.42 ms | 4.43 / 11.00 ms | 0.93x / 2.49x |
+| p99 latency | 15.7 / 14.1 ms | 15.8 / 132.0 ms | 1.01x / 9.36x |
 
-Ignix is ahead on large writes, where Redis also rewrites its AOF in the background (Ignix never compacts its AOF; see Known Limitations). The earlier tables for v0.3.1 could not be reproduced: the scripts that produced them did not check GET replies or count errors.
+Ignix is ahead on large writes, where Redis also rewrites its AOF in the background. The second real-world round was much slower for Ignix, for GETs as well as SETs. It ran right after the large-value runs had appended about 6 GB to Ignix's AOF (12 GB in total, as it is never compacted), on a disk shared with Redis. Repeated on a fresh server right after a 5.5 GB burst of SETs on 20 connections, the scenario was 15% slower than without the burst and AOF syncs took up to 0.3 s, but the collapse did not reappear, so its exact cause is not known; the AOF path is the main suspect. Taking the fsync off the AOF writer's path and compacting the AOF are planned. The earlier tables for v0.3.1 could not be reproduced: the scripts that produced them did not check GET replies or count errors.
 
 ### 📊 Benchmark Your Own Workload
 
@@ -212,7 +224,7 @@ python3 benchmarks/run_all.py
 python3 benchmarks/quick_benchmark.py
 
 # Server throughput with the C client
-redis-benchmark -p 7379 -t set,get -n 200000 -c 50 -q
+redis-benchmark -p 7379 -t set,get -n 500000 -c 50 -q
 ```
 
 See [benchmarks/BENCHMARK_README.md](benchmarks/BENCHMARK_README.md) for every option and for how to compare fairly.
@@ -285,7 +297,7 @@ Monitor AOF: `tail -f ignix.aof`
 - Limited command set compared with Redis (no `KEYS`, `INFO`, `CLIENT`, `CONFIG`, `SELECT`, `QUIT`, ...).
 - RESP2 only: no RESP3 or `HELLO`, and no inline commands (plain text lines such as `PING` typed into telnet).
 - No key expiry: `SET` options and `EXPIRE` are not implemented.
-- The AOF is write-only: it is not loaded on startup, so data does not survive a restart, and it is never compacted, so it grows with every write. The server used for the Performance section ended with a 13.8 GB `ignix.aof`; Redis, which rewrites its AOF, used 2.3 GB.
+- The AOF is write-only: it is not loaded on startup, so data does not survive a restart, and it is never compacted, so it grows with every write. In one of our benchmark sessions `ignix.aof` grew to 13.8 GB while Redis, which rewrites its AOF, used 2.3 GB.
 - Multi-key commands (`MSET`, `DEL`, `RENAME`) are not atomic with respect to other connections.
 - No authentication, and the server listens on the fixed address `0.0.0.0:7379`; do not expose it to untrusted networks.
 - The io_uring backend runs on a single thread.
