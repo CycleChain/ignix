@@ -1,236 +1,138 @@
-# Redis vs Ignix Performance Benchmark
+# Redis vs Ignix Benchmarks
 
-This benchmark system performs detailed performance comparison between Redis and Ignix for GET and SET commands.
+Python scripts that compare Ignix with Redis over the RESP protocol, plus a
+recipe for the standard `redis-benchmark` tool.
 
-## 🚀 Quick Start
+## Contents
 
-### 1. Prerequisites
+| File | Purpose |
+|------|---------|
+| `run_benchmarks.sh` | Builds Ignix in release mode, starts Ignix (and Redis, when port 6379 is free) in temporary directories, runs `run_all.py`, and stops only the processes it started |
+| `run_all.py` | Runs the three benchmarks below against running servers and writes `results/` |
+| `quick_benchmark.py` | 1000 SETs and 1000 GETs on one connection per server; a quick sanity check |
+| `scripts/basic_benchmark.py` | SET/GET for chosen value sizes and connection counts |
+| `scripts/comprehensive_benchmark.py` | SET/GET from 64 B to 2 MB values; JSON and charts |
+| `scripts/real_world_benchmark.py` | Session-store mix: 80% GET / 20% SET, Zipfian keys, 1-2 KB values |
+| `scripts/resp_client.py` | Shared minimal RESP client |
+| `run_tests.sh` | Runs the large payload tests against a release build |
 
-**Start Redis (port 6379):**
+## Requirements
+
+- Python 3.8+ (standard library only).
+- Optional, for charts: `pip install matplotlib seaborn numpy pandas`.
+- Redis on `localhost:6379` and Ignix on `localhost:7379`, or `redis-server`
+  installed so `run_benchmarks.sh` can start it.
+
+## Quick start
+
 ```bash
-redis-server
+# Everything, including building and starting the servers
+bash benchmarks/run_benchmarks.sh
+
+# With both servers already running
+python3 benchmarks/run_all.py
+python3 benchmarks/quick_benchmark.py
 ```
 
-**Start Ignix (port 7379):**
-```bash
-cargo run --release
-```
+The scripts check both servers with `PING` first and exit with a non-zero
+status if a server is missing, a run fails, or any request got a wrong
+reply.
 
-### 2. Run Benchmark
+## Script options
 
-**Simple test:**
-```bash
-python3 benchmark_redis_vs_ignix.py
-```
+`scripts/basic_benchmark.py`
 
-**Advanced test (with charts):**
-```bash
-# Install graphics libraries
-pip install matplotlib seaborn
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `--data-sizes` | `64 256 1024 4096` | Value sizes in bytes |
+| `--connections` | `1 10 50` | Concurrent connections |
+| `--operations` | `1000` | Operations per connection |
+| `--output-dir` | `benchmark_results` | Where JSON and charts go |
+| `--skip-plots` | off | Do not create charts |
 
-# Run benchmark
-python3 benchmark_redis_vs_ignix.py --data-sizes 64 256 1024 --connections 1 10 50
-```
+`scripts/comprehensive_benchmark.py` and `scripts/real_world_benchmark.py`
 
-## 📊 Features
+| Option | Default | Meaning |
+|--------|---------|---------|
+| `--target` | `all` | `all`, `redis` or `ignix` |
+| `--out` | `comprehensive_results` / `real_world_results` | Chart directory |
+| `--json-out` | `benchmark_results.json` / `real_world_results.json` | JSON results; entries for the same server and configuration are replaced, so separate `--target` runs combine |
+| `--report-only` | off | Print the Markdown table from an existing JSON file |
 
-### Core Features
-- ✅ Redis and Ignix comparison
-- ✅ GET and SET operation tests
-- ✅ Multiple data size support (64B - 4KB)
-- ✅ Concurrent connection tests (1-50 connections)
-- ✅ Detailed latency statistics (avg, p95, p99)
-- ✅ Throughput measurement (ops/second)
-- ✅ Success rate tracking
+The comprehensive configurations are fixed: 64 B and 1 KB values with 50
+connections (10,000 measured operations), 32 KB and 256 KB with 20
+connections (5,000), and 2 MB with 10 connections (1,000), each after a
+warm-up. GET runs first write every key; with 2 MB values that is 2 GB per
+server.
 
-### Advanced Features
-- 📊 Automatic visualization charts
-- 💾 JSON export
-- 🔍 Server accessibility check
-- 📈 Performance ratio analysis
-- 🎯 Detailed comparison table
+## What is measured
 
-## 🛠️ Usage
+- **Every reply is checked.** SET must answer `OK`; GET must return exactly
+  the value that was written (the real-world GETs must return a stored
+  value). Anything else, including error replies, counts as an error and is
+  reported in the output and the JSON files.
+- **Timing.** Each request is timed with `time.perf_counter()`. Throughput
+  is successful requests divided by the time from the first to the last
+  request of the run; connecting and preparing requests are not timed.
+- **Interleaving.** For each configuration the comprehensive and basic
+  benchmarks run Redis and Ignix back to back, so slow drift of the machine
+  affects both servers alike.
 
-### Basic Usage
-```bash
-python3 benchmark_redis_vs_ignix.py
-```
+## Fair comparisons
 
-### Custom Test
-```bash
-python3 benchmark_redis_vs_ignix.py \
-  --data-sizes 128 512 2048 \
-  --connections 5 25 100 \
-  --operations 2000 \
-  --output-dir my_benchmark_results
-```
+- **Persistence.** Ignix always writes an append-only file and syncs it at
+  most once per second. Run Redis with
+  `--appendonly yes --appendfsync everysec --save ""` for the same
+  guarantees; `run_benchmarks.sh` does this when it starts Redis.
+- **Disk space.** Ignix never compacts its AOF, so every write stays in
+  the file: after the measurements in the main README (two rounds of
+  these scripts and of `redis-benchmark`) the Ignix AOF was 13.8 GB,
+  against 2.3 GB for Redis, which rewrites its AOF.
+  `run_benchmarks.sh` starts both servers in a directory made by
+  `mktemp -d` (set `TMPDIR` to put it elsewhere) and deletes it at the end.
+- **Threads.** Ignix runs one event loop per CPU core; Redis executes
+  commands on a single thread. Both share the machine with the client.
+- **Busy-polling.** An Ignix worker keeps polling for 50 µs after its last
+  event before it sleeps. Start Ignix with `--busy-poll-us=0` to compare
+  without it.
+- **Server-bound runs.** With a single `redis-benchmark` thread on a small
+  machine the client is usually the bottleneck, and much of what is
+  measured is the cost of waking the servers' threads. To measure the
+  servers, give them the same CPUs of their own and use several client
+  threads on the others:
 
-### Parameters
+  ```bash
+  taskset -c 0-1 ./target/release/ignix
+  taskset -c 0-1 redis-server --port 6379 --appendonly yes --appendfsync everysec --save ""
+  taskset -c 2-3 redis-benchmark -p 7379 -t set,get -n 1000000 -c 50 -d 64 --threads 2 -q
+  ```
 
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `--data-sizes` | Data sizes to test (bytes) | `64 256 1024 4096` |
-| `--connections` | Number of concurrent connections | `1 10 50` |
-| `--operations` | Number of operations per connection | `1000` |
-| `--output-dir` | Directory to save output files | `benchmark_results` |
-| `--skip-plots` | Skip creating plots | `False` |
+- **Pauses between runs.** A pipelined SET run leaves up to a second of
+  AOF data to be synced and written back; wait a few seconds before the
+  next run, or that run is slowed down by the writeback.
+- **The client is the bottleneck.** These scripts use Python threads, which
+  share one interpreter lock, so the numbers compare the servers under the
+  same client rather than their maximum throughput. For server throughput
+  use `redis-benchmark` from the Redis distribution:
 
-## 📈 Output Examples
+  ```bash
+  redis-benchmark -h 127.0.0.1 -p 7379 -t set,get -n 200000 -c 50 -d 64 -q
+  redis-benchmark -h 127.0.0.1 -p 7379 -t set,get -n 1000000 -c 50 -P 16 -q
+  ```
 
-### Console Output
-```
-🚀 Redis vs Ignix Performance Benchmark
-==================================================
+  Pass `-t set,get`: the default test list starts with `PING_INLINE`, and
+  Ignix does not implement inline commands.
 
-🔍 Checking prerequisites...
-✅ Redis (localhost:6379): Accessible
-✅ Ignix (localhost:7379): Accessible
-✅ All prerequisites met!
+## Output files
 
-🔄 Redis - SET benchmark starting...
-   Data size: 64 bytes
-   Concurrent connections: 10
-   Total operations: 10000
-✅ Redis - SET completed!
-   Operations/second: 45231.2
-   Average latency: 0.22 ms
-   Success rate: 100.0%
+All results are written under `benchmarks/results/` (ignored by git):
 
-========================================================
-🏆 BENCHMARK RESULTS
-========================================================
-Server     Operation Data Size  Connections Ops/sec    Avg Lat(ms) P95(ms)  P99(ms)  Success%
---------------------------------------------------------
-Redis      SET       64         10          45231.2    0.22        0.35     0.48     100.0
-Ignix      SET       64         10          52147.8    0.19        0.31     0.42     100.0
-Redis      GET       64         10          48923.1    0.20        0.33     0.45     100.0
-Ignix      GET       64         10          51234.7    0.19        0.30     0.41     100.0
+- `basic/benchmark_results.json` and one set of charts per connection count;
+- `comprehensive/benchmark_results.json`, `throughput.png`,
+  `latency_dist.png`, `tail_latency_<op>_<size>B.png`;
+- `real_world/real_world_results.json`, `real_world_throughput.png`,
+  `real_world_latency.png`;
+- `index.html`, linking the charts that were generated.
 
-🔍 COMPARISON SUMMARY:
---------------------------------------------------
-
-SET (64 bytes):
-  Throughput: Ignix 1.15x Redis
-  Latency: Ignix 1.16x better
-
-GET (64 bytes):
-  Throughput: Ignix 1.05x Redis
-  Latency: Ignix 1.05x better
-```
-
-### Generated Files
-
-**benchmark_results/** directory:
-- `benchmark_results.json` - Raw data
-- `redis_vs_ignix_comparison.png` - Main comparison charts
-- `performance_ratio.png` - Performance ratio chart
-
-## 🔧 Troubleshooting
-
-### Server Connection Issues
-
-**Redis connection error:**
-```bash
-# Check if Redis is running
-redis-cli ping
-
-# Start Redis
-redis-server
-```
-
-**Ignix connection error:**
-```bash
-# Check if Ignix is running
-lsof -i :7379
-
-# Start Ignix
-cargo run --release
-```
-
-### Python Dependency Issues
-
-**Matplotlib installation error:**
-```bash
-# macOS
-brew install python-tk
-pip install matplotlib seaborn
-
-# Ubuntu/Debian
-sudo apt-get install python3-tk
-pip install matplotlib seaborn
-```
-
-**Permission denied error:**
-```bash
-# Use virtual environment
-python3 -m venv benchmark_env
-source benchmark_env/bin/activate
-pip install matplotlib seaborn
-```
-
-### Performance Issues
-
-**Low throughput:**
-- Check system load: `top`
-- Check network latency: `ping localhost`
-- Try fewer concurrent connections: `--connections 1 5`
-
-**High error rate:**
-- Check server logs
-- Increase timeout values (in code `timeout=5.0`)
-- Try fewer operations: `--operations 500`
-
-## 📊 Chart Examples
-
-### Throughput Comparison
-- ops/second for SET and GET operations
-- Performance across different data sizes
-- Redis vs Ignix side-by-side comparison
-
-### Latency Analysis
-- Average, P95, P99 latency values
-- Latency changes by data size
-- Server comparative latency charts
-
-### Performance Ratio
-- Ignix/Redis performance ratio
-- Values >1 indicate Ignix is faster
-- Detailed breakdown by test configuration
-
-## 🎯 Test Scenarios
-
-### Quick Test (30 seconds)
-```bash
-python3 benchmark_redis_vs_ignix.py --data-sizes 64 --connections 1 --operations 1000
-```
-
-### Medium Test (5 minutes)
-```bash
-python3 benchmark_redis_vs_ignix.py --data-sizes 64 256 1024 --connections 1 10 --operations 1000
-```
-
-### Comprehensive Test (15 minutes)
-```bash
-python3 benchmark_redis_vs_ignix.py --data-sizes 64 256 1024 4096 --connections 1 10 25 50 --operations 2000
-```
-
-### Stress Test (30 minutes)
-```bash
-python3 benchmark_redis_vs_ignix.py --data-sizes 64 256 1024 4096 8192 --connections 1 10 25 50 100 --operations 5000
-```
-
-## 📝 Notes
-
-- Do not run other intensive processes during benchmarking
-- Test results may vary depending on system performance
-- Run multiple times for reliable results
-- Take backups before testing in production environment
-
-## 🤝 Contributing
-
-To improve the benchmark:
-1. Add new test scenarios
-2. Implement additional metrics
-3. Improve chart visualizations
-4. Share bug reports and suggestions
+When a script is run on its own, `--json-out` and `--out` default to the
+current directory.

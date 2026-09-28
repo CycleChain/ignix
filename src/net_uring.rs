@@ -1,218 +1,293 @@
 /*!
  * io_uring Network Backend (Linux Only)
- * 
+ *
  * This module implements a high-performance network loop using Linux's io_uring
  * interface. It is conditionally compiled and only available on Linux.
+ *
+ * The loop runs on a single thread. Every connection has exactly one read or
+ * write operation queued or in flight at any time, and a connection is only
+ * removed (closing its socket) while handling the completion of that
+ * operation, so the kernel never touches a buffer that has been freed.
  */
 
 #![cfg(target_os = "linux")]
 
-use crate::shard::Shard;
-use crate::protocol::{parse_many, write_simple, Cmd};
-use anyhow::*;
-use bytes::BytesMut;
-use io_uring::{opcode, types, IoUring};
+use crate::net::{handle_input, ServerOptions};
+use crate::protocol::{Parsed, RequestParser};
+use crate::session::Session;
+use crate::shard::{spawn_active_expiry, Shard};
+use crate::stats::Listener;
+use anyhow::Result;
+use bytes::{Buf, BytesMut};
+use io_uring::{opcode, squeue, types, IoUring};
 use slab::Slab;
-use std::net::SocketAddr;
-use std::os::unix::io::AsRawFd;
+use std::collections::VecDeque;
+use std::io::ErrorKind;
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::Arc;
-use std::net::TcpListener;
 
-// Operation types for user_data
-const OP_ACCEPT: u64 = 0;
-// User data structure: (token << 32) | op_type
-// where op_type: 1 = READ, 2 = WRITE
+/// Size of the kernel read buffer of each connection
+const READ_BUF: usize = 4096;
+/// Submission queue size
+const RING_ENTRIES: u32 = 4096;
 
-#[derive(Debug)]
-struct Connection {
-    fd: i32,
-    // Box provides stable address for io_uring even if Slab reallocates
-    read_buffer: Box<[u8; 4096]>, 
-    read_buf: BytesMut,
-    write_buf: BytesMut,
-    cmds: Vec<Cmd>,
+// user_data = (connection key << 8) | operation tag
+const TAG_ACCEPT: u64 = 1;
+const TAG_ACCEPT_RETRY: u64 = 2;
+const TAG_READ: u64 = 3;
+const TAG_WRITE: u64 = 4;
+
+fn user_data(key: usize, tag: u64) -> u64 {
+    ((key as u64) << 8) | tag
 }
 
-pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> {
-    println!("🚀 Starting Ignix with io_uring backend (Shard {})", shard_id);
-    
-    // Setup listener
-    let listener = TcpListener::bind(addr)?;
-    let listener_fd = listener.as_raw_fd();
+struct Connection {
+    /// Owns the socket: dropping the connection closes it.
+    stream: TcpStream,
+    /// Target of the kernel reads. Boxed so its address stays fixed while a
+    /// read is in flight, even when the slab reallocates.
+    read_buffer: Box<[u8; READ_BUF]>,
+    /// Received bytes not parsed yet
+    read_buf: BytesMut,
+    /// How far the incomplete request in `read_buf` has been parsed
+    parser: RequestParser,
+    /// Replies not written yet. Never modified while a write is in flight.
+    write_buf: BytesMut,
+    reqs: Vec<Parsed>,
+    /// The client's connection state
+    session: Session,
+    /// Set after a protocol error or QUIT: flush `write_buf`, then close.
+    closing: bool,
+}
 
-    // Setup io_uring
-    let mut ring = IoUring::new(4096)?;
-    let mut connections = Slab::with_capacity(1024);
+impl Connection {
+    fn new(stream: TcpStream, session: Session) -> Self {
+        Self {
+            stream,
+            read_buffer: Box::new([0u8; READ_BUF]),
+            read_buf: BytesMut::with_capacity(READ_BUF),
+            parser: RequestParser::new(),
+            write_buf: BytesMut::new(),
+            reqs: Vec::with_capacity(32),
+            session,
+            closing: false,
+        }
+    }
 
-    // Initial Accept
-    let mut accept_addr = libc::sockaddr { sa_family: 0, sa_data: [0; 14] };
-    let mut accept_addr_len: libc::socklen_t = std::mem::size_of::<libc::sockaddr>() as _;
-
-    {
-        let mut sq = ring.submission();
-        let accept_op = opcode::Accept::new(
-            types::Fd(listener_fd),
-            &mut accept_addr,
-            &mut accept_addr_len
+    fn read_entry(&mut self, key: usize) -> squeue::Entry {
+        opcode::Read::new(
+            types::Fd(self.stream.as_raw_fd()),
+            self.read_buffer.as_mut_ptr(),
+            READ_BUF as u32,
         )
         .build()
-        .user_data(OP_ACCEPT);
-        
-        unsafe {
-            sq.push(&accept_op).expect("submission queue full");
-        }
-        sq.sync();
+        .user_data(user_data(key, TAG_READ))
     }
+
+    fn write_entry(&self, key: usize) -> squeue::Entry {
+        let len = self.write_buf.len().min(u32::MAX as usize) as u32;
+        opcode::Write::new(
+            types::Fd(self.stream.as_raw_fd()),
+            self.write_buf.as_ptr(),
+            len,
+        )
+        .build()
+        .user_data(user_data(key, TAG_WRITE))
+    }
+
+    /// Queue the next operation after a completion; returns `false` when the
+    /// connection is finished and must be removed.
+    fn queue_next(&mut self, key: usize, pending: &mut VecDeque<squeue::Entry>) -> bool {
+        if !self.write_buf.is_empty() {
+            pending.push_back(self.write_entry(key));
+        } else if self.closing {
+            return false;
+        } else {
+            pending.push_back(self.read_entry(key));
+        }
+        true
+    }
+}
+
+fn accept_entry(listener: types::Fd) -> squeue::Entry {
+    // The peer address is not used, so no address buffer is passed.
+    opcode::Accept::new(listener, std::ptr::null_mut(), std::ptr::null_mut())
+        .flags(libc::SOCK_CLOEXEC)
+        .build()
+        .user_data(user_data(0, TAG_ACCEPT))
+}
+
+fn is_retryable(res: i32) -> bool {
+    res == -libc::EINTR || res == -libc::EAGAIN
+}
+
+/// Run the io_uring server with default options; see [`run_server`]
+pub fn run_shard(_shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> {
+    run_server(addr, shard, ServerOptions::default())
+}
+
+/// Run the io_uring server: one thread serves every connection. Of
+/// `options`, `requirepass` applies and `busy_poll` does not.
+pub fn run_server(addr: SocketAddr, shard: Shard, options: ServerOptions) -> Result<()> {
+    let listener = TcpListener::bind(addr)?;
+    let bound = listener.local_addr()?;
+    shard.stats.set_listener(Listener {
+        addr: bound,
+        api: "io_uring",
+    });
+    println!("🚀 Ignix listening on {bound} with the io_uring backend");
+    // Shared with the expiry thread, which stops once the shard is dropped
+    let shard = Arc::new(shard);
+    spawn_active_expiry(&shard)?;
+    // The single thread's counter of executed commands, for INFO
+    let commands = shard.stats.command_counter();
+    let password = options.password();
+    let listener_fd = types::Fd(listener.as_raw_fd());
+    // Pause before accepting again when the process runs out of resources.
+    // Must outlive the timeout operations that point at it.
+    let backoff = types::Timespec::new().nsec(10_000_000);
+    let mut accept_failing = false;
+    let mut connections: Slab<Connection> = Slab::with_capacity(1024);
+    let mut pending: VecDeque<squeue::Entry> = VecDeque::new();
+    // Declared last so it is dropped first, before the buffers and the
+    // timespec its operations point to.
+    let mut ring = IoUring::new(RING_ENTRIES)?;
+
+    pending.push_back(accept_entry(listener_fd));
 
     loop {
-        ring.submit_and_wait(1)?;
+        submit_pending(&mut ring, &mut pending)?;
+        match ring.submit_and_wait(1) {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => {}
+            Err(e) => return Err(e.into()),
+        }
 
-        let mut cq = ring.completion();
-        let mut sq = ring.submission();
-
-        for cqe in cq {
-            let user_data = cqe.user_data();
+        for cqe in ring.completion() {
+            let data = cqe.user_data();
             let res = cqe.result();
+            let key = (data >> 8) as usize;
 
-            if user_data == OP_ACCEPT {
-                if res < 0 {
-                    eprintln!("Accept error: {}", res);
-                } else {
-                    let fd = res;
+            match data & 0xff {
+                TAG_ACCEPT if res >= 0 => {
+                    accept_failing = false;
+                    // SAFETY: `res` is the descriptor of a socket accept just
+                    // created; nothing else owns or closes it.
+                    let stream = unsafe { TcpStream::from_raw_fd(res) };
+                    stream.set_nodelay(true).ok();
                     let entry = connections.vacant_entry();
                     let key = entry.key();
-                    
-                    let mut conn = Connection {
-                        fd,
-                        read_buffer: Box::new([0u8; 4096]),
-                        read_buf: BytesMut::with_capacity(4096),
-                        write_buf: BytesMut::new(),
-                        cmds: Vec::new(),
+                    let session = Session::connected(&shard.stats, &commands, password.as_ref());
+                    let conn = entry.insert(Connection::new(stream, session));
+                    pending.push_back(conn.read_entry(key));
+                    pending.push_back(accept_entry(listener_fd));
+                }
+                TAG_ACCEPT => {
+                    if !accept_failing {
+                        log::warn!("accept failed: {}", std::io::Error::from_raw_os_error(-res));
+                    }
+                    accept_failing = true;
+                    if matches!(
+                        -res,
+                        libc::EMFILE | libc::ENFILE | libc::ENOBUFS | libc::ENOMEM
+                    ) {
+                        pending.push_back(
+                            opcode::Timeout::new(&backoff)
+                                .build()
+                                .user_data(user_data(0, TAG_ACCEPT_RETRY)),
+                        );
+                    } else {
+                        pending.push_back(accept_entry(listener_fd));
+                    }
+                }
+                TAG_ACCEPT_RETRY => pending.push_back(accept_entry(listener_fd)),
+                TAG_READ => {
+                    let keep = match connections.get_mut(key) {
+                        Some(conn) if is_retryable(res) => {
+                            pending.push_back(conn.read_entry(key));
+                            true
+                        }
+                        // EOF or error. The write buffer is always empty while
+                        // a read is in flight, so nothing is left to flush.
+                        Some(_) if res <= 0 => false,
+                        Some(conn) => {
+                            let n = (res as usize).min(READ_BUF);
+                            conn.read_buf.extend_from_slice(&conn.read_buffer[..n]);
+                            if !handle_input(
+                                &shard,
+                                &mut conn.session,
+                                &mut conn.read_buf,
+                                &mut conn.parser,
+                                &mut conn.reqs,
+                                &mut conn.write_buf,
+                            ) {
+                                conn.closing = true;
+                                conn.read_buf.clear();
+                            }
+                            conn.queue_next(key, &mut pending)
+                        }
+                        None => true,
                     };
-                    
-                    // Get stable pointer before moving conn into Slab
-                    // Actually, Box pointer is stable even after move.
-                    let buf_ptr = conn.read_buffer.as_mut_ptr();
-                    let buf_len = conn.read_buffer.len();
-
-                    entry.insert(conn);
-
-                    // Re-submit Accept
-                    let accept_op = opcode::Accept::new(
-                        types::Fd(listener_fd),
-                        &mut accept_addr,
-                        &mut accept_addr_len
-                    )
-                    .build()
-                    .user_data(OP_ACCEPT);
-                    
-                    unsafe {
-                        sq.push(&accept_op).expect("sq full");
-                    }
-                    
-                    // Submit Read
-                    let read_op = opcode::Read::new(
-                        types::Fd(fd),
-                        buf_ptr,
-                        buf_len as _
-                    )
-                    .build()
-                    .user_data(((key as u64) << 32) | 1); // 1 = READ
-
-                    unsafe {
-                        sq.push(&read_op).expect("sq full");
+                    if !keep {
+                        connections.remove(key);
                     }
                 }
-            } else {
-                let key = (user_data >> 32) as usize;
-                let op = user_data & 0xFFFFFFFF;
-
-                if connections.contains(key) {
-                    if op == 1 { // READ completion
-                        if res <= 0 {
-                            // EOF or Error
-                            connections.remove(key);
-                            // Close FD - handled by Drop? No, need manual close or impl Drop
-                            // unsafe { libc::close(conn.fd); }
-                        } else {
-                            let conn = connections.get_mut(key).unwrap();
-                            conn.read_buf.extend_from_slice(&conn.read_buffer[..res as usize]);
-                            
-                            // Parse and Execute
-                            if let Ok(_) = parse_many(&mut conn.read_buf, &mut conn.cmds) {
-                                for cmd in conn.cmds.drain(..) {
-                                    shard.exec(cmd, &mut conn.write_buf);
-                                }
-                            }
-
-                            // Submit Write if needed
-                            if !conn.write_buf.is_empty() {
-                                let write_op = opcode::Write::new(
-                                    types::Fd(conn.fd),
-                                    conn.write_buf.as_ptr(),
-                                    conn.write_buf.len() as _
-                                )
-                                .build()
-                                .user_data(((key as u64) << 32) | 2); // 2 = WRITE
-                                
-                                unsafe {
-                                    sq.push(&write_op).expect("sq full");
-                                }
-                            } else {
-                                // Continue Reading
-                                let read_op = opcode::Read::new(
-                                    types::Fd(conn.fd),
-                                    conn.read_buffer.as_mut_ptr(),
-                                    conn.read_buffer.len() as _
-                                )
-                                .build()
-                                .user_data(((key as u64) << 32) | 1);
-
-                                unsafe {
-                                    sq.push(&read_op).expect("sq full");
-                                }
-                            }
+                TAG_WRITE => {
+                    let keep = match connections.get_mut(key) {
+                        Some(conn) if is_retryable(res) => {
+                            pending.push_back(conn.write_entry(key));
+                            true
                         }
-                    } else if op == 2 { // WRITE completion
-                         if res < 0 {
-                            connections.remove(key);
-                        } else {
-                            let conn = connections.get_mut(key).unwrap();
-                            let _ = conn.write_buf.split_to(res as usize);
-
-                            if !conn.write_buf.is_empty() {
-                                // Continue Writing
-                                let write_op = opcode::Write::new(
-                                    types::Fd(conn.fd),
-                                    conn.write_buf.as_ptr(),
-                                    conn.write_buf.len() as _
-                                )
-                                .build()
-                                .user_data(((key as u64) << 32) | 2);
-                                
-                                unsafe {
-                                    sq.push(&write_op).expect("sq full");
-                                }
-                            } else {
-                                // Back to Reading
-                                let read_op = opcode::Read::new(
-                                    types::Fd(conn.fd),
-                                    conn.read_buffer.as_mut_ptr(),
-                                    conn.read_buffer.len() as _
-                                )
-                                .build()
-                                .user_data(((key as u64) << 32) | 1);
-
-                                unsafe {
-                                    sq.push(&read_op).expect("sq full");
-                                }
-                            }
+                        Some(_) if res <= 0 => false,
+                        Some(conn) => {
+                            let n = (res as usize).min(conn.write_buf.len());
+                            conn.write_buf.advance(n);
+                            conn.queue_next(key, &mut pending)
                         }
+                        None => true,
+                    };
+                    if !keep {
+                        connections.remove(key);
                     }
                 }
+                _ => {}
             }
         }
-        
-        sq.sync();
     }
+}
+
+/// Move queued operations into the submission queue, submitting to the kernel
+/// whenever the queue is full.
+fn submit_pending(ring: &mut IoUring, pending: &mut VecDeque<squeue::Entry>) -> Result<()> {
+    while !pending.is_empty() {
+        {
+            let mut sq = ring.submission();
+            while let Some(entry) = pending.front() {
+                // SAFETY: every entry points at memory that outlives the
+                // operation: the boxed read buffer or the write buffer of a
+                // live connection (removed only when its single in-flight
+                // operation completes, and its write buffer is not modified
+                // while a write is in flight), or `backoff`, which lives as
+                // long as the ring.
+                if unsafe { sq.push(entry) }.is_err() {
+                    break;
+                }
+                pending.pop_front();
+            }
+        }
+        if pending.is_empty() {
+            break;
+        }
+        match ring.submit() {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::Interrupted => {}
+            // The kernel cannot take more work until completions are reaped;
+            // the remaining entries are pushed on the next turn of the loop.
+            Err(e) if e.raw_os_error() == Some(libc::EBUSY) => break,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(())
 }

@@ -10,6 +10,7 @@
  * 
  * Usage:
  *     node examples/nodejs_client.js
+ *     IGNIX_PASSWORD=secret node examples/nodejs_client.js   # ignix --requirepass secret
  */
 
 const redis = require('redis');
@@ -24,10 +25,15 @@ async function main() {
         // Connect to Ignix server
         console.log('Connecting to Ignix server at localhost:7379...');
         client = redis.createClient({
-            host: 'localhost',
-            port: 7379,
-            connect_timeout: 5000,
-            socket_timeout: 5000
+            // Sent with HELLO or AUTH when the server runs with --requirepass
+            password: process.env.IGNIX_PASSWORD,
+            socket: {
+                host: 'localhost',
+                port: 7379,
+                connectTimeout: 5000,
+                // Fail instead of retrying forever when Ignix is not running
+                reconnectStrategy: false
+            }
         });
         
         // Handle connection events
@@ -118,13 +124,29 @@ async function main() {
         const deleted = await client.del('greeting');
         console.log(`✅ DEL greeting: ${deleted} key(s) deleted`);
         
+        console.log('\n⏳ Expiry:');
+        console.log('-'.repeat(10));
+        
+        // SET with an expiry, then read and remove it
+        await client.set('session:1', 'token', { EX: 60 });
+        console.log(`✅ SET session:1 EX 60, TTL: ${await client.ttl('session:1')} s`);
+        await client.persist('session:1');
+        console.log(`✅ PERSIST session:1, TTL: ${await client.ttl('session:1')} (no expiry)`);
+        await client.set('session:1', 'token', { PX: 100 });
+        await sleep(200);
+        console.log(`✅ After PX 100 and 200 ms: session:1 = ${await client.get('session:1')}`);
+        
         console.log('\n📊 Statistics:');
         console.log('-'.repeat(15));
         
-        // Count remaining keys
-        const allKeys = await client.keys('*');
-        console.log(`✅ Total keys: ${allKeys.length}`);
-        console.log(`✅ Keys: ${allKeys}`);
+        // The keys this example created, found with SCAN
+        const found = [];
+        for await (const key of client.scanIterator({ MATCH: '*:*' })) {
+            found.push(key);
+        }
+        found.sort();
+        console.log(`✅ SCAN MATCH *:* found ${found.length} keys: ${found.join(', ')}`);
+        console.log(`✅ DBSIZE: ${await client.dbSize()}`);
         
         console.log('\n✅ All operations completed successfully!');
         
@@ -132,13 +154,16 @@ async function main() {
         if (error.code === 'ECONNREFUSED') {
             console.error('❌ Connection Error: Could not connect to Ignix server');
             console.error('Make sure Ignix server is running: cargo run --release');
+        } else if (/^(NOAUTH|WRONGPASS)/.test(error.message)) {
+            console.error('❌ Authentication Error:', error.message);
+            console.error('The server runs with --requirepass: set IGNIX_PASSWORD to its password');
         } else {
             console.error('❌ Error:', error.message);
         }
         process.exit(1);
     } finally {
         // Close connection
-        if (client) {
+        if (client && client.isOpen) {
             await client.quit();
             console.log('\n🔌 Disconnected from Ignix server');
         }
