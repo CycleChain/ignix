@@ -73,8 +73,10 @@ boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler 
   `get`, `set`, `del`, `rename`, `exists`, `len`, `clear`, `incr`/`incr_by` (parçanın yazma
   kilidi altında atomik, `Result<i64, IncrError>` döner). Çok anahtarlı komutlar anahtarlarının
   parçalarını `lock_keys` (yazma: `set_many`, `del_many`, `rename`) ya da `read_many` (okuma:
-  MGET, EXISTS) ile birlikte ve artan sırada kilitler; birden çok parçayı başka yoldan
-  kilitleme ve kilitler tutulurken `Dict`'i kullanma (kilitlenme).
+  MGET, EXISTS) ile birlikte ve artan sırada kilitler; `len` ve `flush` bütün parçaları aynı
+  sırayla kilitler. Birden çok parçayı başka yoldan kilitleme ve kilitler tutulurken `Dict`'i
+  kullanma (kilitlenme). Parçaya yeni tablo koyan kod `Table::with_hasher(self.hasher.clone())`
+  kullanmalı: tablo büyürken kendi hasher'ıyla yeniden hash'ler.
 - `src/aof.rs`: `spawn_aof_writer` (dosyayı önce açar, açamazsa `Err` döner; ayrı iş
   parçacığı, 4096 kapasiteli sınırlı kanal; kayıtlar en geç bir saniye içinde `sync_data` ile
   diske işlenir) ve ikili güvenli `emit_aof_*` kodlayıcıları.
@@ -84,7 +86,8 @@ boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler 
   (`ignix.aof` açılamazsa AOF'suz sürer).
 
 Desteklenen komutlar: PING, ECHO, QUIT, SELECT (yalnızca 0), HELLO, CLIENT (ID, GETNAME,
-SETNAME, SETINFO, HELP), GET, SET, DEL, EXISTS, INCR, INCRBY, DECR, DECRBY, RENAME, MGET, MSET.
+SETNAME, SETINFO, HELP), GET, SET, DEL, UNLINK, EXISTS, TYPE, DBSIZE, FLUSHDB, FLUSHALL, INCR,
+INCRBY, DECR, DECRBY, RENAME, MGET, MSET.
 
 ## Dizin haritası
 

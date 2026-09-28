@@ -380,6 +380,16 @@ pub fn emit_aof_del(keys: &[Bytes]) -> Vec<u8> {
     encode(b"DEL", keys.iter().map(|k| &k[..]))
 }
 
+/// Generate AOF entry for FLUSHDB command
+pub fn emit_aof_flushdb() -> Vec<u8> {
+    encode(b"FLUSHDB", std::iter::empty())
+}
+
+/// Generate AOF entry for FLUSHALL command
+pub fn emit_aof_flushall() -> Vec<u8> {
+    encode(b"FLUSHALL", std::iter::empty())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

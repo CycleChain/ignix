@@ -323,6 +323,67 @@ fn client_help_lists_the_supported_subcommands() {
 }
 
 #[test]
+fn dbsize_counts_the_keys() {
+    let s = shard();
+    assert_eq!(exec(&s, &[b"DBSIZE"]), b":0\r\n");
+    exec(&s, &[b"MSET", b"a", b"1", b"b", b"2"]);
+    assert_eq!(exec(&s, &[b"DBSIZE"]), b":2\r\n");
+    assert_eq!(exec(&s, &[b"DBSIZE", b"x"]), arity_error("dbsize"));
+}
+
+#[test]
+fn type_is_string_for_every_value_and_none_for_missing_keys() {
+    let s = shard();
+    exec(&s, &[b"SET", b"s", b"text"]);
+    exec(&s, &[b"SET", b"i", b"42"]);
+    assert_eq!(exec(&s, &[b"TYPE", b"s"]), b"+string\r\n");
+    assert_eq!(exec(&s, &[b"TYPE", b"i"]), b"+string\r\n");
+    assert_eq!(exec(&s, &[b"TYPE", b"missing"]), b"+none\r\n");
+    assert_eq!(exec(&s, &[b"TYPE"]), arity_error("type"));
+}
+
+#[test]
+fn unlink_deletes_like_del() {
+    let s = shard();
+    exec(&s, &[b"SET", b"a", b"1"]);
+    assert_eq!(exec(&s, &[b"UNLINK", b"a", b"missing", b"a"]), b":1\r\n");
+    assert_eq!(exec(&s, &[b"GET", b"a"]), b"$-1\r\n");
+    assert_eq!(exec(&s, &[b"UNLINK"]), arity_error("unlink"));
+}
+
+#[test]
+fn flushdb_and_flushall_remove_every_key() {
+    let s = shard();
+    for (flush, option) in [
+        (&b"FLUSHDB"[..], None),
+        (b"FLUSHDB", Some(&b"ASYNC"[..])),
+        (b"FLUSHALL", Some(b"sync")),
+        (b"FLUSHALL", None),
+    ] {
+        exec(&s, &[b"MSET", b"a", b"1", b"b", b"2"]);
+        let mut args = vec![flush];
+        args.extend(option);
+        assert_eq!(exec(&s, &args), b"+OK\r\n");
+        assert_eq!(exec(&s, &[b"DBSIZE"]), b":0\r\n");
+    }
+    // The keyspace works as before afterwards
+    exec(&s, &[b"SET", b"k", b"v"]);
+    assert_eq!(exec(&s, &[b"GET", b"k"]), b"$1\r\nv\r\n");
+}
+
+#[test]
+fn flush_options_other_than_async_or_sync_are_syntax_errors() {
+    let s = shard();
+    for args in [
+        &[&b"FLUSHDB"[..], b"foo"][..],
+        &[b"FLUSHDB", b"async", b"sync"],
+        &[b"FLUSHALL", b"x"],
+    ] {
+        assert_eq!(exec(&s, args), b"-ERR syntax error\r\n");
+    }
+}
+
+#[test]
 fn get_with_extra_argument_is_an_arity_error() {
     let s = shard();
     exec(&s, &[b"SET", b"a", b"1"]);

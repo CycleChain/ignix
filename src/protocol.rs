@@ -33,6 +33,15 @@ pub enum Protocol {
     Resp3,
 }
 
+/// How `FLUSHDB` and `FLUSHALL` free the memory of the removed keys
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushMode {
+    /// Before replying (`SYNC`, the default)
+    Sync,
+    /// In a background thread (`ASYNC`)
+    Async,
+}
+
 /// Client attributes set with `CLIENT SETINFO`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -101,6 +110,16 @@ pub enum Cmd {
     ClientSetInfo(ClientInfo, Bytes),
     /// CLIENT HELP - describe the supported CLIENT subcommands
     ClientHelp,
+    /// DBSIZE - the number of keys
+    DbSize,
+    /// TYPE key - the type of the value stored at `key`, or `none`
+    Type(Bytes),
+    /// UNLINK key [key ...] - delete keys like DEL
+    Unlink(Vec<Bytes>),
+    /// FLUSHDB \[ASYNC|SYNC\] - delete every key of the database
+    FlushDb(FlushMode),
+    /// FLUSHALL \[ASYNC|SYNC\] - delete every key of every database
+    FlushAll(FlushMode),
 }
 
 /// Value types that can be stored in Ignix
@@ -350,6 +369,25 @@ fn command_from_frame(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String>
     let cmd = match kind {
         Kind::Ping => Cmd::Ping(items.pop()),
         Kind::Del => Cmd::Del(items),
+        Kind::Unlink => Cmd::Unlink(items),
+        Kind::DbSize => Cmd::DbSize,
+        Kind::Type => {
+            let [key] = <[Bytes; 1]>::try_from(items).map_err(|_| arity_error())?;
+            Cmd::Type(key)
+        }
+        Kind::FlushDb | Kind::FlushAll => {
+            let mode = match &items[..] {
+                [] => FlushMode::Sync,
+                [option] if option.eq_ignore_ascii_case(b"sync") => FlushMode::Sync,
+                [option] if option.eq_ignore_ascii_case(b"async") => FlushMode::Async,
+                _ => return Err("ERR syntax error".to_string()),
+            };
+            if kind == Kind::FlushDb {
+                Cmd::FlushDb(mode)
+            } else {
+                Cmd::FlushAll(mode)
+            }
+        }
         Kind::Exists => Cmd::Exists(items),
         Kind::MGet => Cmd::MGet(items),
         Kind::MSet => {

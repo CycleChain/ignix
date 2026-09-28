@@ -7,12 +7,12 @@
  */
 
 use crate::aof::{
-    emit_aof_del, emit_aof_incr, emit_aof_incrby, emit_aof_mset, emit_aof_rename, emit_aof_set,
-    AofHandle,
+    emit_aof_del, emit_aof_flushall, emit_aof_flushdb, emit_aof_incr, emit_aof_incrby,
+    emit_aof_mset, emit_aof_rename, emit_aof_set, AofHandle,
 };
 use crate::protocol::{
     fmt_i64, parse_canonical_i64, write_array_len, write_bulk, write_error, write_integer,
-    write_map_len, write_nil, write_simple, Cmd, Protocol, Value,
+    write_map_len, write_nil, write_simple, Cmd, FlushMode, Protocol, Value,
 };
 use crate::session::Session;
 use crate::storage::Dict;
@@ -208,6 +208,17 @@ impl Shard {
         self.exec_session(cmd, &mut Session::default(), out)
     }
 
+    /// Remove every key, logging `record()` while the keys are locked so
+    /// that it keeps its place among the other writes
+    fn flush(&self, mode: FlushMode, record: fn() -> Vec<u8>, out: &mut BytesMut) {
+        self.dict.flush(mode == FlushMode::Async, || {
+            if let Some(a) = &self.aof {
+                a.write_owned(record());
+            }
+        });
+        write_simple("OK", out);
+    }
+
     /// Execute a command for the connection `session` belongs to
     ///
     /// This is the main entry point for command execution. It handles
@@ -238,8 +249,9 @@ impl Shard {
                 write_simple("OK", out);
             }
 
-            // DEL key [key ...] - delete keys, reply with the number removed
-            Cmd::Del(mut keys) => {
+            // DEL / UNLINK key [key ...] - delete keys, reply with the number
+            // removed (UNLINK is logged as DEL)
+            Cmd::Del(mut keys) | Cmd::Unlink(mut keys) => {
                 // Keep only the keys that were removed; a repeated key is
                 // removed (and counted) once, like in Redis.
                 self.dict.del_many(&mut keys);
@@ -339,6 +351,20 @@ impl Shard {
 
             // HELLO [protover [AUTH username password] [SETNAME clientname]]
             Cmd::Hello { protocol, options } => hello(protocol, &options, session, out),
+
+            // DBSIZE - number of keys
+            Cmd::DbSize => write_integer(self.dict.len() as i64, out),
+
+            // TYPE key - every stored value is a string
+            Cmd::Type(key) => {
+                let exists = self.dict.read(&key, |value| value.is_some());
+                write_simple(if exists { "string" } else { "none" }, out);
+            }
+
+            // FLUSHDB / FLUSHALL [ASYNC|SYNC] - there is one database, so both
+            // remove every key
+            Cmd::FlushDb(mode) => self.flush(mode, emit_aof_flushdb, out),
+            Cmd::FlushAll(mode) => self.flush(mode, emit_aof_flushall, out),
 
             // CLIENT subcommands about the current connection
             Cmd::ClientId => write_integer(session.id() as i64, out),

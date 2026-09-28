@@ -80,6 +80,7 @@ world
 | `SET key value` | Set a value | `SET key value` → `+OK` |
 | `GET key` | Get a value | `GET key` → `$5\r\nvalue` |
 | `DEL key [key ...]` | Delete keys, reply with the number removed | `DEL a b` → `:2` |
+| `UNLINK key [key ...]` | Delete keys, like `DEL` | `UNLINK a b` → `:2` |
 | `EXISTS key [key ...]` | Count how many of the keys exist | `EXISTS a b` → `:1` |
 | `INCR key` | Increment an integer | `INCR counter` → `:1` |
 | `INCRBY key increment` | Add to an integer | `INCRBY counter 5` → `:6` |
@@ -88,6 +89,9 @@ world
 | `RENAME key newkey` | Rename a key | `RENAME old new` → `+OK` |
 | `MGET key [key ...]` | Get multiple values | `MGET k1 k2` → `*2\r\n...` |
 | `MSET key value [key value ...]` | Set multiple values | `MSET k1 v1 k2 v2` → `+OK` |
+| `TYPE key` | Type of the value (`string`), or `none` | `TYPE k1` → `+string` |
+| `DBSIZE` | Number of keys | `DBSIZE` → `:2` |
+| `FLUSHDB [ASYNC\|SYNC]`, `FLUSHALL [ASYNC\|SYNC]` | Delete every key (with `ASYNC` the memory is freed in the background) | `FLUSHDB` → `+OK` |
 
 Replies and error messages match Redis 7, for example `-ERR wrong number of arguments for 'get' command`, `-ERR unknown command 'FOO', with args beginning with: ...` and `-ERR value is not an integer or out of range`. After an invalid command the connection keeps working; after malformed RESP the server replies `-ERR Protocol error: ...` and closes the connection, as Redis does.
 

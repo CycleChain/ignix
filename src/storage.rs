@@ -175,20 +175,47 @@ impl Dict {
         }
     }
 
-    /// Number of keys
+    /// Read-lock every shard, in ascending order
+    fn read_all(&self) -> Vec<RwLockReadGuard<'_, Table>> {
+        (0..SHARDS).map(|i| self.read_shard(i)).collect()
+    }
+
+    /// Number of keys, counted with every shard locked, so a key moving
+    /// between shards is counted once
     pub fn len(&self) -> usize {
-        (0..SHARDS).map(|i| self.read_shard(i).len()).sum()
+        self.read_all().iter().map(|table| table.len()).sum()
     }
 
     /// Whether the dictionary holds no keys
     pub fn is_empty(&self) -> bool {
-        (0..SHARDS).all(|i| self.read_shard(i).is_empty())
+        self.read_all().iter().all(|table| table.is_empty())
     }
 
     /// Remove every key
     pub fn clear(&self) {
-        for i in 0..SHARDS {
-            self.write_shard(i).clear();
+        self.flush(false, || ());
+    }
+
+    /// Remove every key at once (FLUSHDB), calling `log` while every shard
+    /// is still locked. The shards are only locked while their tables are
+    /// swapped for empty ones; the removed keys are freed afterwards, in a
+    /// background thread if `lazy`.
+    pub(crate) fn flush(&self, lazy: bool, log: impl FnOnce()) {
+        let mut guards: Vec<_> = (0..SHARDS).map(|i| self.write_shard(i)).collect();
+        // The new tables must use the dictionary's hasher: hashes computed
+        // with it place keys, and a table rehashes with its own when it grows.
+        let removed: Vec<Table> = guards
+            .iter_mut()
+            .map(|table| std::mem::replace(&mut **table, Table::with_hasher(self.hasher.clone())))
+            .collect();
+        log();
+        drop(guards);
+        if lazy {
+            let freeing = std::thread::Builder::new()
+                .name("ignix-flush".into())
+                .spawn(move || drop(removed));
+            // Without a thread the keys are freed here
+            drop(freeing);
         }
     }
 
@@ -513,6 +540,58 @@ mod tests {
         }
         dict.clear();
         assert!(dict.is_empty());
+    }
+
+    #[test]
+    fn keys_added_after_flush_survive_table_growth() {
+        // Flushed tables must keep the dictionary's hasher, or they would
+        // misplace keys when they grow
+        let dict = Dict::default();
+        dict.set(key("before"), Value::Int(0));
+        dict.flush(false, || ());
+        assert!(dict.is_empty());
+        for i in 0..50_000 {
+            dict.set(key(&format!("key:{i}")), Value::Int(i));
+        }
+        for i in 0..50_000 {
+            assert_eq!(dict.get(format!("key:{i}").as_bytes()), Some(Value::Int(i)));
+        }
+        dict.flush(true, || ());
+        assert_eq!(dict.len(), 0);
+    }
+
+    #[test]
+    fn flush_logs_while_every_shard_is_locked() {
+        let dict = Dict::default();
+        dict.set(key("k"), Value::Int(1));
+        let mut logged = false;
+        dict.flush(false, || {
+            // Another thread could not lock a shard here
+            assert!(dict.shards.iter().all(|shard| shard.try_read().is_err()));
+            logged = true;
+        });
+        assert!(logged);
+    }
+
+    #[test]
+    fn len_counts_a_key_moving_between_shards_once() {
+        let dict = Dict::default();
+        let (a, _, b) = keys_by_shard(&dict);
+        dict.set(a.clone(), Value::Int(1));
+        let done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let counter = s.spawn(|| {
+                while !done.load(Ordering::Relaxed) {
+                    assert_eq!(dict.len(), 1);
+                }
+            });
+            for _ in 0..20_000 {
+                dict.rename(a.clone(), b.clone());
+                dict.rename(b.clone(), a.clone());
+            }
+            done.store(true, Ordering::Relaxed);
+            counter.join().unwrap();
+        });
     }
 
     #[test]

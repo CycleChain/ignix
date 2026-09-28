@@ -110,6 +110,40 @@ fn del_is_logged_for_removed_keys_only() {
 }
 
 #[test]
+fn unlink_is_logged_as_del_of_the_removed_keys() {
+    let data = aof_after(
+        "unlink",
+        &[&[b"SET", b"u", b"1"], &[b"UNLINK", b"u", b"missing"]],
+    );
+    assert!(
+        contains(&data, b"*2\r\n$3\r\nDEL\r\n$1\r\nu\r\n"),
+        "{:?}",
+        String::from_utf8_lossy(&data)
+    );
+    assert!(!contains(&data, b"UNLINK") && !contains(&data, b"missing"));
+}
+
+#[test]
+fn flushdb_and_flushall_are_logged() {
+    let data = aof_after(
+        "flush",
+        &[
+            &[b"SET", b"f", b"1"],
+            &[b"FLUSHDB", b"ASYNC"],
+            &[b"FLUSHALL"],
+        ],
+    );
+    let flushdb = b"*1\r\n$7\r\nFLUSHDB\r\n";
+    let flushall = b"*1\r\n$8\r\nFLUSHALL\r\n";
+    let position = |needle: &[u8]| data.windows(needle.len()).position(|w| w == needle);
+    assert!(
+        position(flushdb) < position(flushall) && position(flushdb).is_some(),
+        "{:?}",
+        String::from_utf8_lossy(&data)
+    );
+}
+
+#[test]
 fn failed_incr_is_not_logged() {
     let data = aof_after("incr", &[&[b"SET", b"t", b"abc"], &[b"INCR", b"t"]]);
     assert!(

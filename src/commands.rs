@@ -26,6 +26,11 @@ pub(crate) enum Kind {
     Select,
     Hello,
     Client,
+    DbSize,
+    Type,
+    Unlink,
+    FlushDb,
+    FlushAll,
 }
 
 /// The static description of a command
@@ -122,6 +127,11 @@ commands! {
     SELECT = "select", 2, Select;
     HELLO = "hello", -1, Hello;
     CLIENT = "client", -2, Client;
+    DBSIZE = "dbsize", 1, DbSize;
+    TYPE = "type", 2, Type;
+    UNLINK = "unlink", -2, Unlink;
+    FLUSHDB = "flushdb", -1, FlushDb;
+    FLUSHALL = "flushall", -1, FlushAll;
 }
 
 #[cfg(test)]
