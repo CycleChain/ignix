@@ -14,7 +14,7 @@ Ignix (from "Ignite" + "Index") is a Redis-protocol compatible, in-memory key-va
 - 🧵 **Async I/O**: `mio` (epoll/kqueue) by default, optional `io_uring` backend on Linux
 - ⚡ **Busy-polling**: a worker keeps polling for 50 µs after its last event before it sleeps, so requests rarely wait for a thread to wake up (`--busy-poll-us`)
 - 💾 **AOF**: every write is appended to `ignix.aof` by a background thread and synced at most once per second
-- 🧠 **Concurrent storage**: `DashMap` (sharded locking) in the hot path
+- 🧠 **Concurrent storage**: 1024 hash-table shards with one read-write lock each
 - 📊 **Benchmarks included**: criterion micro-benchmarks and a Redis comparison suite
 
 ## 🏗️ Architecture
@@ -25,7 +25,7 @@ Ignix (from "Ignite" + "Index") is a Redis-protocol compatible, in-memory key-va
 - **Busy-polling**: waking a sleeping thread costs more than serving a small request, especially on virtual machines, so after its last event a worker polls without blocking for 50 µs before it sleeps. An idle server sleeps.
 - **Allocation-free replies**: replies are written straight into the connection's output buffer.
 - **RESP parsing**: requests are RESP arrays of bulk strings, parsed with the same length rules and limits as Redis (at most 512 MB per argument).
-- **Concurrent storage**: `DashMap<Bytes, Value>`; canonical integers are stored as numbers, everything else byte for byte.
+- **Concurrent storage**: the keyspace is split into 1024 hashbrown tables, each behind its own read-write lock; a key is hashed once (SipHash with random keys) to pick its shard and its slot. Canonical integers are stored as numbers, everything else byte for byte.
 - **AOF persistence**: dedicated writer thread fed by a bounded channel (back-pressure); queued records are written in batches and synced at most once per second.
 
 ## 🚀 Quick Start

@@ -21,6 +21,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Request API for servers**: `protocol::parse_requests` parses every complete request into `Request::Cmd` or `Request::Invalid(error_line)` and only fails on protocol errors, and `protocol::write_error` writes a RESP error reply (`-ERR ...`).
 
 ### Changed
+- **Own sharded keyspace instead of DashMap**: `Dict` now keeps the keys in 1024 hashbrown tables with one read-write lock each and hashes a key once to find both its shard and its slot; the `dashmap` dependency is gone. Behaviour and the public `Dict` methods are unchanged, and `Dict` gains `len`, `is_empty` and `clear`. The shards can be locked together in a fixed order, which later multi-key commands need.
 - **`parse_many` no longer gets stuck on an invalid command**: the invalid request is consumed before the error is returned, so the next call continues with the following request. Protocol errors still leave the malformed bytes in the buffer.
 - **Breaking: command enum shapes**: `Cmd::Ping` is now `Cmd::Ping(Option<Bytes>)`, `Cmd::Del(Bytes)` is `Cmd::Del(Vec<Bytes>)` and `Cmd::Exists(Bytes)` is `Cmd::Exists(Vec<Bytes>)`. `Cmd` and `Value` are `#[non_exhaustive]`, so future commands and value types are not breaking changes.
 - **Breaking: `Dict::incr`** is now `fn incr(&self, key: Bytes) -> Result<i64, IncrError>` (was `fn incr(&self, k: &[u8]) -> i64`); it takes the key by value, so no copy is made, and reports the new `IncrError`.
