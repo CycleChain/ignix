@@ -124,7 +124,11 @@ fn write_section(shard: &Shard, name: &str, text: &mut String) {
             text.push_str("# Keyspace\r\n");
             match shard.dict.len() {
                 0 => Ok(()),
-                keys => write!(text, "db0:keys={keys},expires=0,avg_ttl=0\r\n"),
+                keys => write!(
+                    text,
+                    "db0:keys={keys},expires={},avg_ttl=0\r\n",
+                    shard.dict.count_volatile()
+                ),
             }
         }
     };

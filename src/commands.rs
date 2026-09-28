@@ -35,6 +35,15 @@ pub(crate) enum Kind {
     Scan,
     Info,
     Config,
+    Expire,
+    PExpire,
+    ExpireAt,
+    PExpireAt,
+    Ttl,
+    PTtl,
+    ExpireTime,
+    PExpireTime,
+    Persist,
 }
 
 /// The static description of a command
@@ -140,6 +149,15 @@ commands! {
     SCAN = "scan", -2, Scan;
     INFO = "info", -1, Info;
     CONFIG = "config", -2, Config;
+    EXPIRE = "expire", -3, Expire;
+    PEXPIRE = "pexpire", -3, PExpire;
+    EXPIREAT = "expireat", -3, ExpireAt;
+    PEXPIREAT = "pexpireat", -3, PExpireAt;
+    TTL = "ttl", 2, Ttl;
+    PTTL = "pttl", 2, PTtl;
+    EXPIRETIME = "expiretime", 2, ExpireTime;
+    PEXPIRETIME = "pexpiretime", 2, PExpireTime;
+    PERSIST = "persist", 2, Persist;
 }
 
 #[cfg(test)]

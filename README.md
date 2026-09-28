@@ -92,6 +92,11 @@ world
 | `MGET key [key ...]` | Get multiple values | `MGET k1 k2` → `*2\r\n...` |
 | `MSET key value [key value ...]` | Set multiple values | `MSET k1 v1 k2 v2` → `+OK` |
 | `TYPE key` | Type of the value (`string`), or `none` | `TYPE k1` → `+string` |
+| `EXPIRE`/`PEXPIRE key time [NX\|XX\|GT\|LT]` | Expire a key after `time` seconds or milliseconds | `EXPIRE k1 60` → `:1` |
+| `EXPIREAT`/`PEXPIREAT key time [NX\|XX\|GT\|LT]` | Expire a key at a unix time in seconds or milliseconds | `EXPIREAT k1 4102444800` → `:1` |
+| `TTL`/`PTTL key` | Time left before the key expires (`-1` without expiry, `-2` if missing) | `TTL k1` → `:60` |
+| `EXPIRETIME`/`PEXPIRETIME key` | The key's expiry as a unix time | `EXPIRETIME k1` → `:4102444800` |
+| `PERSIST key` | Remove the key's expiry | `PERSIST k1` → `:1` |
 | `DBSIZE` | Number of keys | `DBSIZE` → `:2` |
 | `KEYS pattern` | Keys matching a glob pattern (`*`, `?`, `[a-z]`, `\\`), like Redis | `KEYS user:*` → `*2\r\n...` |
 | `SCAN cursor [MATCH pattern] [COUNT count] [TYPE type]` | Iterate over the keys | `SCAN 0` → `*2\r\n$2\r\n17\r\n*...` |
@@ -301,7 +306,7 @@ Monitor AOF: `tail -f ignix.aof`
 
 ## 🚧 Roadmap (Short)
 
-- More Redis commands (HASH/LIST/SET) and key expiry
+- More Redis commands (HASH/LIST/SET)
 - Loading the AOF on startup, RDB snapshots, metrics/monitoring
 - Clustering and replication
 
@@ -312,7 +317,8 @@ Monitor AOF: `tail -f ignix.aof`
 - `SCAN` visits the keyspace one shard (1/1024 of the keys) at a time, so with many keys a step returns more keys than `COUNT`; like in Redis, every key that exists during the whole iteration is returned, and here exactly once.
 - A single database: `SELECT` accepts only index 0.
 - No inline commands (plain text lines such as `PING` typed into telnet); requests must be RESP arrays.
-- No key expiry: `SET` options and `EXPIRE` are not implemented.
+- `SET` options (`EX`, `PX`, `NX`, `XX`, `GET`, ...) are not implemented yet.
+- Expired keys are removed when they are next accessed, so they still count in `DBSIZE` until then (as in Redis between its expiry cycles).
 - The AOF is write-only: it is not loaded on startup, so data does not survive a restart, and it is never compacted, so it grows with every write. In one of our benchmark sessions `ignix.aof` grew to 13.8 GB while Redis, which rewrites its AOF, used 2.3 GB.
 - No authentication, and the server listens on the fixed address `0.0.0.0:7379`; do not expose it to untrusted networks.
 - The io_uring backend runs on a single thread.

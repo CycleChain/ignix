@@ -42,6 +42,20 @@ pub enum FlushMode {
     Async,
 }
 
+/// Conditions of EXPIRE and its variants; with none set the expiry is
+/// always set
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExpireOptions {
+    /// `NX`: only if the key has no expiry
+    pub nx: bool,
+    /// `XX`: only if the key has an expiry
+    pub xx: bool,
+    /// `GT`: only if the new expiry is later (never for a key without one)
+    pub gt: bool,
+    /// `LT`: only if the new expiry is earlier (always for a key without one)
+    pub lt: bool,
+}
+
 /// Client attributes set with `CLIENT SETINFO`
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[non_exhaustive]
@@ -142,6 +156,29 @@ pub enum Cmd {
     ConfigGet(Vec<Bytes>),
     /// CONFIG HELP - describe the supported CONFIG subcommands
     ConfigHelp,
+    /// EXPIRE / PEXPIRE / EXPIREAT / PEXPIREAT key time \[NX|XX|GT|LT\] -
+    /// set the key's expiry
+    #[non_exhaustive]
+    Expire {
+        /// The key
+        key: Bytes,
+        /// The new expiry as a unix time in milliseconds (relative times are
+        /// converted when parsing); a time not after now deletes the key
+        at: i64,
+        /// When to set it
+        options: ExpireOptions,
+    },
+    /// TTL key - seconds until the key expires (-1 without an expiry, -2 if
+    /// the key is missing)
+    Ttl(Bytes),
+    /// PTTL key - milliseconds until the key expires
+    PTtl(Bytes),
+    /// EXPIRETIME key - the key's expiry as a unix time in seconds
+    ExpireTime(Bytes),
+    /// PEXPIRETIME key - the key's expiry as a unix time in milliseconds
+    PExpireTime(Bytes),
+    /// PERSIST key - remove the key's expiry
+    Persist(Bytes),
 }
 
 /// Value types that can be stored in Ignix
@@ -460,6 +497,19 @@ fn command_from_frame(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String>
         }
         Kind::Scan => scan_command(items)?,
         Kind::Info => Cmd::Info(items),
+        Kind::Expire | Kind::PExpire | Kind::ExpireAt | Kind::PExpireAt => {
+            expire_command(kind, spec.name, items)?
+        }
+        Kind::Ttl | Kind::PTtl | Kind::ExpireTime | Kind::PExpireTime | Kind::Persist => {
+            let [key] = <[Bytes; 1]>::try_from(items).map_err(|_| arity_error())?;
+            match kind {
+                Kind::Ttl => Cmd::Ttl(key),
+                Kind::PTtl => Cmd::PTtl(key),
+                Kind::ExpireTime => Cmd::ExpireTime(key),
+                Kind::PExpireTime => Cmd::PExpireTime(key),
+                _ => Cmd::Persist(key),
+            }
+        }
         Kind::Config => config_command(items)?,
         Kind::Client => client_command(items)?,
         Kind::Hello => {
@@ -554,6 +604,61 @@ fn scan_command(items: Vec<Bytes>) -> std::result::Result<Cmd, String> {
         pattern,
         count,
         type_name,
+    })
+}
+
+/// Parse the NX, XX, GT and LT options of EXPIRE, with Redis's errors
+fn expire_options(options: &[Bytes]) -> std::result::Result<ExpireOptions, String> {
+    let mut parsed = ExpireOptions::default();
+    for option in options {
+        let flag = match option.to_ascii_lowercase().as_slice() {
+            b"nx" => &mut parsed.nx,
+            b"xx" => &mut parsed.xx,
+            b"gt" => &mut parsed.gt,
+            b"lt" => &mut parsed.lt,
+            _ => {
+                let option = String::from_utf8_lossy(option);
+                return Err(format!("ERR Unsupported option {option}"));
+            }
+        };
+        *flag = true;
+    }
+    if parsed.nx && (parsed.xx || parsed.gt || parsed.lt) {
+        return Err(
+            "ERR NX and XX, GT or LT options at the same time are not compatible".to_string(),
+        );
+    }
+    if parsed.gt && parsed.lt {
+        return Err("ERR GT and LT options at the same time are not compatible".to_string());
+    }
+    Ok(parsed)
+}
+
+/// Build EXPIRE, PEXPIRE, EXPIREAT or PEXPIREAT from the arguments after the
+/// command name, converting the time to an absolute unix time in
+/// milliseconds with the overflow checks Redis makes.
+fn expire_command(kind: Kind, name: &str, items: Vec<Bytes>) -> std::result::Result<Cmd, String> {
+    let options = expire_options(&items[2..])?;
+    let time = parse_canonical_i64(&items[1])
+        .ok_or_else(|| "ERR value is not an integer or out of range".to_string())?;
+    let invalid = || format!("ERR invalid expire time in '{name}' command");
+    let millis = match kind {
+        Kind::Expire | Kind::ExpireAt => time.checked_mul(1000).ok_or_else(invalid)?,
+        _ => time,
+    };
+    let at = match kind {
+        Kind::Expire | Kind::PExpire => {
+            let now = i64::try_from(crate::storage::unix_ms()).unwrap_or(i64::MAX);
+            millis.checked_add(now).ok_or_else(invalid)?
+        }
+        _ => millis,
+    };
+    let mut items = items;
+    items.truncate(1);
+    Ok(Cmd::Expire {
+        key: items.pop().unwrap_or_default(),
+        at,
+        options,
     })
 }
 

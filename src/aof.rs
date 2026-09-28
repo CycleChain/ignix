@@ -380,6 +380,22 @@ pub fn emit_aof_del(keys: &[Bytes]) -> Vec<u8> {
     encode(b"DEL", keys.iter().map(|k| &k[..]))
 }
 
+/// Generate AOF entry for PEXPIREAT command, which EXPIRE and its variants
+/// are logged as
+///
+/// # Arguments
+/// * `k` - Key bytes
+/// * `at` - Expiry as a unix time in milliseconds
+pub fn emit_aof_pexpireat(k: &[u8], at: i64) -> Vec<u8> {
+    let mut digits = [0u8; 20];
+    encode(b"PEXPIREAT", [k, fmt_i64(at, &mut digits)].into_iter())
+}
+
+/// Generate AOF entry for PERSIST command
+pub fn emit_aof_persist(k: &[u8]) -> Vec<u8> {
+    encode(b"PERSIST", [k].into_iter())
+}
+
 /// Generate AOF entry for FLUSHDB command
 pub fn emit_aof_flushdb() -> Vec<u8> {
     encode(b"FLUSHDB", std::iter::empty())

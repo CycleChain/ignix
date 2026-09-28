@@ -143,6 +143,86 @@ fn flushdb_and_flushall_are_logged() {
     );
 }
 
+/// The PEXPIREAT record for `key` in `data`, and its time
+fn pexpireat_time(data: &[u8], key: &[u8]) -> i64 {
+    let head = [
+        b"*3\r\n$9\r\nPEXPIREAT\r\n$".as_slice(),
+        key.len().to_string().as_bytes(),
+        b"\r\n",
+        key,
+        b"\r\n$",
+    ]
+    .concat();
+    let start = data
+        .windows(head.len())
+        .position(|w| w == head.as_slice())
+        .unwrap_or_else(|| {
+            panic!(
+                "no PEXPIREAT for {key:?} in {:?}",
+                String::from_utf8_lossy(data)
+            )
+        })
+        + head.len();
+    let rest = &data[start..];
+    let header_end = rest.windows(2).position(|w| w == b"\r\n").unwrap();
+    let len: usize = std::str::from_utf8(&rest[..header_end])
+        .unwrap()
+        .parse()
+        .unwrap();
+    let value = &rest[header_end + 2..header_end + 2 + len];
+    std::str::from_utf8(value).unwrap().parse().unwrap()
+}
+
+fn unix_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+#[test]
+fn expire_family_is_logged_as_pexpireat_with_an_absolute_time() {
+    let before = unix_ms();
+    let data = aof_after(
+        "expire",
+        &[
+            &[b"SET", b"e", b"1"],
+            &[b"EXPIRE", b"e", b"100"],
+            &[b"SET", b"p", b"1"],
+            &[b"PEXPIREAT", b"p", b"4102444800000"],
+        ],
+    );
+    let after = unix_ms();
+    let at = pexpireat_time(&data, b"e");
+    assert!(before + 100_000 <= at && at <= after + 100_000, "{at}");
+    assert_eq!(pexpireat_time(&data, b"p"), 4_102_444_800_000);
+}
+
+#[test]
+fn passed_expiry_and_persist_are_logged_and_no_ops_are_not() {
+    let data = aof_after(
+        "expire-del",
+        &[
+            &[b"SET", b"gone", b"1"],
+            &[b"EXPIRE", b"gone", b"0"],
+            &[b"SET", b"kept", b"1"],
+            &[b"EXPIRE", b"kept", b"100"],
+            &[b"PERSIST", b"kept"],
+            &[b"PERSIST", b"kept"],
+            &[b"EXPIRE", b"missing", b"100"],
+            &[b"EXPIRE", b"kept", b"100", b"XX"],
+        ],
+    );
+    let text = String::from_utf8_lossy(&data);
+    assert!(
+        contains(&data, b"*2\r\n$3\r\nDEL\r\n$4\r\ngone\r\n"),
+        "{text}"
+    );
+    assert_eq!(text.matches("PERSIST").count(), 1, "{text}");
+    assert_eq!(text.matches("PEXPIREAT").count(), 1, "{text}");
+    assert!(!contains(&data, b"missing"), "{text}");
+}
+
 #[test]
 fn failed_incr_is_not_logged() {
     let data = aof_after("incr", &[&[b"SET", b"t", b"abc"], &[b"INCR", b"t"]]);

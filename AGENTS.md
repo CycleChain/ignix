@@ -86,6 +86,11 @@ boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler 
   sırayla kilitler. Birden çok parçayı başka yoldan kilitleme ve kilitler tutulurken `Dict`'i
   kullanma (kilitlenme). Parçaya yeni tablo koyan kod `Table::with_hasher(self.hasher.clone())`
   kullanmalı: tablo büyürken kendi hasher'ıyla yeniden hash'ler.
+  Süre sonu: `Entry::expires_at` mutlak unix ms (0 süresiz); saat yalnızca süreli anahtara
+  bakılınca okunur (`Clock`). Süresi dolmuş anahtar her yolda yok sayılır ve silinir; silme
+  `on_expired` kancasıyla (Shard: sayaç + AOF'a `DEL`) bildirilir. SET/MSET/RENAME hedefi gibi
+  anahtarı zaten değiştiren komutlarda kanca `replaced` ile çağrılır ve `DEL` yazılmaz: SET
+  kaydı uygulamadan önce yazıldığı için `DEL` ondan sonra gelip anahtarı silerdi.
 - `src/aof.rs`: `spawn_aof_writer` (dosyayı önce açar, açamazsa `Err` döner; ayrı iş
   parçacığı, 4096 kapasiteli sınırlı kanal; kayıtlar en geç bir saniye içinde `sync_data` ile
   diske işlenir) ve ikili güvenli `emit_aof_*` kodlayıcıları.
@@ -96,7 +101,8 @@ boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler 
 
 Desteklenen komutlar: PING, ECHO, QUIT, SELECT (yalnızca 0), HELLO, CLIENT (ID, GETNAME,
 SETNAME, SETINFO, HELP), INFO, CONFIG (GET, HELP), GET, SET, DEL, UNLINK, EXISTS, TYPE, DBSIZE,
-KEYS, SCAN, FLUSHDB, FLUSHALL, INCR, INCRBY, DECR, DECRBY, RENAME, MGET, MSET.
+KEYS, SCAN, FLUSHDB, FLUSHALL, INCR, INCRBY, DECR, DECRBY, RENAME, MGET, MSET, EXPIRE, PEXPIRE,
+EXPIREAT, PEXPIREAT, TTL, PTTL, EXPIRETIME, PEXPIRETIME, PERSIST.
 
 ## Dizin haritası
 

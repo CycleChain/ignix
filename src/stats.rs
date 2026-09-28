@@ -114,6 +114,10 @@ impl Stats {
     pub(crate) fn client_disconnected(&self) {
         self.connected_clients.fetch_sub(1, Ordering::Relaxed);
     }
+
+    pub(crate) fn key_expired(&self) {
+        self.expired_keys.fetch_add(1, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]

@@ -686,6 +686,196 @@ fn config_checks_subcommands_and_their_arity_like_redis() {
     assert!(help.starts_with(b"*5\r\n+CONFIG <subcommand> [<arg> [value] [opt] ...]."));
 }
 
+/// Far in the future, as a unix time in milliseconds (2100-01-01)
+const FUTURE_MS: i64 = 4_102_444_800_000;
+
+fn integer(reply: &[u8]) -> i64 {
+    assert!(
+        reply.starts_with(b":"),
+        "{:?}",
+        String::from_utf8_lossy(reply)
+    );
+    std::str::from_utf8(&reply[1..reply.len() - 2])
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+#[test]
+fn expire_sets_a_relative_expiry_that_ttl_reports() {
+    let s = shard();
+    exec(&s, &[b"SET", b"k", b"v"]);
+    assert_eq!(exec(&s, &[b"EXPIRE", b"k", b"100"]), b":1\r\n");
+    assert_eq!(exec(&s, &[b"TTL", b"k"]), b":100\r\n");
+    let pttl = integer(&exec(&s, &[b"PTTL", b"k"]));
+    assert!((99_000..=100_000).contains(&pttl), "{pttl}");
+    assert_eq!(exec(&s, &[b"PEXPIRE", b"k", b"5000"]), b":1\r\n");
+    assert_eq!(exec(&s, &[b"TTL", b"k"]), b":5\r\n");
+}
+
+#[test]
+fn ttl_family_reports_missing_keys_and_keys_without_expiry() {
+    let s = shard();
+    exec(&s, &[b"SET", b"p", b"v"]);
+    for command in [&b"TTL"[..], b"PTTL", b"EXPIRETIME", b"PEXPIRETIME"] {
+        assert_eq!(exec(&s, &[command, b"missing"]), b":-2\r\n");
+        assert_eq!(exec(&s, &[command, b"p"]), b":-1\r\n");
+    }
+    exec(&s, &[b"EXPIREAT", b"p", b"4102444800"]);
+    assert_eq!(exec(&s, &[b"EXPIRETIME", b"p"]), b":4102444800\r\n");
+    assert_eq!(exec(&s, &[b"PEXPIRETIME", b"p"]), b":4102444800000\r\n");
+}
+
+#[test]
+fn a_time_that_has_passed_deletes_the_key() {
+    let s = shard();
+    for args in [
+        &[&b"EXPIRE"[..], b"k", b"0"][..],
+        &[b"EXPIRE", b"k", b"-5"],
+        &[b"PEXPIRE", b"k", b"0"],
+        &[b"PEXPIREAT", b"k", b"1"],
+        &[b"EXPIREAT", b"k", b"100"],
+    ] {
+        exec(&s, &[b"SET", b"k", b"v"]);
+        assert_eq!(exec(&s, args), b":1\r\n");
+        assert_eq!(exec(&s, &[b"EXISTS", b"k"]), b":0\r\n");
+    }
+}
+
+#[test]
+fn expire_and_persist_on_missing_keys_and_keys_without_expiry() {
+    let s = shard();
+    assert_eq!(exec(&s, &[b"EXPIRE", b"missing", b"10"]), b":0\r\n");
+    assert_eq!(exec(&s, &[b"PERSIST", b"missing"]), b":0\r\n");
+    exec(&s, &[b"SET", b"p", b"v"]);
+    assert_eq!(exec(&s, &[b"PERSIST", b"p"]), b":0\r\n");
+    exec(&s, &[b"EXPIRE", b"p", b"10"]);
+    assert_eq!(exec(&s, &[b"PERSIST", b"p"]), b":1\r\n");
+    assert_eq!(exec(&s, &[b"TTL", b"p"]), b":-1\r\n");
+}
+
+#[test]
+fn expire_options_follow_redis() {
+    let s = shard();
+    let at = |offset: i64| (FUTURE_MS + offset).to_string().into_bytes();
+    let set = |time: &[u8], option: &[u8]| integer(&exec(&s, &[b"PEXPIREAT", b"n", time, option]));
+    exec(&s, &[b"SET", b"n", b"v"]);
+    // Without an expiry: XX and GT fail, LT and NX set it
+    assert_eq!(set(&at(0), b"XX"), 0);
+    assert_eq!(set(&at(0), b"GT"), 0);
+    assert_eq!(set(&at(0), b"LT"), 1);
+    exec(&s, &[b"PERSIST", b"n"]);
+    assert_eq!(set(&at(0), b"NX"), 1);
+    // With an expiry: NX fails, XX sets, GT and LT compare
+    assert_eq!(set(&at(10), b"NX"), 0);
+    assert_eq!(set(&at(10), b"XX"), 1);
+    assert_eq!(set(&at(5), b"GT"), 0);
+    assert_eq!(set(&at(10), b"GT"), 0);
+    assert_eq!(set(&at(50), b"gt"), 1);
+    assert_eq!(set(&at(100), b"LT"), 0);
+    assert_eq!(set(&at(1), b"LT"), 1);
+    assert_eq!(integer(&exec(&s, &[b"PEXPIRETIME", b"n"])), FUTURE_MS + 1);
+    // XX may be combined with GT or LT
+    let reply = exec(&s, &[b"PEXPIREAT", b"n", &at(2), b"XX", b"GT"]);
+    assert_eq!(integer(&reply), 1);
+}
+
+#[test]
+fn incr_keeps_the_expiry_while_set_mset_and_rename_follow_redis() {
+    let s = shard();
+    let future = FUTURE_MS.to_string().into_bytes();
+    exec(&s, &[b"SET", b"i", b"5"]);
+    exec(&s, &[b"PEXPIREAT", b"i", &future]);
+    assert_eq!(exec(&s, &[b"INCR", b"i"]), b":6\r\n");
+    assert_eq!(integer(&exec(&s, &[b"PEXPIRETIME", b"i"])), FUTURE_MS);
+    exec(&s, &[b"SET", b"i", b"7"]);
+    assert_eq!(exec(&s, &[b"TTL", b"i"]), b":-1\r\n");
+    exec(&s, &[b"PEXPIREAT", b"i", &future]);
+    exec(&s, &[b"MSET", b"i", b"8"]);
+    assert_eq!(exec(&s, &[b"TTL", b"i"]), b":-1\r\n");
+    // RENAME moves the expiry and replaces the target's
+    exec(&s, &[b"SET", b"r", b"v"]);
+    exec(&s, &[b"PEXPIREAT", b"r", &future]);
+    exec(&s, &[b"RENAME", b"r", b"r2"]);
+    assert_eq!(integer(&exec(&s, &[b"PEXPIRETIME", b"r2"])), FUTURE_MS);
+    exec(&s, &[b"SET", b"src", b"y"]);
+    exec(&s, &[b"RENAME", b"src", b"r2"]);
+    assert_eq!(exec(&s, &[b"TTL", b"r2"]), b":-1\r\n");
+}
+
+#[test]
+fn expire_errors_match_redis() {
+    let s = shard();
+    exec(&s, &[b"SET", b"p", b"v"]);
+    let cases: [(&[&[u8]], &[u8]); 11] = [
+        (
+            &[b"EXPIRE", b"p", b"abc"],
+            b"-ERR value is not an integer or out of range\r\n",
+        ),
+        (
+            &[b"EXPIRE", b"p", b"10", b"FOO"],
+            b"-ERR Unsupported option FOO\r\n",
+        ),
+        // Options are checked before the time
+        (
+            &[b"EXPIRE", b"p", b"abc", b"FOO"],
+            b"-ERR Unsupported option FOO\r\n",
+        ),
+        (
+            &[b"EXPIRE", b"p", b"10", b"NX", b"XX"],
+            b"-ERR NX and XX, GT or LT options at the same time are not compatible\r\n",
+        ),
+        (
+            &[b"EXPIRE", b"p", b"10", b"NX", b"GT"],
+            b"-ERR NX and XX, GT or LT options at the same time are not compatible\r\n",
+        ),
+        (
+            &[b"EXPIRE", b"p", b"10", b"GT", b"LT"],
+            b"-ERR GT and LT options at the same time are not compatible\r\n",
+        ),
+        (
+            &[b"EXPIRE", b"p", b"9223372036854775807"],
+            b"-ERR invalid expire time in 'expire' command\r\n",
+        ),
+        (
+            &[b"EXPIRE", b"p", b"-9223372036854775808"],
+            b"-ERR invalid expire time in 'expire' command\r\n",
+        ),
+        (
+            &[b"PEXPIRE", b"p", b"9223372036854775807"],
+            b"-ERR invalid expire time in 'pexpire' command\r\n",
+        ),
+        (
+            &[b"EXPIREAT", b"p", b"9223372036854775807"],
+            b"-ERR invalid expire time in 'expireat' command\r\n",
+        ),
+        (
+            &[b"EXPIRE", b"p"],
+            b"-ERR wrong number of arguments for 'expire' command\r\n",
+        ),
+    ];
+    for (args, expected) in cases {
+        assert_eq!(exec(&s, args), expected, "{args:?}");
+    }
+    for name in ["ttl", "pttl", "expiretime", "pexpiretime", "persist"] {
+        let upper = name.to_uppercase();
+        assert_eq!(exec(&s, &[upper.as_bytes()]), arity_error(name));
+    }
+    // The key is untouched by the failed commands
+    assert_eq!(exec(&s, &[b"TTL", b"p"]), b":-1\r\n");
+}
+
+#[test]
+fn info_keyspace_counts_keys_with_an_expiry() {
+    let s = shard();
+    exec(&s, &[b"MSET", b"a", b"1", b"b", b"2"]);
+    exec(&s, &[b"EXPIRE", b"a", b"100"]);
+    assert_eq!(
+        info_text(&s, &[b"INFO", b"keyspace"]),
+        "# Keyspace\r\ndb0:keys=2,expires=1,avg_ttl=0\r\n"
+    );
+}
+
 #[test]
 fn get_with_extra_argument_is_an_arity_error() {
     let s = shard();

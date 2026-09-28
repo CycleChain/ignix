@@ -7,7 +7,7 @@
  */
 
 use crate::glob::Pattern;
-use crate::protocol::{parse_canonical_i64, Value};
+use crate::protocol::{parse_canonical_i64, ExpireOptions, Value};
 use bytes::Bytes;
 use crossbeam::utils::CachePadded;
 use hashbrown::hash_map::RawEntryMut;
@@ -16,6 +16,7 @@ use std::collections::hash_map::RandomState;
 use std::fmt;
 use std::hash::BuildHasher;
 use std::sync::{PoisonError, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Number of shards of the keyspace (a power of two)
 const SHARDS: usize = 1024;
@@ -39,6 +40,48 @@ impl Entry {
             expires_at: 0,
         }
     }
+
+    /// Whether the entry has expired: like Redis, once the time is past its
+    /// expiry
+    fn expired(&self, clock: &mut Clock) -> bool {
+        self.expires_at != 0 && clock.now() > self.expires_at
+    }
+}
+
+/// The current time in unix milliseconds
+pub(crate) fn unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |since| since.as_millis() as u64)
+}
+
+/// The time of one operation: read at most once, and only when a key with
+/// an expiry is looked at
+#[derive(Default)]
+struct Clock(Option<u64>);
+
+impl Clock {
+    fn now(&mut self) -> u64 {
+        *self.0.get_or_insert_with(unix_ms)
+    }
+}
+
+/// Told about each key found expired, while its shard is locked: with
+/// `replaced` set when the command replaces the key anyway (SET, MSET, the
+/// target of RENAME), so that only the removal of other keys needs a record
+pub(crate) type ExpiredHook = Box<dyn Fn(&Bytes, bool) + Send + Sync>;
+
+/// What [`Dict::expire`] did
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ExpireResult {
+    /// The key does not exist
+    Missing,
+    /// The options did not allow the change
+    Unchanged,
+    /// The expiry was set
+    Set,
+    /// The time was not after now, so the key was deleted
+    Deleted,
 }
 
 /// One shard: keys hashed with the `Dict`'s hasher
@@ -77,9 +120,13 @@ impl std::error::Error for IncrError {}
 /// The core storage structure that holds all key-value pairs in memory, in
 /// 1024 hash tables (shards) with one read-write lock each. Keys are hashed
 /// with SipHash and random keys (std `RandomState`), like std's `HashMap`.
+///
+/// Keys with an expiry are removed lazily: every access treats an expired
+/// key as missing and removes it.
 pub struct Dict {
     hasher: RandomState,
     shards: Box<[CachePadded<RwLock<Table>>]>,
+    on_expired: Option<ExpiredHook>,
 }
 
 impl Default for Dict {
@@ -88,7 +135,11 @@ impl Default for Dict {
         let shards = (0..SHARDS)
             .map(|_| CachePadded::new(RwLock::new(Table::with_hasher(hasher.clone()))))
             .collect();
-        Self { hasher, shards }
+        Self {
+            hasher,
+            shards,
+            on_expired: None,
+        }
     }
 }
 
@@ -103,7 +154,53 @@ impl Dict {
     #[inline]
     fn locate(&self, key: &[u8]) -> (u64, usize) {
         let hash = self.hasher.hash_one(key);
-        (hash, ((hash >> SHARD_SHIFT) as usize) & (SHARDS - 1))
+        (hash, shard_of(hash))
+    }
+
+    /// Store `key` with an expiry that has already passed, as if it had
+    /// expired since it was written
+    #[cfg(test)]
+    pub(crate) fn insert_expired(&self, key: Bytes, value: Value) {
+        let (hash, shard) = self.locate(&key);
+        let entry = Entry {
+            value,
+            expires_at: 1,
+        };
+        let mut table = self.write_shard(shard);
+        match table
+            .raw_entry_mut()
+            .from_key_hashed_nocheck(hash, &key[..])
+        {
+            RawEntryMut::Occupied(mut slot) => *slot.get_mut() = entry,
+            RawEntryMut::Vacant(slot) => {
+                slot.insert_hashed_nocheck(hash, key, entry);
+            }
+        }
+    }
+
+    /// Call `hook` for every key found expired, while its shard is locked
+    pub(crate) fn set_on_expired(&mut self, hook: ExpiredHook) {
+        self.on_expired = Some(hook);
+    }
+
+    fn expired(&self, key: &Bytes, replaced: bool) {
+        if let Some(hook) = &self.on_expired {
+            hook(key, replaced);
+        }
+    }
+
+    /// Remove `key` if it has expired. Readers call this after finding the
+    /// key expired under a read lock; it may have been written since.
+    fn remove_expired(&self, key: &[u8], hash: u64) {
+        let mut table = self.write_shard(shard_of(hash));
+        if let RawEntryMut::Occupied(slot) =
+            table.raw_entry_mut().from_key_hashed_nocheck(hash, key)
+        {
+            if slot.get().expired(&mut Clock::default()) {
+                let (key, _) = slot.remove_entry();
+                self.expired(&key, false);
+            }
+        }
     }
 
     #[inline]
@@ -170,7 +267,7 @@ impl Dict {
     pub(crate) fn lock_keys<'k>(&self, keys: impl IntoIterator<Item = &'k [u8]>) -> LockedKeys<'_> {
         let (guards, keys) = self.lock_shards(keys, |shard| self.write_shard(shard));
         LockedKeys {
-            hasher: &self.hasher,
+            dict: self,
             guards,
             keys,
         }
@@ -196,14 +293,22 @@ impl Dict {
     /// with every shard read-locked (KEYS)
     pub(crate) fn keys(&self, pattern: Option<&Pattern>) -> Vec<Bytes> {
         let tables = self.read_all();
+        let mut clock = Clock::default();
         let mut keys = Vec::new();
         for table in &tables {
-            let matching = table
-                .keys()
-                .filter(|k| pattern.is_none_or(|p| p.matches(k)));
-            keys.extend(matching.cloned());
+            keys.extend(live_keys(table, &mut clock, pattern));
         }
         keys
+    }
+
+    /// Number of keys with an expiry (INFO); like Redis, keys that have
+    /// expired but were not removed yet are counted
+    pub(crate) fn count_volatile(&self) -> usize {
+        let tables = self.read_all();
+        let volatile = |table: &&RwLockReadGuard<'_, Table>| {
+            table.values().filter(|entry| entry.expires_at != 0).count()
+        };
+        tables.iter().map(|table| volatile(&table)).sum()
     }
 
     /// One step of SCAN from `cursor`, the index of the next shard to visit.
@@ -221,14 +326,12 @@ impl Dict {
     ) -> (u64, Vec<Bytes>) {
         let mut shard = usize::try_from(cursor).unwrap_or(SHARDS);
         let (mut seen, mut visited) = (0, 0);
+        let mut clock = Clock::default();
         let mut keys = Vec::new();
         while shard < SHARDS && seen < count && visited < count.saturating_mul(10) {
             let table = self.read_shard(shard);
             seen += table.len();
-            let matching = table
-                .keys()
-                .filter(|k| pattern.is_none_or(|p| p.matches(k)));
-            keys.extend(matching.cloned());
+            keys.extend(live_keys(&table, &mut clock, pattern));
             shard += 1;
             visited += 1;
         }
@@ -274,11 +377,27 @@ impl Dict {
     /// * `None` if key doesn't exist
     #[inline]
     pub fn get(&self, k: &[u8]) -> Option<Value> {
+        self.read(k, |value| value.cloned())
+    }
+
+    /// Call `f` with the entry stored under `k`, or `None` if it is missing
+    /// or expired, while its shard's read lock is held. `f` must not use the
+    /// dictionary.
+    #[inline]
+    fn read_entry<R>(&self, k: &[u8], f: impl FnOnce(Option<&Entry>) -> R) -> R {
         let (hash, shard) = self.locate(k);
-        self.read_shard(shard)
+        let table = self.read_shard(shard);
+        let entry = table
             .raw_entry()
             .from_key_hashed_nocheck(hash, k)
-            .map(|(_, entry)| entry.value.clone())
+            .map(|(_, entry)| entry);
+        let expired = entry.is_some_and(|entry| entry.expired(&mut Clock::default()));
+        let result = f(entry.filter(|_| !expired));
+        drop(table);
+        if expired {
+            self.remove_expired(k, hash);
+        }
+        result
     }
 
     /// Call `f` with the value stored under `k` while its shard's read lock
@@ -286,12 +405,13 @@ impl Dict {
     /// use the dictionary.
     #[inline]
     pub(crate) fn read<R>(&self, k: &[u8], f: impl FnOnce(Option<&Value>) -> R) -> R {
-        let (hash, shard) = self.locate(k);
-        let table = self.read_shard(shard);
-        f(table
-            .raw_entry()
-            .from_key_hashed_nocheck(hash, k)
-            .map(|(_, entry)| &entry.value))
+        self.read_entry(k, |entry| f(entry.map(|entry| &entry.value)))
+    }
+
+    /// The expiry of `k` in unix milliseconds, 0 if it has none, or `None`
+    /// if the key does not exist
+    pub(crate) fn expiry(&self, k: &[u8]) -> Option<u64> {
+        self.read_entry(k, |entry| entry.map(|entry| entry.expires_at))
     }
 
     /// Call `f` with the value of each of `keys`, in order, while the shards
@@ -303,11 +423,24 @@ impl Dict {
         }
         let keys_bytes = keys.iter().map(|k| &k[..]);
         let (guards, located) = self.lock_shards(keys_bytes, |shard| self.read_shard(shard));
+        let mut clock = Clock::default();
+        let mut expired = Vec::new();
         for (key, &(hash, guard)) in keys.iter().zip(&located) {
-            f(guards[guard]
+            let entry = guards[guard]
                 .raw_entry()
                 .from_key_hashed_nocheck(hash, &key[..])
-                .map(|(_, entry)| &entry.value));
+                .map(|(_, entry)| entry);
+            match entry {
+                Some(entry) if entry.expired(&mut clock) => {
+                    expired.push((key, hash));
+                    f(None);
+                }
+                entry => f(entry.map(|entry| &entry.value)),
+            }
+        }
+        drop(guards);
+        for (key, hash) in expired {
+            self.remove_expired(key, hash);
         }
     }
 
@@ -326,9 +459,14 @@ impl Dict {
         let (hash, shard) = self.locate(&k);
         let mut table = self.write_shard(shard);
         match table.raw_entry_mut().from_key_hashed_nocheck(hash, &k[..]) {
-            RawEntryMut::Occupied(mut entry) => *entry.get_mut() = Entry::new(v),
-            RawEntryMut::Vacant(entry) => {
-                entry.insert_hashed_nocheck(hash, k, Entry::new(v));
+            RawEntryMut::Occupied(mut slot) => {
+                let old = std::mem::replace(slot.get_mut(), Entry::new(v));
+                if old.expired(&mut Clock::default()) {
+                    self.expired(slot.key(), true);
+                }
+            }
+            RawEntryMut::Vacant(slot) => {
+                slot.insert_hashed_nocheck(hash, k, Entry::new(v));
             }
         }
     }
@@ -361,9 +499,13 @@ impl Dict {
             .raw_entry_mut()
             .from_key_hashed_nocheck(hash, k)
         {
-            RawEntryMut::Occupied(entry) => {
-                entry.remove();
-                true
+            RawEntryMut::Occupied(slot) => {
+                let (key, entry) = slot.remove_entry();
+                let expired = entry.expired(&mut Clock::default());
+                if expired {
+                    self.expired(&key, false);
+                }
+                !expired
             }
             RawEntryMut::Vacant(_) => false,
         }
@@ -429,11 +571,67 @@ impl Dict {
     /// * `false` if key doesn't exist
     #[inline]
     pub fn exists(&self, k: &[u8]) -> bool {
-        let (hash, shard) = self.locate(k);
-        self.read_shard(shard)
-            .raw_entry()
-            .from_key_hashed_nocheck(hash, k)
-            .is_some()
+        self.read(k, |value| value.is_some())
+    }
+
+    /// Set the expiry of `key` to `at`, a unix time in milliseconds, if
+    /// `options` allow it (EXPIRE and its variants). Like Redis, a time that
+    /// is not after now deletes the key, a key without an expiry never passes
+    /// GT and always passes LT.
+    pub(crate) fn expire(&self, key: &[u8], at: i64, options: ExpireOptions) -> ExpireResult {
+        let (hash, shard) = self.locate(key);
+        let mut table = self.write_shard(shard);
+        let RawEntryMut::Occupied(mut slot) =
+            table.raw_entry_mut().from_key_hashed_nocheck(hash, key)
+        else {
+            return ExpireResult::Missing;
+        };
+        let mut clock = Clock::default();
+        if slot.get().expired(&mut clock) {
+            let (key, _) = slot.remove_entry();
+            self.expired(&key, false);
+            return ExpireResult::Missing;
+        }
+        let current = slot.get().expires_at;
+        let has_expiry = current != 0;
+        let current = i64::try_from(current).unwrap_or(i64::MAX);
+        if (options.nx && has_expiry)
+            || (options.xx && !has_expiry)
+            || (options.gt && (!has_expiry || at <= current))
+            || (options.lt && has_expiry && at >= current)
+        {
+            return ExpireResult::Unchanged;
+        }
+        match u64::try_from(at) {
+            Ok(at) if at > clock.now() => {
+                slot.get_mut().expires_at = at;
+                ExpireResult::Set
+            }
+            _ => {
+                slot.remove();
+                ExpireResult::Deleted
+            }
+        }
+    }
+
+    /// Remove the expiry of `key` (PERSIST); returns whether it had one
+    pub(crate) fn persist(&self, key: &[u8]) -> bool {
+        let (hash, shard) = self.locate(key);
+        let mut table = self.write_shard(shard);
+        let RawEntryMut::Occupied(mut slot) =
+            table.raw_entry_mut().from_key_hashed_nocheck(hash, key)
+        else {
+            return false;
+        };
+        if slot.get().expired(&mut Clock::default()) {
+            let (key, _) = slot.remove_entry();
+            self.expired(&key, false);
+            return false;
+        }
+        let entry = slot.get_mut();
+        let had_expiry = entry.expires_at != 0;
+        entry.expires_at = 0;
+        had_expiry
     }
 
     /// Atomically increment the integer stored under `key`, creating it with
@@ -457,6 +655,13 @@ impl Dict {
             .from_key_hashed_nocheck(hash, &key[..])
         {
             RawEntryMut::Occupied(mut slot) => {
+                if slot.get().expired(&mut Clock::default()) {
+                    // Counts from 0 like a missing key; the removal is logged
+                    // before the increment
+                    self.expired(slot.key(), false);
+                    *slot.get_mut() = Entry::new(Value::Int(delta));
+                    return Ok(delta);
+                }
                 let entry = slot.get_mut();
                 let current = match &entry.value {
                     Value::Int(i) => *i,
@@ -476,12 +681,32 @@ impl Dict {
     }
 }
 
+/// The shard of a key with this hash
+#[inline]
+fn shard_of(hash: u64) -> usize {
+    ((hash >> SHARD_SHIFT) as usize) & (SHARDS - 1)
+}
+
+/// The keys of `table` that have not expired and match `pattern`
+fn live_keys<'t>(
+    table: &'t Table,
+    clock: &'t mut Clock,
+    pattern: Option<&'t Pattern>,
+) -> impl Iterator<Item = Bytes> + 't {
+    table
+        .iter()
+        .filter(move |(_, entry)| !entry.expired(clock))
+        .map(|(key, _)| key)
+        .filter(move |key| pattern.is_none_or(|p| p.matches(key)))
+        .cloned()
+}
+
 /// Write locks on the shards of a list of keys, from [`Dict::lock_keys`]
 ///
 /// A key is addressed by its position in that list, and every method must be
 /// given the key at that position.
 pub(crate) struct LockedKeys<'a> {
-    hasher: &'a RandomState,
+    dict: &'a Dict,
     /// The locked shards, in ascending order
     guards: Vec<RwLockWriteGuard<'a, Table>>,
     /// Each key's hash and the index of its shard's guard
@@ -492,27 +717,46 @@ impl LockedKeys<'_> {
     /// The hash and the table of key `i`
     fn table(&mut self, i: usize, key: &[u8]) -> (u64, &mut Table) {
         let (hash, guard) = self.keys[i];
-        debug_assert_eq!(hash, self.hasher.hash_one(key), "key {i} was not locked");
+        debug_assert_eq!(
+            hash,
+            self.dict.hasher.hash_one(key),
+            "key {i} was not locked"
+        );
         (hash, &mut self.guards[guard])
     }
 
-    /// Remove key `i`, returning its entry
+    /// Remove key `i`, returning its entry; an expired entry is removed but
+    /// not returned
     pub(crate) fn remove(&mut self, i: usize, key: &[u8]) -> Option<Entry> {
+        let dict = self.dict;
         let (hash, table) = self.table(i, key);
         match table.raw_entry_mut().from_key_hashed_nocheck(hash, key) {
-            RawEntryMut::Occupied(entry) => Some(entry.remove()),
+            RawEntryMut::Occupied(slot) => {
+                let (key, entry) = slot.remove_entry();
+                if entry.expired(&mut Clock::default()) {
+                    dict.expired(&key, false);
+                    return None;
+                }
+                Some(entry)
+            }
             RawEntryMut::Vacant(_) => None,
         }
     }
 
     /// Store `entry` under key `i`, replacing any previous entry
     pub(crate) fn insert(&mut self, i: usize, key: Bytes, entry: Entry) {
+        let dict = self.dict;
         let (hash, table) = self.table(i, &key);
         match table
             .raw_entry_mut()
             .from_key_hashed_nocheck(hash, &key[..])
         {
-            RawEntryMut::Occupied(mut slot) => *slot.get_mut() = entry,
+            RawEntryMut::Occupied(mut slot) => {
+                let old = std::mem::replace(slot.get_mut(), entry);
+                if old.expired(&mut Clock::default()) {
+                    dict.expired(slot.key(), true);
+                }
+            }
             RawEntryMut::Vacant(slot) => {
                 slot.insert_hashed_nocheck(hash, key, entry);
             }
@@ -637,6 +881,103 @@ mod tests {
             done.store(true, Ordering::Relaxed);
             counter.join().unwrap();
         });
+    }
+
+    /// The calls of an expiry hook: each key and whether it was replaced
+    type HookCalls = std::sync::Arc<std::sync::Mutex<Vec<(Bytes, bool)>>>;
+
+    /// A dictionary that records the calls of its expiry hook
+    fn recording_dict() -> (Dict, HookCalls) {
+        let calls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let mut dict = Dict::default();
+        let recorded = calls.clone();
+        dict.set_on_expired(Box::new(move |key: &Bytes, replaced: bool| {
+            recorded.lock().unwrap().push((key.clone(), replaced));
+        }));
+        (dict, calls)
+    }
+
+    #[test]
+    fn reads_treat_expired_keys_as_missing_and_remove_them() {
+        let (dict, calls) = recording_dict();
+        let (a, _, b) = keys_by_shard(&dict);
+        dict.insert_expired(a.clone(), Value::Int(1));
+        dict.insert_expired(b.clone(), Value::Int(2));
+        assert_eq!(dict.get(&a), None);
+        assert!(!dict.exists(&a));
+        let mut values = Vec::new();
+        dict.read_many(&[a.clone(), b.clone()], |v| values.push(v.cloned()));
+        assert_eq!(values, [None, None]);
+        assert_eq!(dict.expiry(&b), None);
+        assert_eq!(dict.len(), 0);
+        assert_eq!(*calls.lock().unwrap(), [(a, false), (b, false)]);
+    }
+
+    #[test]
+    fn writes_over_expired_keys_follow_redis() {
+        let (dict, calls) = recording_dict();
+        let (a, _, b) = keys_by_shard(&dict);
+        // SET replaces it: counted, nothing to log
+        dict.insert_expired(a.clone(), Value::Int(1));
+        dict.set(a.clone(), Value::Int(2));
+        assert_eq!(dict.get(&a), Some(Value::Int(2)));
+        // DEL does not count it
+        dict.insert_expired(a.clone(), Value::Int(1));
+        assert!(!dict.del(&a));
+        // INCR starts from zero and keeps no expiry
+        dict.insert_expired(a.clone(), Value::Int(41));
+        assert_eq!(dict.incr(a.clone()), Ok(1));
+        assert_eq!(dict.expiry(&a), Some(0));
+        // RENAME of an expired key fails; onto one, it replaces it
+        dict.insert_expired(b.clone(), Value::Int(1));
+        assert!(!dict.rename(b.clone(), key("elsewhere")));
+        dict.insert_expired(b.clone(), Value::Int(1));
+        assert!(dict.rename(a.clone(), b.clone()));
+        assert_eq!(dict.get(&b), Some(Value::Int(1)));
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                (a.clone(), true),
+                (a.clone(), false),
+                (a.clone(), false),
+                (b.clone(), false),
+                (b.clone(), true),
+            ]
+        );
+    }
+
+    #[test]
+    fn keys_and_scan_skip_expired_keys() {
+        let dict = Dict::default();
+        dict.set(key("live"), Value::Int(1));
+        dict.insert_expired(key("gone"), Value::Int(2));
+        assert_eq!(dict.keys(None), [key("live")]);
+        assert_eq!(dict.scan(0, 100_000, None), (0, vec![key("live")]));
+        // Like Redis, DBSIZE and INFO count it until it is removed
+        assert_eq!((dict.len(), dict.count_volatile()), (2, 1));
+    }
+
+    #[test]
+    fn expire_and_persist_treat_expired_keys_as_missing() {
+        let (dict, calls) = recording_dict();
+        let k = key("k");
+        dict.insert_expired(k.clone(), Value::Int(1));
+        let far = 4_102_444_800_000;
+        assert_eq!(
+            dict.expire(&k, far, ExpireOptions::default()),
+            ExpireResult::Missing
+        );
+        dict.insert_expired(k.clone(), Value::Int(1));
+        assert!(!dict.persist(&k));
+        assert_eq!(calls.lock().unwrap().len(), 2);
+        // A time that has passed deletes a live key without calling the hook
+        dict.set(k.clone(), Value::Int(1));
+        assert_eq!(
+            dict.expire(&k, 1, ExpireOptions::default()),
+            ExpireResult::Deleted
+        );
+        assert!(dict.is_empty());
+        assert_eq!(calls.lock().unwrap().len(), 2);
     }
 
     #[test]

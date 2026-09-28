@@ -8,7 +8,7 @@
 
 use crate::aof::{
     emit_aof_del, emit_aof_flushall, emit_aof_flushdb, emit_aof_incr, emit_aof_incrby,
-    emit_aof_mset, emit_aof_rename, emit_aof_set, AofHandle,
+    emit_aof_mset, emit_aof_persist, emit_aof_pexpireat, emit_aof_rename, emit_aof_set, AofHandle,
 };
 use crate::glob::Pattern;
 use crate::info::{write_config_get, write_info, REDIS_VERSION};
@@ -18,7 +18,7 @@ use crate::protocol::{
 };
 use crate::session::Session;
 use crate::stats::Stats;
-use crate::storage::Dict;
+use crate::storage::{unix_ms, Dict, ExpireResult};
 use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
 
@@ -214,12 +214,47 @@ impl Shard {
     /// * `id` - Unique identifier for this shard
     /// * `aof` - Optional AOF handle for command logging
     pub fn new(id: usize, aof: Option<AofHandle>) -> Self {
+        let stats: Arc<Stats> = Arc::default();
+        let mut dict = Dict::default();
+        let (log, counters) = (aof.clone(), stats.clone());
+        // A key removed because it expired is counted and logged as DEL,
+        // unless the command replaces it anyway
+        dict.set_on_expired(Box::new(move |key: &Bytes, replaced: bool| {
+            counters.key_expired();
+            if let (Some(aof), false) = (&log, replaced) {
+                aof.write_owned(emit_aof_del(std::slice::from_ref(key)));
+            }
+        }));
         Self {
             id,
-            dict: Dict::default(),
+            dict,
             aof,
-            stats: Arc::default(),
+            stats,
         }
+    }
+
+    /// Write the TTL family's reply for `key`: the time left, or the expiry
+    /// itself if `absolute`, in milliseconds or rounded seconds
+    fn ttl(&self, key: &[u8], millis: bool, absolute: bool, out: &mut BytesMut) {
+        let reply = match self.dict.expiry(key) {
+            None => -2,
+            Some(0) => -1,
+            Some(at) => {
+                let at = i64::try_from(at).unwrap_or(i64::MAX);
+                let ms = if absolute {
+                    at
+                } else {
+                    let now = i64::try_from(unix_ms()).unwrap_or(i64::MAX);
+                    (at - now).max(0)
+                };
+                if millis {
+                    ms
+                } else {
+                    (ms + 500) / 1000
+                }
+            }
+        };
+        write_integer(reply, out);
     }
 
     /// Execute a Redis command and write response directly to buffer
@@ -443,6 +478,38 @@ impl Shard {
             // INFO [section ...]
             Cmd::Info(sections) => write_info(self, &sections, session.protocol(), out),
 
+            // EXPIRE / PEXPIRE / EXPIREAT / PEXPIREAT, logged as PEXPIREAT, or
+            // as DEL when the time has passed and the key was deleted
+            Cmd::Expire { key, at, options } => {
+                let result = self.dict.expire(&key, at, options);
+                if let Some(a) = &self.aof {
+                    match result {
+                        ExpireResult::Set => a.write_owned(emit_aof_pexpireat(&key, at)),
+                        ExpireResult::Deleted => {
+                            a.write_owned(emit_aof_del(std::slice::from_ref(&key)))
+                        }
+                        ExpireResult::Missing | ExpireResult::Unchanged => {}
+                    }
+                }
+                let changed = matches!(result, ExpireResult::Set | ExpireResult::Deleted);
+                write_integer(i64::from(changed), out);
+            }
+
+            // TTL / PTTL / EXPIRETIME / PEXPIRETIME key
+            Cmd::Ttl(key) => self.ttl(&key, false, false, out),
+            Cmd::PTtl(key) => self.ttl(&key, true, false, out),
+            Cmd::ExpireTime(key) => self.ttl(&key, false, true, out),
+            Cmd::PExpireTime(key) => self.ttl(&key, true, true, out),
+
+            // PERSIST key
+            Cmd::Persist(key) => {
+                let removed = self.dict.persist(&key);
+                if let (Some(a), true) = (&self.aof, removed) {
+                    a.write_owned(emit_aof_persist(&key));
+                }
+                write_integer(i64::from(removed), out);
+            }
+
             // CONFIG GET parameter [parameter ...] / CONFIG HELP
             Cmd::ConfigGet(patterns) => write_config_get(self, &patterns, session.protocol(), out),
             Cmd::ConfigHelp => write_help(&CONFIG_HELP, out),
@@ -453,6 +520,50 @@ impl Shard {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn expired_keys_are_counted_and_logged_as_del() {
+        let dir = std::env::temp_dir().join(format!("ignix-shard-expiry-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("test.aof");
+        let aof = crate::aof::spawn_aof_writer(path.to_str().unwrap()).unwrap();
+        let shard = Shard::new(0, Some(aof));
+        let mut out = BytesMut::new();
+        shard
+            .dict
+            .insert_expired(Bytes::from_static(b"old"), Value::Int(1));
+        shard.exec(Cmd::Get(Bytes::from_static(b"old")), &mut out);
+        assert_eq!(&out[..], b"$-1\r\n");
+        assert_eq!(shard.stats.expired_keys(), 1);
+        // A replaced key is counted but needs no record
+        shard
+            .dict
+            .insert_expired(Bytes::from_static(b"reused"), Value::Int(1));
+        shard.exec(
+            Cmd::Set(Bytes::from_static(b"reused"), Bytes::from_static(b"2")),
+            &mut out,
+        );
+        assert_eq!(shard.stats.expired_keys(), 2);
+        shard.exec(
+            Cmd::Set(Bytes::from_static(b"marker"), Bytes::from_static(b"end")),
+            &mut out,
+        );
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let data = loop {
+            let data = std::fs::read(&path).unwrap_or_default();
+            if data.ends_with(b"$6\r\nmarker\r\n$3\r\nend\r\n") {
+                break data;
+            }
+            assert!(std::time::Instant::now() < deadline, "AOF: {data:?}");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        };
+        drop(shard);
+        let _ = std::fs::remove_dir_all(&dir);
+        let text = String::from_utf8_lossy(&data);
+        assert!(text.contains("*2\r\n$3\r\nDEL\r\n$3\r\nold\r\n"), "{text}");
+        assert!(!text.contains("DEL\r\n$6\r\nreused"), "{text}");
+    }
 
     #[test]
     fn test_shard_alignment() {
