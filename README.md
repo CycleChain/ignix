@@ -77,6 +77,7 @@ world
 | `QUIT` | Reply, then close the connection; requests sent after it are dropped | `QUIT` → `+OK` |
 | `HELLO [protover [AUTH username password] [SETNAME clientname]]` | Switch to RESP2 or RESP3 and describe the server | `HELLO 3` → `%7\r\n$6\r\nserver...` |
 | `AUTH [username] password` | Authenticate the connection when the server runs with `--requirepass` (the only user is `default`) | `AUTH secret` → `+OK` |
+| `COMMAND [COUNT\|INFO [name ...]\|LIST [FILTERBY ...]\|GETKEYS command [arg ...]\|HELP]` | Describe the commands: arity, flags, key positions and ACL categories as Redis 7.0 reports them (without key specifications); `COMMAND DOCS` is not supported, so `redis-cli` uses its own hints | `COMMAND COUNT` → `:44` |
 | `CLIENT ID\|GETNAME\|SETNAME\|SETINFO\|HELP` | The connection's id and name, the client library's name and version | `CLIENT SETNAME app` → `+OK` |
 | `INFO [section ...]` | Server, clients, persistence, stats, replication and keyspace sections, in Redis's format | `INFO keyspace` → `# Keyspace\r\ndb0:keys=2,...` |
 | `CONFIG GET parameter [parameter ...]` | Configuration parameters matching names or glob patterns | `CONFIG GET save` → `*2\r\n$4\r\nsave\r\n$0\r\n` |

@@ -6,7 +6,7 @@
  * including command parsing, validation, and response formatting.
  */
 
-use crate::commands::{self, CommandSpec, Kind};
+use crate::commands::{self, CommandSpec, Kind, SubcommandSpec};
 use anyhow::{bail, Result};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -115,6 +115,18 @@ pub enum ClientInfo {
     LibName,
     /// `LIB-VER`: the version of the client library
     LibVer,
+}
+
+/// Which command names `COMMAND LIST FILTERBY` keeps
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum CommandFilter {
+    /// `MODULE name`: commands of a module (Ignix has none)
+    Module(Bytes),
+    /// `ACLCAT category`: commands in an ACL category
+    AclCat(Bytes),
+    /// `PATTERN pattern`: names matching a glob pattern, ignoring case
+    Pattern(Bytes),
 }
 
 /// Redis-compatible commands supported by Ignix
@@ -257,6 +269,17 @@ pub enum Cmd {
         /// The password
         password: Bytes,
     },
+    /// COMMAND and COMMAND INFO \[name ...\] - describe the named commands,
+    /// or every command without names
+    CommandInfo(Vec<Bytes>),
+    /// COMMAND COUNT - the number of commands
+    CommandCount,
+    /// COMMAND LIST \[FILTERBY MODULE|ACLCAT|PATTERN value\] - command names
+    CommandList(Option<CommandFilter>),
+    /// COMMAND GETKEYS command \[arg ...\] - the key arguments of a command
+    CommandGetKeys(Vec<Bytes>),
+    /// COMMAND HELP
+    CommandHelp,
 }
 
 impl Cmd {
@@ -535,13 +558,8 @@ fn command_from_frame(items: Vec<Bytes>) -> Parsed {
     if !spec.arity_matches(items.len()) {
         return Parsed::Invalid(arity_error(spec.name));
     }
-    if matches!(spec.kind, Kind::Client | Kind::Config) {
-        let checked = if spec.kind == Kind::Client {
-            client_subcommand(&items[1..])
-        } else {
-            config_subcommand(&items[1..])
-        };
-        if let Err(error) = checked {
+    if matches!(spec.kind, Kind::Client | Kind::Config | Kind::Command) && items.len() > 1 {
+        if let Err(error) = subcommand(spec, &items[1..]) {
             return Parsed::Invalid(error);
         }
     }
@@ -726,8 +744,9 @@ fn build_command(spec: &CommandSpec, mut items: Vec<Bytes>) -> std::result::Resu
                 _ => Cmd::Persist(key),
             }
         }
-        Kind::Config => config_command(items)?,
-        Kind::Client => client_command(items)?,
+        Kind::Config => config_command(spec, items)?,
+        Kind::Client => client_command(spec, items)?,
+        Kind::Command => command_command(spec, items)?,
         Kind::Hello => {
             let mut args = items.into_iter();
             let protocol = match args.next() {
@@ -892,59 +911,73 @@ fn expire_command(kind: Kind, name: &str, items: Vec<Bytes>) -> std::result::Res
     })
 }
 
-/// `ERR unknown subcommand ...`, with the subcommand cut to 128 bytes
-fn unknown_subcommand_error(subcommand: &[u8], command: &str) -> String {
-    let shown = String::from_utf8_lossy(&subcommand[..subcommand.len().min(128)]);
-    format!("ERR unknown subcommand '{shown}'. Try {command} HELP.")
-}
-
-/// The name of the `CONFIG` subcommand in the arguments after `CONFIG`,
-/// once it is known to exist and to have the right number of arguments
-fn config_subcommand(items: &[Bytes]) -> std::result::Result<&'static str, String> {
-    let subcommand = &items[0];
-    let (name, arity_ok) = if subcommand.eq_ignore_ascii_case(b"get") {
-        ("get", items.len() >= 2)
-    } else if subcommand.eq_ignore_ascii_case(b"help") {
-        ("help", items.len() == 1)
-    } else {
-        return Err(unknown_subcommand_error(subcommand, "CONFIG"));
+/// The subcommand of `command` (CLIENT, CONFIG or COMMAND) named first in
+/// `items`, the arguments after the command name, once it is known to exist
+/// and to have the right number of arguments
+fn subcommand(
+    command: &CommandSpec,
+    items: &[Bytes],
+) -> std::result::Result<&'static SubcommandSpec, String> {
+    let name = &items[0];
+    let Some(spec) = commands::find_subcommand(command.kind, name) else {
+        let shown = String::from_utf8_lossy(&name[..name.len().min(128)]);
+        let command = command.name.to_ascii_uppercase();
+        return Err(format!(
+            "ERR unknown subcommand '{shown}'. Try {command} HELP."
+        ));
     };
-    if !arity_ok {
-        return Err(arity_error(&format!("config|{name}")));
+    if !spec.arity_matches(items.len() + 1) {
+        return Err(arity_error(spec.name));
     }
-    Ok(name)
+    Ok(spec)
 }
 
 /// Build a `CONFIG` subcommand from the arguments after `CONFIG`.
-fn config_command(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String> {
-    if config_subcommand(&items)? == "help" {
+fn config_command(spec: &CommandSpec, mut items: Vec<Bytes>) -> std::result::Result<Cmd, String> {
+    if subcommand(spec, &items)?.short_name() == "help" {
         return Ok(Cmd::ConfigHelp);
     }
     items.remove(0);
     Ok(Cmd::ConfigGet(items))
 }
 
-/// The name of the `CLIENT` subcommand in the arguments after `CLIENT`,
-/// once it is known to exist and to have the right number of arguments
-fn client_subcommand(items: &[Bytes]) -> std::result::Result<&'static str, String> {
-    let subcommand = &items[0];
-    let (name, arity) = match subcommand.to_ascii_lowercase().as_slice() {
-        b"id" => ("id", 1),
-        b"getname" => ("getname", 1),
-        b"setname" => ("setname", 2),
-        b"setinfo" => ("setinfo", 3),
-        b"help" => ("help", 1),
-        _ => return Err(unknown_subcommand_error(subcommand, "CLIENT")),
-    };
-    if items.len() != arity {
-        return Err(arity_error(&format!("client|{name}")));
+/// Build a `COMMAND` subcommand from the arguments after `COMMAND`.
+fn command_command(spec: &CommandSpec, mut items: Vec<Bytes>) -> std::result::Result<Cmd, String> {
+    if items.is_empty() {
+        return Ok(Cmd::CommandInfo(items));
     }
-    Ok(name)
+    let name = subcommand(spec, &items)?.short_name();
+    items.remove(0);
+    Ok(match name {
+        "count" => Cmd::CommandCount,
+        "info" => Cmd::CommandInfo(items),
+        "getkeys" => Cmd::CommandGetKeys(items),
+        "help" => Cmd::CommandHelp,
+        _ => {
+            // LIST [FILTERBY MODULE|ACLCAT|PATTERN value]
+            let filter = match <[Bytes; 3]>::try_from(items) {
+                Err(items) if items.is_empty() => None,
+                Ok([filterby, kind, value]) if filterby.eq_ignore_ascii_case(b"filterby") => {
+                    if kind.eq_ignore_ascii_case(b"module") {
+                        Some(CommandFilter::Module(value))
+                    } else if kind.eq_ignore_ascii_case(b"aclcat") {
+                        Some(CommandFilter::AclCat(value))
+                    } else if kind.eq_ignore_ascii_case(b"pattern") {
+                        Some(CommandFilter::Pattern(value))
+                    } else {
+                        return Err("ERR syntax error".to_string());
+                    }
+                }
+                _ => return Err("ERR syntax error".to_string()),
+            };
+            Cmd::CommandList(filter)
+        }
+    })
 }
 
 /// Build a `CLIENT` subcommand from the arguments after `CLIENT`.
-fn client_command(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String> {
-    let name = client_subcommand(&items)?;
+fn client_command(spec: &CommandSpec, mut items: Vec<Bytes>) -> std::result::Result<Cmd, String> {
+    let name = subcommand(spec, &items)?.short_name();
     Ok(match name {
         "id" => Cmd::ClientId,
         "getname" => Cmd::ClientGetName,
@@ -1365,6 +1398,15 @@ pub fn write_verbatim(protocol: Protocol, text: &[u8], out: &mut BytesMut) {
 /// Write array length header (`*<count>\r\n`) directly to buffer
 pub fn write_array_len(n: usize, out: &mut BytesMut) {
     write_header(b'*', n, out);
+}
+
+/// Write the header of a set of `n` elements: `~<n>\r\n` in RESP3, and in
+/// RESP2, which has no sets, the header of an array (as Redis does)
+pub fn write_set_len(protocol: Protocol, n: usize, out: &mut BytesMut) {
+    match protocol {
+        Protocol::Resp2 => write_header(b'*', n, out),
+        Protocol::Resp3 => write_header(b'~', n, out),
+    }
 }
 
 /// Write the header of a map with `n` entries, each written after it as a

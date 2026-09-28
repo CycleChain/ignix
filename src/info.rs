@@ -1,12 +1,16 @@
 /*!
- * INFO and CONFIG GET
+ * INFO, CONFIG GET and COMMAND
  *
- * The server description and configuration Ignix reports, in the formats
- * Redis uses, so clients and tools that read them keep working.
+ * The server description, configuration and commands Ignix reports, in the
+ * formats Redis uses, so clients and tools that read them keep working.
  */
 
+use crate::commands::{self, CommandSpec, SubcommandSpec, COMMANDS};
 use crate::glob::Pattern;
-use crate::protocol::{write_bulk, write_map_len, write_verbatim, Protocol};
+use crate::protocol::{
+    write_array_len, write_bulk, write_error, write_integer, write_map_len, write_nil,
+    write_set_len, write_simple, write_verbatim, CommandFilter, Protocol,
+};
 use crate::shard::Shard;
 use bytes::{Bytes, BytesMut};
 use std::fmt::Write as _;
@@ -200,5 +204,163 @@ pub(crate) fn write_config_get(
     for (i, name) in &matched {
         write_bulk(name, out);
         write_bulk(parameters[*i].1.as_bytes(), out);
+    }
+}
+
+/// Write the description COMMAND INFO gives of a command or subcommand, as
+/// Redis 7.0 does: name, arity, flags, first key, last key, key step, ACL
+/// categories, tips, key specifications (Ignix reports none) and the
+/// descriptions of its subcommands
+#[allow(clippy::too_many_arguments)]
+fn write_description(
+    name: &str,
+    arity: i32,
+    flags: &[&str],
+    (first, last, step): (i32, i32, i32),
+    acl: &[&str],
+    tips: &[&str],
+    subcommands: &[SubcommandSpec],
+    protocol: Protocol,
+    out: &mut BytesMut,
+) {
+    write_array_len(10, out);
+    write_bulk(name.as_bytes(), out);
+    write_integer(i64::from(arity), out);
+    write_set_len(protocol, flags.len(), out);
+    for flag in flags {
+        write_simple(flag, out);
+    }
+    for position in [first, last, step] {
+        write_integer(i64::from(position), out);
+    }
+    write_set_len(protocol, acl.len(), out);
+    for category in acl {
+        write_simple(category, out);
+    }
+    write_set_len(protocol, tips.len(), out);
+    for tip in tips {
+        write_bulk(tip.as_bytes(), out);
+    }
+    write_set_len(protocol, 0, out);
+    write_set_len(protocol, subcommands.len(), out);
+    for sub in subcommands {
+        write_subcommand(sub, protocol, out);
+    }
+}
+
+fn write_command(spec: &CommandSpec, protocol: Protocol, out: &mut BytesMut) {
+    let subcommands = commands::subcommands(spec.kind);
+    write_description(
+        spec.name,
+        spec.arity,
+        spec.flags,
+        spec.keys,
+        spec.acl,
+        spec.tips,
+        subcommands,
+        protocol,
+        out,
+    );
+}
+
+fn write_subcommand(sub: &SubcommandSpec, protocol: Protocol, out: &mut BytesMut) {
+    write_description(
+        sub.name,
+        sub.arity,
+        sub.flags,
+        (0, 0, 0),
+        sub.acl,
+        sub.tips,
+        &[],
+        protocol,
+        out,
+    );
+}
+
+/// Write the COMMAND INFO reply: the description of each command in
+/// `names`, a subcommand being named `command|subcommand`, and nil for an
+/// unknown one; every command's without names (as COMMAND does)
+pub(crate) fn write_command_info(names: &[Bytes], protocol: Protocol, out: &mut BytesMut) {
+    if names.is_empty() {
+        write_array_len(COMMANDS.len(), out);
+        for spec in COMMANDS {
+            write_command(spec, protocol, out);
+        }
+        return;
+    }
+    write_array_len(names.len(), out);
+    for name in names {
+        let found = match name.iter().position(|&b| b == b'|') {
+            None => commands::lookup(name).map(|spec| write_command(spec, protocol, out)),
+            Some(bar) => commands::lookup(&name[..bar])
+                .and_then(|spec| commands::find_subcommand(spec.kind, &name[bar + 1..]))
+                .map(|sub| write_subcommand(sub, protocol, out)),
+        };
+        if found.is_none() {
+            write_nil(protocol, out);
+        }
+    }
+}
+
+/// Write the COMMAND LIST reply: the name of every command and subcommand
+/// that `filter` keeps
+pub(crate) fn write_command_list(filter: Option<&CommandFilter>, out: &mut BytesMut) {
+    let pattern = match filter {
+        Some(CommandFilter::Pattern(pattern)) => Some(Pattern::new(pattern, true)),
+        _ => None,
+    };
+    let keep = |name: &str, acl: &[&str]| match filter {
+        None => true,
+        Some(CommandFilter::Module(_)) => false,
+        Some(CommandFilter::AclCat(category)) => acl
+            .iter()
+            .any(|c| c.as_bytes()[1..].eq_ignore_ascii_case(category)),
+        Some(CommandFilter::Pattern(_)) => {
+            pattern.as_ref().is_some_and(|p| p.matches(name.as_bytes()))
+        }
+    };
+    let mut names = Vec::new();
+    for spec in COMMANDS {
+        if keep(spec.name, spec.acl) {
+            names.push(spec.name);
+        }
+        for sub in commands::subcommands(spec.kind) {
+            if keep(sub.name, sub.acl) {
+                names.push(sub.name);
+            }
+        }
+    }
+    write_array_len(names.len(), out);
+    for name in names {
+        write_bulk(name.as_bytes(), out);
+    }
+}
+
+/// Write the COMMAND GETKEYS reply: the key arguments of the command in
+/// `args`, found from its first and last key positions and step
+pub(crate) fn write_command_getkeys(args: &[Bytes], out: &mut BytesMut) {
+    let Some(spec) = commands::lookup(&args[0]) else {
+        return write_error("ERR Invalid command specified", out);
+    };
+    if !spec.arity_matches(args.len()) {
+        return write_error("ERR Invalid number of arguments specified for command", out);
+    }
+    let (first, last, step) = spec.keys;
+    if first == 0 {
+        return write_error("ERR The command has no key arguments", out);
+    }
+    let argc = args.len() as i32;
+    let last = if last < 0 {
+        argc + last
+    } else {
+        last.min(argc - 1)
+    };
+    let positions: Vec<usize> = (first..=last)
+        .step_by(step as usize)
+        .map(|i| i as usize)
+        .collect();
+    write_array_len(positions.len(), out);
+    for i in positions {
+        write_bulk(&args[i], out);
     }
 }

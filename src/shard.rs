@@ -12,7 +12,10 @@ use crate::aof::{
     emit_aof_set_keepttl, emit_aof_set_pxat, AofHandle,
 };
 use crate::glob::Pattern;
-use crate::info::{write_config_get, write_info, REDIS_VERSION};
+use crate::info::{
+    write_command_getkeys, write_command_info, write_command_list, write_config_get, write_info,
+    REDIS_VERSION,
+};
 use crate::protocol::{
     fmt_i64, fmt_u64, parse_canonical_i64, resolve_expiry, write_array_len, write_bulk,
     write_error, write_integer, write_map_len, write_nil, write_simple, Cmd, FlushMode,
@@ -120,6 +123,25 @@ const CONFIG_HELP: [&str; 5] = [
     "CONFIG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
     "GET <pattern>",
     "    Return parameters matching the glob-like <pattern> and their values.",
+    "HELP",
+    "    Prints this help.",
+];
+
+/// `COMMAND HELP`, in Redis's words, for the subcommands Ignix supports
+const COMMAND_HELP: [&str; 15] = [
+    "COMMAND <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+    "(no subcommand)",
+    "    Return details about all Redis commands.",
+    "COUNT",
+    "    Return the total number of commands in this Redis server.",
+    "LIST",
+    "    Return a list of all commands in this Redis server.",
+    "INFO [<command-name> ...]",
+    "    Return details about multiple Redis commands.",
+    "    If no command names are given, documentation details for all",
+    "    commands are returned.",
+    "GETKEYS <full-command>",
+    "    Return the keys from a full Redis command.",
     "HELP",
     "    Prints this help.",
 ];
@@ -719,6 +741,14 @@ impl Shard {
             // CONFIG GET parameter [parameter ...] / CONFIG HELP
             Cmd::ConfigGet(patterns) => write_config_get(self, &patterns, session.protocol(), out),
             Cmd::ConfigHelp => write_help(&CONFIG_HELP, out),
+
+            // COMMAND [COUNT | INFO [name ...] | LIST [FILTERBY ...] |
+            // GETKEYS command [arg ...] | HELP]
+            Cmd::CommandInfo(names) => write_command_info(&names, session.protocol(), out),
+            Cmd::CommandCount => write_integer(crate::commands::COMMANDS.len() as i64, out),
+            Cmd::CommandList(filter) => write_command_list(filter.as_ref(), out),
+            Cmd::CommandGetKeys(args) => write_command_getkeys(&args, out),
+            Cmd::CommandHelp => write_help(&COMMAND_HELP, out),
         }
     }
 }

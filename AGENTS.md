@@ -59,9 +59,13 @@ boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler 
   `parse_requests` ve `Request`; ayırmasız yanıt yazıcıları (`write_simple`, `write_error`,
   `write_bulk`, `write_null`, `write_integer`, `write_array_len`); eski, `Vec<u8>` döndüren
   `resp_*`.
-- `src/commands.rs`: statik komut tablosu (`CommandSpec { name, arity, kind }`, tek listeden
-  `commands!` makrosuyla); `lookup` adı küçük harfe indirgenmiş bir `u128`'e paketleyip eşler.
-  Yeni komut önce buraya eklenir.
+- `src/commands.rs`: statik komut tablosu (`CommandSpec { name, arity, kind, flags, keys, acl,
+  tips }`, tek listeden `commands!` makrosuyla) ve CLIENT, CONFIG, COMMAND alt komut tablosu
+  (`SubcommandSpec`); `lookup` adı küçük harfe indirgenmiş bir `u128`'e paketleyip eşler.
+  Argüman sayıları, alt komutların varlığı ve COMMAND INFO buradan gelir; bayrak, anahtar
+  konumu, ACL kategorisi ve ipuçları Redis 7.0.15'in `COMMAND INFO` çıktısıyla aynıdır. Yeni
+  komut önce buraya, Redis'in o komut için verdiği değerlerle eklenir. `COMMAND DOCS` bilerek
+  yok: hata alınca redis-cli kendi ipuçlarını kullanır, boş ya da eksik yanıt onları siler.
 - `src/glob.rs`: KEYS, SCAN MATCH (ve `nocase` ile CONFIG GET) desenleri; Redis
   `stringmatchlen` ile aynı sonucu verir (işaretli `char` aralıkları, kapanmamış `[`, 1000 yıldız
   sınırı dahil), ama özyinelemesizdir. Davranışı değiştirmeden önce testlerindeki Redis 7.0.15
@@ -124,7 +128,7 @@ SETNAME, SETINFO, HELP), INFO, CONFIG (GET, HELP), GET, SET, DEL, UNLINK, EXISTS
 KEYS, SCAN, FLUSHDB, FLUSHALL, INCR, INCRBY, DECR, DECRBY, RENAME, MGET, MSET, EXPIRE, PEXPIRE,
 EXPIREAT, PEXPIREAT, TTL, PTTL, EXPIRETIME, PEXPIRETIME, PERSIST; SET seçenekleri (NX, XX, GET, EX,
 PX, EXAT, PXAT, KEEPTTL), SETEX, PSETEX, SETNX, GETSET, GETDEL, GETEX, MSETNX, AUTH
-(`--requirepass` ile).
+(`--requirepass` ile), COMMAND (COUNT, INFO, LIST, GETKEYS, HELP).
 
 ## Dizin haritası
 

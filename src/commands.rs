@@ -52,6 +52,7 @@ pub(crate) enum Kind {
     GetEx,
     MSetNx,
     Auth,
+    Command,
 }
 
 impl Kind {
@@ -72,18 +73,138 @@ pub(crate) struct CommandSpec {
     /// more themselves (`PING` takes at most one argument, `MSET` pairs).
     pub(crate) arity: i32,
     pub(crate) kind: Kind,
+    /// Flags, as COMMAND INFO reports them (Redis 7.0's)
+    pub(crate) flags: &'static [&'static str],
+    /// Position of the first key argument, of the last one (negative:
+    /// counted from the end) and the step between them; 0 for none
+    pub(crate) keys: (i32, i32, i32),
+    /// ACL categories, as COMMAND INFO reports them (Redis 7.0's)
+    pub(crate) acl: &'static [&'static str],
+    /// Hints for clients, as COMMAND INFO reports them (Redis 7.0's)
+    pub(crate) tips: &'static [&'static str],
 }
 
 impl CommandSpec {
     /// Whether `argc` arguments, including the command name, match the arity
     pub(crate) fn arity_matches(&self, argc: usize) -> bool {
-        let arity = self.arity.unsigned_abs() as usize;
-        if self.arity < 0 {
-            argc >= arity
-        } else {
-            argc == arity
-        }
+        arity_matches(self.arity, argc)
     }
+}
+
+/// Whether `argc` arguments match `arity`, counted like Redis
+fn arity_matches(arity: i32, argc: usize) -> bool {
+    let min = arity.unsigned_abs() as usize;
+    if arity < 0 {
+        argc >= min
+    } else {
+        argc == min
+    }
+}
+
+/// The static description of a subcommand of CLIENT, CONFIG or COMMAND
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct SubcommandSpec {
+    /// Name as Redis reports it: `command|subcommand`, lowercase
+    pub(crate) name: &'static str,
+    /// Number of arguments including the command and subcommand names,
+    /// counted like Redis
+    pub(crate) arity: i32,
+    pub(crate) flags: &'static [&'static str],
+    pub(crate) acl: &'static [&'static str],
+    pub(crate) tips: &'static [&'static str],
+}
+
+impl SubcommandSpec {
+    /// The name after the `|`
+    pub(crate) fn short_name(&self) -> &'static str {
+        self.name
+            .split_once('|')
+            .map_or(self.name, |(_, name)| name)
+    }
+
+    /// Whether `argc` arguments, including the command and subcommand
+    /// names, match the arity
+    pub(crate) fn arity_matches(&self, argc: usize) -> bool {
+        arity_matches(self.arity, argc)
+    }
+}
+
+const fn subcommand(
+    name: &'static str,
+    arity: i32,
+    flags: &'static [&'static str],
+    acl: &'static [&'static str],
+    tips: &'static [&'static str],
+) -> SubcommandSpec {
+    SubcommandSpec {
+        name,
+        arity,
+        flags,
+        acl,
+        tips,
+    }
+}
+
+/// Flags and ACL categories of most subcommands of these commands
+const CONNECTION: &[&str] = &["noscript", "loading", "stale"];
+const LOADING_STALE: &[&str] = &["loading", "stale"];
+const SLOW_CONNECTION: &[&str] = &["@slow", "@connection"];
+
+// Redis 7.0's descriptions; CLIENT SETINFO is Redis 7.2's
+static CLIENT_SUBCOMMANDS: &[SubcommandSpec] = &[
+    subcommand("client|id", 2, CONNECTION, SLOW_CONNECTION, &[]),
+    subcommand("client|getname", 2, CONNECTION, SLOW_CONNECTION, &[]),
+    subcommand("client|setname", 3, CONNECTION, SLOW_CONNECTION, &[]),
+    subcommand("client|setinfo", 4, CONNECTION, SLOW_CONNECTION, &[]),
+    subcommand("client|help", 2, LOADING_STALE, SLOW_CONNECTION, &[]),
+];
+
+static CONFIG_SUBCOMMANDS: &[SubcommandSpec] = &[
+    subcommand(
+        "config|get",
+        -3,
+        &["admin", "noscript", "loading", "stale"],
+        &["@admin", "@slow", "@dangerous"],
+        &[],
+    ),
+    subcommand("config|help", 2, LOADING_STALE, &["@slow"], &[]),
+];
+
+static COMMAND_SUBCOMMANDS: &[SubcommandSpec] = &[
+    subcommand("command|count", 2, LOADING_STALE, SLOW_CONNECTION, &[]),
+    subcommand(
+        "command|info",
+        -2,
+        LOADING_STALE,
+        SLOW_CONNECTION,
+        &["nondeterministic_output_order"],
+    ),
+    subcommand(
+        "command|list",
+        -2,
+        LOADING_STALE,
+        SLOW_CONNECTION,
+        &["nondeterministic_output_order"],
+    ),
+    subcommand("command|getkeys", -4, LOADING_STALE, SLOW_CONNECTION, &[]),
+    subcommand("command|help", 2, LOADING_STALE, SLOW_CONNECTION, &[]),
+];
+
+/// The subcommands of a command; only CLIENT, CONFIG and COMMAND have some
+pub(crate) fn subcommands(kind: Kind) -> &'static [SubcommandSpec] {
+    match kind {
+        Kind::Client => CLIENT_SUBCOMMANDS,
+        Kind::Config => CONFIG_SUBCOMMANDS,
+        Kind::Command => COMMAND_SUBCOMMANDS,
+        _ => &[],
+    }
+}
+
+/// Find a subcommand of the command `kind` by name, ignoring ASCII case
+pub(crate) fn find_subcommand(kind: Kind, name: &[u8]) -> Option<&'static SubcommandSpec> {
+    subcommands(kind)
+        .iter()
+        .find(|spec| spec.short_name().as_bytes().eq_ignore_ascii_case(name))
 }
 
 /// Longest command name that `lookup` can find
@@ -107,17 +228,23 @@ const fn pack(name: &[u8]) -> u128 {
 /// Define the command table: one constant per command, `COMMANDS` and
 /// `lookup`, from a single list
 macro_rules! commands {
-    ($($spec:ident = $name:literal, $arity:expr, $kind:ident;)*) => {
+    ($(
+        $spec:ident = $name:literal, $arity:expr, $kind:ident,
+            [$($flag:literal),*], $keys:expr, [$($acl:literal),*], [$($tip:literal),*];
+    )*) => {
         $(
             const $spec: CommandSpec = CommandSpec {
                 name: $name,
                 arity: $arity,
                 kind: Kind::$kind,
+                flags: &[$($flag),*],
+                keys: $keys,
+                acl: &[$($acl),*],
+                tips: &[$($tip),*],
             };
         )*
 
         /// Every command
-        #[cfg_attr(not(test), allow(dead_code))]
         pub(crate) static COMMANDS: &[&CommandSpec] = &[$(&$spec),*];
 
         /// Each command's packed name
@@ -139,49 +266,113 @@ macro_rules! commands {
 }
 
 commands! {
-    GET = "get", 2, Get;
-    SET = "set", -3, Set;
-    PING = "ping", -1, Ping;
-    DEL = "del", -2, Del;
-    RENAME = "rename", 3, Rename;
-    EXISTS = "exists", -2, Exists;
-    INCR = "incr", 2, Incr;
-    INCRBY = "incrby", 3, IncrBy;
-    DECR = "decr", 2, Decr;
-    DECRBY = "decrby", 3, DecrBy;
-    MGET = "mget", -2, MGet;
-    MSET = "mset", -3, MSet;
-    ECHO = "echo", 2, Echo;
-    QUIT = "quit", -1, Quit;
-    SELECT = "select", 2, Select;
-    HELLO = "hello", -1, Hello;
-    CLIENT = "client", -2, Client;
-    DBSIZE = "dbsize", 1, DbSize;
-    TYPE = "type", 2, Type;
-    UNLINK = "unlink", -2, Unlink;
-    FLUSHDB = "flushdb", -1, FlushDb;
-    FLUSHALL = "flushall", -1, FlushAll;
-    KEYS = "keys", 2, Keys;
-    SCAN = "scan", -2, Scan;
-    INFO = "info", -1, Info;
-    CONFIG = "config", -2, Config;
-    EXPIRE = "expire", -3, Expire;
-    PEXPIRE = "pexpire", -3, PExpire;
-    EXPIREAT = "expireat", -3, ExpireAt;
-    PEXPIREAT = "pexpireat", -3, PExpireAt;
-    TTL = "ttl", 2, Ttl;
-    PTTL = "pttl", 2, PTtl;
-    EXPIRETIME = "expiretime", 2, ExpireTime;
-    PEXPIRETIME = "pexpiretime", 2, PExpireTime;
-    PERSIST = "persist", 2, Persist;
-    SETEX = "setex", 4, SetEx;
-    PSETEX = "psetex", 4, PSetEx;
-    SETNX = "setnx", 3, SetNx;
-    GETSET = "getset", 3, GetSet;
-    GETDEL = "getdel", 2, GetDel;
-    GETEX = "getex", -2, GetEx;
-    MSETNX = "msetnx", -3, MSetNx;
-    AUTH = "auth", -2, Auth;
+    GET = "get", 2, Get,
+        ["readonly", "fast"], (1, 1, 1), ["@read", "@string", "@fast"], [];
+    SET = "set", -3, Set,
+        ["write", "denyoom"], (1, 1, 1), ["@write", "@string", "@slow"], [];
+    PING = "ping", -1, Ping,
+        ["fast"], (0, 0, 0), ["@fast", "@connection"],
+        ["request_policy:all_shards", "response_policy:all_succeeded"];
+    DEL = "del", -2, Del,
+        ["write"], (1, -1, 1), ["@keyspace", "@write", "@slow"],
+        ["request_policy:multi_shard", "response_policy:agg_sum"];
+    RENAME = "rename", 3, Rename,
+        ["write"], (1, 2, 1), ["@keyspace", "@write", "@slow"], [];
+    EXISTS = "exists", -2, Exists,
+        ["readonly", "fast"], (1, -1, 1), ["@keyspace", "@read", "@fast"],
+        ["request_policy:multi_shard", "response_policy:agg_sum"];
+    INCR = "incr", 2, Incr,
+        ["write", "denyoom", "fast"], (1, 1, 1), ["@write", "@string", "@fast"], [];
+    INCRBY = "incrby", 3, IncrBy,
+        ["write", "denyoom", "fast"], (1, 1, 1), ["@write", "@string", "@fast"], [];
+    DECR = "decr", 2, Decr,
+        ["write", "denyoom", "fast"], (1, 1, 1), ["@write", "@string", "@fast"], [];
+    DECRBY = "decrby", 3, DecrBy,
+        ["write", "denyoom", "fast"], (1, 1, 1), ["@write", "@string", "@fast"], [];
+    MGET = "mget", -2, MGet,
+        ["readonly", "fast"], (1, -1, 1), ["@read", "@string", "@fast"],
+        ["request_policy:multi_shard"];
+    MSET = "mset", -3, MSet,
+        ["write", "denyoom"], (1, -1, 2), ["@write", "@string", "@slow"],
+        ["request_policy:multi_shard", "response_policy:all_succeeded"];
+    ECHO = "echo", 2, Echo,
+        ["loading", "stale", "fast"], (0, 0, 0), ["@fast", "@connection"], [];
+    QUIT = "quit", -1, Quit,
+        ["noscript", "loading", "stale", "fast", "no_auth", "allow_busy"],
+        (0, 0, 0), ["@fast", "@connection"], [];
+    SELECT = "select", 2, Select,
+        ["loading", "stale", "fast"], (0, 0, 0), ["@fast", "@connection"], [];
+    HELLO = "hello", -1, Hello,
+        ["noscript", "loading", "stale", "fast", "no_auth", "allow_busy"],
+        (0, 0, 0), ["@fast", "@connection"], [];
+    CLIENT = "client", -2, Client,
+        [], (0, 0, 0), ["@slow"], [];
+    DBSIZE = "dbsize", 1, DbSize,
+        ["readonly", "fast"], (0, 0, 0), ["@keyspace", "@read", "@fast"],
+        ["request_policy:all_shards", "response_policy:agg_sum"];
+    TYPE = "type", 2, Type,
+        ["readonly", "fast"], (1, 1, 1), ["@keyspace", "@read", "@fast"], [];
+    UNLINK = "unlink", -2, Unlink,
+        ["write", "fast"], (1, -1, 1), ["@keyspace", "@write", "@fast"],
+        ["request_policy:multi_shard", "response_policy:agg_sum"];
+    FLUSHDB = "flushdb", -1, FlushDb,
+        ["write"], (0, 0, 0), ["@keyspace", "@write", "@slow", "@dangerous"],
+        ["request_policy:all_shards", "response_policy:all_succeeded"];
+    FLUSHALL = "flushall", -1, FlushAll,
+        ["write"], (0, 0, 0), ["@keyspace", "@write", "@slow", "@dangerous"],
+        ["request_policy:all_shards", "response_policy:all_succeeded"];
+    KEYS = "keys", 2, Keys,
+        ["readonly"], (0, 0, 0), ["@keyspace", "@read", "@slow", "@dangerous"],
+        ["request_policy:all_shards", "nondeterministic_output_order"];
+    SCAN = "scan", -2, Scan,
+        ["readonly"], (0, 0, 0), ["@keyspace", "@read", "@slow"],
+        ["nondeterministic_output", "request_policy:special"];
+    INFO = "info", -1, Info,
+        ["loading", "stale"], (0, 0, 0), ["@slow", "@dangerous"],
+        ["nondeterministic_output", "request_policy:all_shards", "response_policy:special"];
+    CONFIG = "config", -2, Config,
+        [], (0, 0, 0), ["@slow"], [];
+    EXPIRE = "expire", -3, Expire,
+        ["write", "fast"], (1, 1, 1), ["@keyspace", "@write", "@fast"], [];
+    PEXPIRE = "pexpire", -3, PExpire,
+        ["write", "fast"], (1, 1, 1), ["@keyspace", "@write", "@fast"], [];
+    EXPIREAT = "expireat", -3, ExpireAt,
+        ["write", "fast"], (1, 1, 1), ["@keyspace", "@write", "@fast"], [];
+    PEXPIREAT = "pexpireat", -3, PExpireAt,
+        ["write", "fast"], (1, 1, 1), ["@keyspace", "@write", "@fast"], [];
+    TTL = "ttl", 2, Ttl,
+        ["readonly", "fast"], (1, 1, 1), ["@keyspace", "@read", "@fast"],
+        ["nondeterministic_output"];
+    PTTL = "pttl", 2, PTtl,
+        ["readonly", "fast"], (1, 1, 1), ["@keyspace", "@read", "@fast"],
+        ["nondeterministic_output"];
+    EXPIRETIME = "expiretime", 2, ExpireTime,
+        ["readonly", "fast"], (1, 1, 1), ["@keyspace", "@read", "@fast"], [];
+    PEXPIRETIME = "pexpiretime", 2, PExpireTime,
+        ["readonly", "fast"], (1, 1, 1), ["@keyspace", "@read", "@fast"], [];
+    PERSIST = "persist", 2, Persist,
+        ["write", "fast"], (1, 1, 1), ["@keyspace", "@write", "@fast"], [];
+    SETEX = "setex", 4, SetEx,
+        ["write", "denyoom"], (1, 1, 1), ["@write", "@string", "@slow"], [];
+    PSETEX = "psetex", 4, PSetEx,
+        ["write", "denyoom"], (1, 1, 1), ["@write", "@string", "@slow"], [];
+    SETNX = "setnx", 3, SetNx,
+        ["write", "denyoom", "fast"], (1, 1, 1), ["@write", "@string", "@fast"], [];
+    GETSET = "getset", 3, GetSet,
+        ["write", "denyoom", "fast"], (1, 1, 1), ["@write", "@string", "@fast"], [];
+    GETDEL = "getdel", 2, GetDel,
+        ["write", "fast"], (1, 1, 1), ["@write", "@string", "@fast"], [];
+    GETEX = "getex", -2, GetEx,
+        ["write", "fast"], (1, 1, 1), ["@write", "@string", "@fast"], [];
+    MSETNX = "msetnx", -3, MSetNx,
+        ["write", "denyoom"], (1, -1, 2), ["@write", "@string", "@slow"],
+        ["request_policy:multi_shard", "response_policy:agg_min"];
+    AUTH = "auth", -2, Auth,
+        ["noscript", "loading", "stale", "fast", "no_auth", "allow_busy"],
+        (0, 0, 0), ["@fast", "@connection"], [];
+    COMMAND = "command", -1, Command,
+        ["loading", "stale"], (0, 0, 0), ["@slow", "@connection"],
+        ["nondeterministic_output_order"];
 }
 
 #[cfg(test)]
@@ -215,6 +406,38 @@ mod tests {
         assert_eq!(lookup(b"ge\x14"), None);
         assert_eq!(lookup(b"G\xc5T"), None);
         assert_eq!(lookup("gét".as_bytes()), None);
+    }
+
+    #[test]
+    fn no_auth_commands_are_the_ones_with_the_flag() {
+        for &spec in COMMANDS {
+            assert_eq!(
+                spec.kind.allowed_before_auth(),
+                spec.flags.contains(&"no_auth"),
+                "{}",
+                spec.name
+            );
+        }
+    }
+
+    #[test]
+    fn subcommands_are_found_in_any_case() {
+        let setname = find_subcommand(Kind::Client, b"SetName").unwrap();
+        assert_eq!(
+            (setname.name, setname.short_name()),
+            ("client|setname", "setname")
+        );
+        assert!(setname.arity_matches(3) && !setname.arity_matches(2));
+        assert_eq!(find_subcommand(Kind::Client, b"kill"), None);
+        assert_eq!(find_subcommand(Kind::Get, b"id"), None);
+        for kind in [Kind::Client, Kind::Config, Kind::Command] {
+            for spec in subcommands(kind) {
+                assert_eq!(
+                    find_subcommand(kind, spec.short_name().as_bytes()),
+                    Some(spec)
+                );
+            }
+        }
     }
 
     #[test]

@@ -1481,3 +1481,145 @@ fn auth_without_a_password_set_follows_redis() {
         b"-ERR wrong number of arguments for 'auth' command\r\n"
     );
 }
+
+#[test]
+fn command_info_describes_commands_like_redis_7() {
+    let s = shard();
+    // Redis 7.0's reply, but without key specifications
+    let get = "*10\r\n$3\r\nget\r\n:2\r\n*2\r\n+readonly\r\n+fast\r\n:1\r\n:1\r\n:1\r\n\
+               *3\r\n+@read\r\n+@string\r\n+@fast\r\n*0\r\n*0\r\n*0\r\n";
+    assert_eq!(
+        String::from_utf8(exec(&s, &[b"COMMAND", b"INFO", b"get", b"nosuch"])).unwrap(),
+        format!("*2\r\n{get}$-1\r\n")
+    );
+    let mset = exec(&s, &[b"COMMAND", b"INFO", b"MSET"]);
+    assert!(mset.starts_with(
+        b"*1\r\n*10\r\n$4\r\nmset\r\n:-3\r\n*2\r\n+write\r\n+denyoom\r\n:1\r\n:-1\r\n:2\r\n"
+    ));
+    assert!(mset.ends_with(
+        concat!(
+            "*2\r\n$26\r\nrequest_policy:multi_shard\r\n",
+            "$29\r\nresponse_policy:all_succeeded\r\n*0\r\n*0\r\n"
+        )
+        .as_bytes()
+    ));
+    // A subcommand by its full name, and among the container's details
+    let config_get = "*10\r\n$10\r\nconfig|get\r\n:-3\r\n*4\r\n+admin\r\n+noscript\r\n+loading\r\n\
+                      +stale\r\n:0\r\n:0\r\n:0\r\n*3\r\n+@admin\r\n+@slow\r\n+@dangerous\r\n\
+                      *0\r\n*0\r\n*0\r\n";
+    assert_eq!(
+        String::from_utf8(exec(
+            &s,
+            &[b"COMMAND", b"INFO", b"CONFIG|GET", b"config|nosuch"]
+        ))
+        .unwrap(),
+        format!("*2\r\n{config_get}$-1\r\n")
+    );
+    let config = String::from_utf8(exec(&s, &[b"COMMAND", b"INFO", b"config"])).unwrap();
+    assert!(config.contains(&format!("*2\r\n{config_get}")));
+
+    // RESP3 lists flags, categories, tips, key specifications and
+    // subcommands as sets
+    let mut session = Session::new();
+    exec_in(&s, &mut session, &[b"HELLO", b"3"]);
+    assert_eq!(
+        exec_in(&s, &mut session, &[b"COMMAND", b"INFO", b"get", b"x"]),
+        "*2\r\n*10\r\n$3\r\nget\r\n:2\r\n~2\r\n+readonly\r\n+fast\r\n:1\r\n:1\r\n:1\r\n\
+         ~3\r\n+@read\r\n+@string\r\n+@fast\r\n~0\r\n~0\r\n~0\r\n_\r\n"
+            .as_bytes()
+    );
+
+    // COMMAND and COMMAND INFO without names describe every command
+    let count = integer(&exec(&s, &[b"COMMAND", b"COUNT"]));
+    let all = exec(&s, &[b"COMMAND"]);
+    assert!(all.starts_with(format!("*{count}\r\n*10\r\n").as_bytes()));
+    assert_eq!(exec(&s, &[b"COMMAND", b"INFO"]), all);
+}
+
+/// The bulk strings of an array reply, as text
+fn strings(reply: &[u8]) -> Vec<String> {
+    bulk_strings(reply)
+        .into_iter()
+        .map(|s| String::from_utf8(s).unwrap())
+        .collect()
+}
+
+#[test]
+fn command_list_and_getkeys_follow_redis() {
+    let s = shard();
+    let list = |args: &[&[u8]]| {
+        let mut names = strings(&exec(&s, args));
+        names.sort();
+        names
+    };
+    assert_eq!(
+        list(&[b"COMMAND", b"LIST", b"FILTERBY", b"PATTERN", b"GET*"]),
+        ["get", "getdel", "getex", "getset"]
+    );
+    assert_eq!(
+        list(&[b"COMMAND", b"LIST", b"FILTERBY", b"pattern", b"config*"]),
+        ["config", "config|get", "config|help"]
+    );
+    assert_eq!(
+        list(&[b"COMMAND", b"LIST", b"FILTERBY", b"ACLCAT", b"Dangerous"]),
+        ["config|get", "flushall", "flushdb", "info", "keys"]
+    );
+    assert_eq!(
+        exec(&s, &[b"COMMAND", b"LIST", b"FILTERBY", b"MODULE", b"x"]),
+        b"*0\r\n"
+    );
+    let every = list(&[b"COMMAND", b"LIST"]);
+    assert!(every.contains(&"client|setinfo".to_string()) && every.contains(&"auth".to_string()));
+    for args in [
+        &[&b"COMMAND"[..], b"LIST", b"x"][..],
+        &[b"COMMAND", b"LIST", b"FILTERBY", b"NOPE", b"x"],
+    ] {
+        assert_eq!(exec(&s, args), b"-ERR syntax error\r\n");
+    }
+
+    let keys = |args: &[&[u8]]| strings(&exec(&s, args));
+    assert_eq!(
+        keys(&[b"COMMAND", b"GETKEYS", b"MSET", b"a", b"1", b"b", b"2"]),
+        ["a", "b"]
+    );
+    assert_eq!(
+        keys(&[b"COMMAND", b"GETKEYS", b"set", b"k", b"v", b"EX", b"1"]),
+        ["k"]
+    );
+    assert_eq!(
+        keys(&[b"COMMAND", b"GETKEYS", b"DEL", b"a", b"b", b"c"]),
+        ["a", "b", "c"]
+    );
+    assert_eq!(
+        exec(&s, &[b"COMMAND", b"GETKEYS", b"CLIENT", b"ID"]),
+        b"-ERR The command has no key arguments\r\n"
+    );
+    assert_eq!(
+        exec(&s, &[b"COMMAND", b"GETKEYS", b"NOSUCH", b"x"]),
+        b"-ERR Invalid command specified\r\n"
+    );
+    assert_eq!(
+        exec(&s, &[b"COMMAND", b"GETKEYS", b"GET", b"a", b"b"]),
+        b"-ERR Invalid number of arguments specified for command\r\n"
+    );
+    assert_eq!(
+        exec(&s, &[b"COMMAND", b"GETKEYS", b"GET"]),
+        b"-ERR wrong number of arguments for 'command|getkeys' command\r\n"
+    );
+}
+
+#[test]
+fn command_docs_is_left_to_redis_cli() {
+    let s = shard();
+    // Without DOCS, redis-cli falls back to its own command hints
+    assert_eq!(
+        exec(&s, &[b"COMMAND", b"DOCS", b"get"]),
+        b"-ERR unknown subcommand 'DOCS'. Try COMMAND HELP.\r\n"
+    );
+    assert_eq!(
+        exec(&s, &[b"COMMAND", b"COUNT", b"x"]),
+        b"-ERR wrong number of arguments for 'command|count' command\r\n"
+    );
+    let help = exec(&s, &[b"COMMAND", b"HELP"]);
+    assert!(help.starts_with(b"*15\r\n+COMMAND <subcommand>"));
+}
