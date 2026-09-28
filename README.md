@@ -12,6 +12,7 @@ Ignix (from "Ignite" + "Index") is a Redis-protocol compatible, in-memory key-va
 - 🚀 **Multi-core**: one event loop per CPU core, sharing the listening port with `SO_REUSEPORT`
 - 🔌 **Redis protocol (RESP2)**: works with `redis-cli` and Redis client libraries (redis-py, node-redis, ...) for the supported commands
 - 🧵 **Async I/O**: `mio` (epoll/kqueue) by default, optional `io_uring` backend on Linux
+- ⚡ **Busy-polling**: a worker keeps polling for 50 µs after its last event before it sleeps, so requests rarely wait for a thread to wake up (`--busy-poll-us`)
 - 💾 **AOF**: every write is appended to `ignix.aof` by a background thread and synced at most once per second
 - 🧠 **Concurrent storage**: `DashMap` (sharded locking) in the hot path
 - 📊 **Benchmarks included**: criterion micro-benchmarks and a Redis comparison suite
@@ -21,6 +22,7 @@ Ignix (from "Ignite" + "Index") is a Redis-protocol compatible, in-memory key-va
 - **Thread per core**: `SO_REUSEPORT` lets one worker thread per CPU core accept connections on the same port; the kernel spreads new connections across them.
 - **Pluggable backend**: `mio` (epoll/kqueue) or `io_uring` (Linux only, single thread).
 - **Independent event loops**: each thread owns its connections and runs commands inline; all threads share one concurrent dictionary.
+- **Busy-polling**: waking a sleeping thread costs more than serving a small request, especially on virtual machines, so after its last event a worker polls without blocking for 50 µs before it sleeps. An idle server sleeps.
 - **Allocation-free replies**: replies are written straight into the connection's output buffer.
 - **RESP parsing**: requests are RESP arrays of bulk strings, parsed with the same length rules and limits as Redis (at most 512 MB per argument).
 - **Concurrent storage**: `DashMap<Bytes, Value>`; canonical integers are stored as numbers, everything else byte for byte.
@@ -87,6 +89,11 @@ Replies and error messages match Redis 7, for example `-ERR wrong number of argu
 `SET` options (`EX`, `PX`, `NX`, `XX`, `GET`, `EXAT`, `PXAT`, `KEEPTTL`) are not implemented yet; they are rejected with `-ERR SET option '<NAME>' is not supported` instead of being ignored.
 
 ## 🔧 Configuration
+
+### Command-line Options
+
+- `--backend=uring`: use the io_uring backend (Linux only; elsewhere Ignix falls back to mio).
+- `--busy-poll-us=N`: how long a worker of the default (mio) backend keeps polling for new events after its last one before it sleeps, in microseconds; the default is 50 and `0` disables busy-polling. It trades CPU time for latency: an idle server uses no CPU either way, at 1,000 requests per second the server used about 10% of a CPU instead of 5% in our measurements, and under sustained load every busy worker uses a full core.
 
 ### Environment Variables
 

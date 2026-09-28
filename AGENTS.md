@@ -47,6 +47,9 @@ hata yanıtı yazılır ve bağlantı, yanıtlar boşaltıldıktan sonra kapanı
   parçacığı açar. Her biri `bind_reuseport` (SO_REUSEPORT) ile aynı portu kendi dinleyicisiyle
   dinler ve kendi olay döngüsünü (`run_worker_loop`) çalıştırır. Komutlar olay döngüsünde satır
   içi yürütülür; ayrı iş havuzu yoktur.
+  Son olaydan sonra worker uyumadan önce `ServerOptions::busy_poll` (varsayılan 50 µs,
+  `--busy-poll-us=N`, `0` kapatır) boyunca engellemeden yoklar; VM'de uyuyan iş parçacığını
+  uyandırmak istekten pahalıdır. `run_shard` varsayılanlarla `run_server`'ı çağırır.
 - `src/net_uring.rs`: Linux'a özgü io_uring arka ucu (`#![cfg(target_os = "linux")]`); tek iş
   parçacığı, SO_REUSEPORT yok, `unsafe` SQE gönderimleri. `--backend=uring` ile seçilir.
 - `src/protocol.rs`: `Cmd` ve `Value` enum'ları (`#[non_exhaustive]`); çerçeve okuma

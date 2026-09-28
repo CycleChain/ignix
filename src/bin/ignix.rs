@@ -9,6 +9,7 @@
 use anyhow::Result;
 use ignix::*;
 use std::net::ToSocketAddrs;
+use std::time::Duration;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -29,6 +30,19 @@ fn main() -> Result<()> {
     // Parse arguments
     let args: Vec<String> = std::env::args().collect();
     let use_uring = args.iter().any(|a| a == "--backend=uring");
+
+    // --busy-poll-us=N: busy-poll window of the mio backend (0 disables it)
+    let mut options = net::ServerOptions::default();
+    let mut busy_poll_given = false;
+    for arg in &args[1..] {
+        if let Some(value) = arg.strip_prefix("--busy-poll-us=") {
+            let micros: u64 = value
+                .parse()
+                .map_err(|_| anyhow::anyhow!("invalid --busy-poll-us value: {value:?}"))?;
+            options.busy_poll = Duration::from_micros(micros);
+            busy_poll_given = true;
+        }
+    }
 
     // Parse the default server address (0.0.0.0:7379)
     let addr = DEFAULT_ADDR.to_socket_addrs()?.next().unwrap();
@@ -52,6 +66,9 @@ fn main() -> Result<()> {
 
     #[cfg(target_os = "linux")]
     if use_uring {
+        if busy_poll_given {
+            log::warn!("--busy-poll-us only applies to the default (mio) backend");
+        }
         return net_uring::run_shard(0, addr, shard);
     }
 
@@ -59,7 +76,9 @@ fn main() -> Result<()> {
         log::warn!("io_uring backend is only available on Linux, falling back to mio/epoll");
     }
 
+    log::info!("busy-poll window: {} µs", options.busy_poll.as_micros());
+
     // Start the main server event loop
     // This call blocks until the server is shut down
-    net::run_shard(0, addr, shard)
+    net::run_server(addr, shard, options)
 }

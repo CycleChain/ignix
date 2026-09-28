@@ -18,6 +18,7 @@ use std::io::{ErrorKind, Read, Write};
 use std::net::SocketAddr;
 use std::result::Result::{Err, Ok};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 /// Size of read buffer for incoming data
 const READ_BUF: usize = 4096;
@@ -58,11 +59,45 @@ pub fn bind_reuseport(addr: SocketAddr) -> Result<TcpListener> {
     Ok(TcpListener::from_std(socket.into()))
 }
 
+/// Default busy-poll window of [`ServerOptions`]
+pub const DEFAULT_BUSY_POLL: Duration = Duration::from_micros(50);
+
+/// Tuning options for [`run_server`]
+///
+/// Start from [`ServerOptions::default`] and change the fields you need.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct ServerOptions {
+    /// How long a worker keeps polling for new events without sleeping after
+    /// its last event (default [`DEFAULT_BUSY_POLL`]); zero disables it.
+    ///
+    /// Waking a sleeping worker is expensive: the client that sends the next
+    /// request pays for the wake-up, and on virtual machines an idle vCPU has
+    /// to be woken as well. Polling briefly keeps latency low while traffic
+    /// flows, at the cost of CPU time under load. An idle server sleeps.
+    pub busy_poll: Duration,
+}
+
+impl Default for ServerOptions {
+    fn default() -> Self {
+        Self {
+            busy_poll: DEFAULT_BUSY_POLL,
+        }
+    }
+}
+
+/// Run the main server with Multi-Reactor architecture and default options
+///
+/// See [`run_server`].
+pub fn run_shard(_shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> {
+    run_server(addr, shard, ServerOptions::default())
+}
+
 /// Run the main server with Multi-Reactor architecture
 ///
 /// Spawns one thread per CPU core. Each thread runs its own event loop
 /// and accepts connections on the shared port (via SO_REUSEPORT).
-pub fn run_shard(_shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> {
+pub fn run_server(addr: SocketAddr, shard: Shard, options: ServerOptions) -> Result<()> {
     let shard = Arc::new(shard);
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
@@ -77,8 +112,9 @@ pub fn run_shard(_shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()>
 
     for id in 0..threads {
         let shard = shard.clone();
+        let busy_poll = options.busy_poll;
         handles.push(std::thread::spawn(move || {
-            if let Err(e) = run_worker_loop(id, addr, shard) {
+            if let Err(e) = run_worker_loop(id, addr, shard, busy_poll) {
                 log::error!("worker {id} stopped: {e:#}");
             }
         }));
@@ -150,8 +186,23 @@ pub(crate) fn handle_input(
     }
 }
 
+/// Timeout for the next poll: zero while the busy-poll window after the last
+/// event is open, otherwise block until the next event.
+fn poll_timeout(busy_poll: Duration, idle_for: Option<Duration>) -> Option<Duration> {
+    match idle_for {
+        _ if busy_poll.is_zero() => None,
+        Some(idle) if idle >= busy_poll => None,
+        _ => Some(Duration::ZERO),
+    }
+}
+
 /// Main event loop for a single worker thread
-fn run_worker_loop(id: usize, addr: SocketAddr, shard: Arc<Shard>) -> Result<()> {
+fn run_worker_loop(
+    id: usize,
+    addr: SocketAddr,
+    shard: Arc<Shard>,
+    busy_poll: Duration,
+) -> Result<()> {
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(1024);
 
@@ -168,13 +219,24 @@ fn run_worker_loop(id: usize, addr: SocketAddr, shard: Arc<Shard>) -> Result<()>
     // Buffer for reading from socket
     let mut tmp_buf = [0u8; READ_BUF];
 
+    // When the last event was handled, while no new one has arrived since
+    let mut idle_since: Option<Instant> = None;
+
     loop {
-        if let Err(e) = poll.poll(&mut events, None) {
+        let timeout = poll_timeout(busy_poll, idle_since.map(|since| since.elapsed()));
+        if let Err(e) = poll.poll(&mut events, timeout) {
             if e.kind() == ErrorKind::Interrupted {
                 continue;
             }
             return Err(e.into());
         }
+        if events.is_empty() {
+            if timeout.is_some() {
+                idle_since.get_or_insert_with(Instant::now);
+            }
+            continue;
+        }
+        idle_since = None;
 
         for ev in events.iter() {
             match ev.token() {
@@ -318,4 +380,24 @@ fn drive(
 #[inline]
 fn would_block(e: &std::io::Error) -> bool {
     e.kind() == ErrorKind::WouldBlock
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn workers_poll_without_blocking_only_inside_the_busy_poll_window() {
+        let window = Duration::from_micros(50);
+        // Right after an event, and while the window is open: do not block
+        assert_eq!(poll_timeout(window, None), Some(Duration::ZERO));
+        assert_eq!(
+            poll_timeout(window, Some(Duration::from_micros(10))),
+            Some(Duration::ZERO)
+        );
+        // The window has passed without events: sleep until the next one
+        assert_eq!(poll_timeout(window, Some(window)), None);
+        // Busy-polling disabled: always sleep
+        assert_eq!(poll_timeout(Duration::ZERO, None), None);
+    }
 }
