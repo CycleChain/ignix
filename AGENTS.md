@@ -73,7 +73,12 @@ boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler 
   oku-değiştir-yaz yok); INFO toplar. İstek yoluna paylaşılan atomik ekleme.
 - `src/session.rs`: `Session`, bağlantı başına durum: istemci kimliği (bağlantı başına bir kez
   genel sayaçtan), protokol (RESP2/RESP3), istemci adı, kütüphane adı ve sürümü (`CLIENT
-  SETINFO`), QUIT'in kapanış bayrağı.
+  SETINFO`), QUIT'in kapanış bayrağı, istenen parola (`Password`, sabit zamanlı karşılaştırma,
+  `Debug`'da gizli) ve `needs_auth`. Kimlik doğrulama sırası Redis 7 gibidir: bilinmeyen komut
+  ya da alt komut ve argüman sayısı hatası NOAUTH'tan önce, komutun kendi argüman denetimleri
+  sonra gelir. Ayrıştırıcı bunun için içte `Parsed::{Cmd, Invalid, Rejected}` üretir
+  (`RequestParser::parse_split`); genel `Request` değişmedi. NOAUTH kapısı `exec_session`'da,
+  `Rejected` için `handle_input`'ta.
 - `src/shard.rs`: `Shard { id, dict, aof, stats }`, 64 bayta hizalı (`test_shard_alignment`
   sınar). Komut semantiği iki eşleşmede: sık komutlar (PING, GET, SET, DEL/UNLINK, EXISTS,
   INCR ailesi, MGET, MSET) her zaman inline edilen `exec_frequent`'te, diğerleri
@@ -116,7 +121,8 @@ Desteklenen komutlar: PING, ECHO, QUIT, SELECT (yalnızca 0), HELLO, CLIENT (ID,
 SETNAME, SETINFO, HELP), INFO, CONFIG (GET, HELP), GET, SET, DEL, UNLINK, EXISTS, TYPE, DBSIZE,
 KEYS, SCAN, FLUSHDB, FLUSHALL, INCR, INCRBY, DECR, DECRBY, RENAME, MGET, MSET, EXPIRE, PEXPIRE,
 EXPIREAT, PEXPIREAT, TTL, PTTL, EXPIRETIME, PEXPIRETIME, PERSIST; SET seçenekleri (NX, XX, GET, EX,
-PX, EXAT, PXAT, KEEPTTL), SETEX, PSETEX, SETNX, GETSET, GETDEL, GETEX, MSETNX.
+PX, EXAT, PXAT, KEEPTTL), SETEX, PSETEX, SETNX, GETSET, GETDEL, GETEX, MSETNX, AUTH
+(`--requirepass` ile).
 
 ## Dizin haritası
 

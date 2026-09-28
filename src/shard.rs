@@ -18,7 +18,7 @@ use crate::protocol::{
     write_error, write_integer, write_map_len, write_nil, write_simple, Cmd, FlushMode,
     GetExOption, Protocol, SetCondition, SetExpiry, SetOptions, TimeOption, Value,
 };
-use crate::session::Session;
+use crate::session::{Session, HELLO_NOAUTH, NOAUTH};
 use crate::stats::Stats;
 use crate::storage::{unix_ms, Dict, ExpireResult, GetExChange, GetExEffect, GetExResult};
 use bytes::{Bytes, BytesMut};
@@ -158,13 +158,8 @@ fn hello(protocol: Option<Protocol>, options: &[Bytes], session: &mut Session, o
         let option = &options[i];
         let more = options.len() - 1 - i;
         if option.eq_ignore_ascii_case(b"AUTH") && more >= 2 {
-            // No password is set, so only the default user exists and it
-            // accepts any password (Redis `nopass`).
-            if options[i + 1] != b"default"[..] {
-                write_error(
-                    "WRONGPASS invalid username-password pair or user is disabled.",
-                    out,
-                );
+            if let Err(error) = session.authenticate(Some(&options[i + 1]), &options[i + 2]) {
+                write_error(error, out);
                 return;
             }
             i += 3;
@@ -179,6 +174,12 @@ fn hello(protocol: Option<Protocol>, options: &[Bytes], session: &mut Session, o
             write_error(&format!("ERR Syntax error in HELLO option '{option}'"), out);
             return;
         }
+    }
+    // Like Redis, only once the options are applied (so SETNAME has named
+    // the connection even if this fails)
+    if !session.is_authenticated() {
+        write_error(HELLO_NOAUTH, out);
+        return;
     }
     if let Some(protocol) = protocol {
         session.set_protocol(protocol);
@@ -349,7 +350,14 @@ impl Shard {
     /// output buffer. After `QUIT`, [`Session::is_closing`] is true: the
     /// server must send the replies and close the connection without
     /// running any later request.
+    ///
+    /// Until a session made with [`Session::with_password`] authenticates,
+    /// every command but AUTH, HELLO and QUIT gets `NOAUTH`.
     pub fn exec_session(&self, cmd: Cmd, session: &mut Session, out: &mut BytesMut) {
+        if !session.is_authenticated() && !cmd.allowed_before_auth() {
+            write_error(NOAUTH, out);
+            return;
+        }
         session.count_command();
         self.exec_frequent(cmd, session.protocol(), out, |cmd, out| {
             self.exec_other(cmd, session, out)
@@ -698,6 +706,14 @@ impl Shard {
                     a.write_owned(emit_aof_persist(&key));
                 }
                 write_integer(i64::from(removed), out);
+            }
+
+            // AUTH [username] password
+            Cmd::Auth { username, password } => {
+                match session.authenticate(username.as_deref(), &password) {
+                    Ok(()) => write_simple("OK", out),
+                    Err(error) => write_error(error, out),
+                }
             }
 
             // CONFIG GET parameter [parameter ...] / CONFIG HELP

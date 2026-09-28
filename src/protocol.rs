@@ -6,7 +6,7 @@
  * including command parsing, validation, and response formatting.
  */
 
-use crate::commands::{self, Kind};
+use crate::commands::{self, CommandSpec, Kind};
 use anyhow::{bail, Result};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -248,6 +248,23 @@ pub enum Cmd {
     /// MSETNX key value \[key value ...\] - set every pair if none of the
     /// keys exists
     MSetNx(Vec<(Bytes, Bytes)>),
+    /// AUTH \[username\] password - authenticate the connection; the only
+    /// user is `default`
+    #[non_exhaustive]
+    Auth {
+        /// The user, when given
+        username: Option<Bytes>,
+        /// The password
+        password: Bytes,
+    },
+}
+
+impl Cmd {
+    /// Whether a client that has not authenticated yet may run the command
+    /// (Redis `no-auth` commands: AUTH, HELLO and QUIT)
+    pub(crate) fn allowed_before_auth(&self) -> bool {
+        matches!(self, Cmd::Auth { .. } | Cmd::Hello { .. } | Cmd::Quit)
+    }
 }
 
 /// Value types that can be stored in Ignix
@@ -375,6 +392,21 @@ impl RequestParser {
     /// they are. After an error, or when the buffer is cleared, call
     /// [`RequestParser::reset`] before parsing again.
     pub fn parse(&mut self, buf: &mut BytesMut, out: &mut Vec<Request>) -> Result<()> {
+        self.parse_with(buf, out, Parsed::into_request)
+    }
+
+    /// Like [`RequestParser::parse`], but keeps apart the invalid requests
+    /// that Redis rejects only once the client has authenticated
+    pub(crate) fn parse_split(&mut self, buf: &mut BytesMut, out: &mut Vec<Parsed>) -> Result<()> {
+        self.parse_with(buf, out, |parsed| parsed)
+    }
+
+    fn parse_with<T>(
+        &mut self,
+        buf: &mut BytesMut,
+        out: &mut Vec<T>,
+        convert: impl Fn(Parsed) -> T,
+    ) -> Result<()> {
         loop {
             let Some((consumed, items)) = self.next_frame(&buf[..])? else {
                 return Ok(());
@@ -383,10 +415,7 @@ impl RequestParser {
             if items.is_empty() {
                 continue;
             }
-            out.push(match command_from_frame(items) {
-                Ok(cmd) => Request::Cmd(cmd),
-                Err(message) => Request::Invalid(message),
-            });
+            out.push(convert(command_from_frame(items)));
         }
     }
 
@@ -461,20 +490,81 @@ impl RequestParser {
     }
 }
 
-/// Build a command from the arguments of one request frame.
-///
-/// On failure returns a complete RESP error line worded like Redis 7.
-fn command_from_frame(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String> {
-    let Some(spec) = commands::lookup(&items[0]) else {
-        return Err(unknown_command_error(&items));
-    };
-    let kind = spec.kind;
+/// A request as the server sees it: like [`Request`], with the invalid
+/// requests split by when Redis rejects them
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum Parsed {
+    Cmd(Cmd),
+    /// Rejected whether or not the client has authenticated: an unknown
+    /// command or subcommand, a wrong number of arguments, or an invalid
+    /// argument of a command allowed before authenticating. Holds the
+    /// complete error line.
+    Invalid(String),
+    /// Rejected by the command's own checks, which Redis only reaches for an
+    /// authenticated client; another client gets `NOAUTH` instead
+    Rejected(String),
+}
 
-    let argc = items.len();
-    let arity_error = || format!("ERR wrong number of arguments for '{}' command", spec.name);
-    if !spec.arity_matches(argc) {
-        return Err(arity_error());
+impl Parsed {
+    fn into_request(self) -> Request {
+        match self {
+            Parsed::Cmd(cmd) => Request::Cmd(cmd),
+            Parsed::Invalid(message) | Parsed::Rejected(message) => Request::Invalid(message),
+        }
     }
+
+    fn into_result(self) -> Result<Cmd> {
+        match self {
+            Parsed::Cmd(cmd) => Ok(cmd),
+            Parsed::Invalid(message) | Parsed::Rejected(message) => {
+                Err(anyhow::Error::msg(message))
+            }
+        }
+    }
+}
+
+/// Build a command from the arguments of one request frame, or the complete
+/// RESP error line to reply with, worded like Redis 7.
+///
+/// The command name, the number of arguments and the subcommand are checked
+/// first, as Redis does before it checks authentication.
+fn command_from_frame(items: Vec<Bytes>) -> Parsed {
+    let Some(spec) = commands::lookup(&items[0]) else {
+        return Parsed::Invalid(unknown_command_error(&items));
+    };
+    if !spec.arity_matches(items.len()) {
+        return Parsed::Invalid(arity_error(spec.name));
+    }
+    if matches!(spec.kind, Kind::Client | Kind::Config) {
+        let checked = if spec.kind == Kind::Client {
+            client_subcommand(&items[1..])
+        } else {
+            config_subcommand(&items[1..])
+        };
+        if let Err(error) = checked {
+            return Parsed::Invalid(error);
+        }
+    }
+    match build_command(spec, items) {
+        Ok(cmd) => Parsed::Cmd(cmd),
+        Err(error) if spec.kind.allowed_before_auth() => Parsed::Invalid(error),
+        Err(error) => Parsed::Rejected(error),
+    }
+}
+
+/// `ERR wrong number of arguments for '<name>' command`
+fn arity_error(name: &str) -> String {
+    format!("ERR wrong number of arguments for '{name}' command")
+}
+
+/// Build the command `spec` from the arguments of its request frame, whose
+/// number `command_from_frame` has checked, with the checks Redis makes in
+/// the command itself.
+#[inline(always)]
+fn build_command(spec: &CommandSpec, mut items: Vec<Bytes>) -> std::result::Result<Cmd, String> {
+    let kind = spec.kind;
+    let argc = items.len();
+    let arity_error = || arity_error(spec.name);
     // Limits Redis checks in the commands themselves, with the same error
     let arity_ok = match kind {
         Kind::Ping => argc <= 2,
@@ -658,6 +748,20 @@ fn command_from_frame(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String>
                 options: args.collect(),
             }
         }
+        Kind::Auth => {
+            let mut args = items.into_iter();
+            match (args.next(), args.next(), args.next()) {
+                (Some(password), None, _) => Cmd::Auth {
+                    username: None,
+                    password,
+                },
+                (Some(username), Some(password), None) => Cmd::Auth {
+                    username: Some(username),
+                    password,
+                },
+                _ => return Err("ERR syntax error".to_string()),
+            }
+        }
         Kind::Select => {
             let [index] = <[Bytes; 1]>::try_from(items).map_err(|_| arity_error())?;
             let index = parse_canonical_i64(&index)
@@ -788,30 +892,41 @@ fn expire_command(kind: Kind, name: &str, items: Vec<Bytes>) -> std::result::Res
     })
 }
 
-/// Build a `CONFIG` subcommand from the arguments after `CONFIG`.
-fn config_command(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String> {
-    let subcommand = &items[0];
-    if subcommand.eq_ignore_ascii_case(b"get") {
-        if items.len() < 2 {
-            return Err("ERR wrong number of arguments for 'config|get' command".to_string());
-        }
-        items.remove(0);
-        Ok(Cmd::ConfigGet(items))
-    } else if subcommand.eq_ignore_ascii_case(b"help") {
-        if items.len() != 1 {
-            return Err("ERR wrong number of arguments for 'config|help' command".to_string());
-        }
-        Ok(Cmd::ConfigHelp)
-    } else {
-        let shown = String::from_utf8_lossy(&subcommand[..subcommand.len().min(128)]);
-        Err(format!(
-            "ERR unknown subcommand '{shown}'. Try CONFIG HELP."
-        ))
-    }
+/// `ERR unknown subcommand ...`, with the subcommand cut to 128 bytes
+fn unknown_subcommand_error(subcommand: &[u8], command: &str) -> String {
+    let shown = String::from_utf8_lossy(&subcommand[..subcommand.len().min(128)]);
+    format!("ERR unknown subcommand '{shown}'. Try {command} HELP.")
 }
 
-/// Build a `CLIENT` subcommand from the arguments after `CLIENT`.
-fn client_command(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String> {
+/// The name of the `CONFIG` subcommand in the arguments after `CONFIG`,
+/// once it is known to exist and to have the right number of arguments
+fn config_subcommand(items: &[Bytes]) -> std::result::Result<&'static str, String> {
+    let subcommand = &items[0];
+    let (name, arity_ok) = if subcommand.eq_ignore_ascii_case(b"get") {
+        ("get", items.len() >= 2)
+    } else if subcommand.eq_ignore_ascii_case(b"help") {
+        ("help", items.len() == 1)
+    } else {
+        return Err(unknown_subcommand_error(subcommand, "CONFIG"));
+    };
+    if !arity_ok {
+        return Err(arity_error(&format!("config|{name}")));
+    }
+    Ok(name)
+}
+
+/// Build a `CONFIG` subcommand from the arguments after `CONFIG`.
+fn config_command(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String> {
+    if config_subcommand(&items)? == "help" {
+        return Ok(Cmd::ConfigHelp);
+    }
+    items.remove(0);
+    Ok(Cmd::ConfigGet(items))
+}
+
+/// The name of the `CLIENT` subcommand in the arguments after `CLIENT`,
+/// once it is known to exist and to have the right number of arguments
+fn client_subcommand(items: &[Bytes]) -> std::result::Result<&'static str, String> {
     let subcommand = &items[0];
     let (name, arity) = match subcommand.to_ascii_lowercase().as_slice() {
         b"id" => ("id", 1),
@@ -819,18 +934,17 @@ fn client_command(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String> {
         b"setname" => ("setname", 2),
         b"setinfo" => ("setinfo", 3),
         b"help" => ("help", 1),
-        _ => {
-            let shown = String::from_utf8_lossy(&subcommand[..subcommand.len().min(128)]);
-            return Err(format!(
-                "ERR unknown subcommand '{shown}'. Try CLIENT HELP."
-            ));
-        }
+        _ => return Err(unknown_subcommand_error(subcommand, "CLIENT")),
     };
     if items.len() != arity {
-        return Err(format!(
-            "ERR wrong number of arguments for 'client|{name}' command"
-        ));
+        return Err(arity_error(&format!("client|{name}")));
     }
+    Ok(name)
+}
+
+/// Build a `CLIENT` subcommand from the arguments after `CLIENT`.
+fn client_command(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String> {
+    let name = client_subcommand(&items)?;
     Ok(match name {
         "id" => Cmd::ClientId,
         "getname" => Cmd::ClientGetName,
@@ -1006,7 +1120,7 @@ pub fn parse_one(data: &[u8]) -> Result<Option<(usize, Cmd)>> {
         if items.is_empty() {
             continue;
         }
-        let cmd = command_from_frame(items).map_err(anyhow::Error::msg)?;
+        let cmd = command_from_frame(items).into_result()?;
         return Ok(Some((consumed, cmd)));
     }
 }
@@ -1033,7 +1147,7 @@ pub fn parse_many(buf: &mut BytesMut, out: &mut Vec<Cmd>) -> Result<()> {
         if items.is_empty() {
             continue;
         }
-        out.push(command_from_frame(items).map_err(anyhow::Error::msg)?);
+        out.push(command_from_frame(items).into_result()?);
     }
 }
 

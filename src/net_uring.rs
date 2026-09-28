@@ -12,8 +12,8 @@
 
 #![cfg(target_os = "linux")]
 
-use crate::net::handle_input;
-use crate::protocol::{Request, RequestParser};
+use crate::net::{handle_input, ServerOptions};
+use crate::protocol::{Parsed, RequestParser};
 use crate::session::Session;
 use crate::shard::{spawn_active_expiry, Shard};
 use crate::stats::Listener;
@@ -54,7 +54,7 @@ struct Connection {
     parser: RequestParser,
     /// Replies not written yet. Never modified while a write is in flight.
     write_buf: BytesMut,
-    reqs: Vec<Request>,
+    reqs: Vec<Parsed>,
     /// The client's connection state
     session: Session,
     /// Set after a protocol error or QUIT: flush `write_buf`, then close.
@@ -122,12 +122,18 @@ fn is_retryable(res: i32) -> bool {
     res == -libc::EINTR || res == -libc::EAGAIN
 }
 
+/// Run the io_uring server with default options; see [`run_server`]
 pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> {
     println!(
         "🚀 Starting Ignix with io_uring backend (Shard {})",
         shard_id
     );
+    run_server(addr, shard, ServerOptions::default())
+}
 
+/// Run the io_uring server: one thread serves every connection. Of
+/// `options`, `requirepass` applies and `busy_poll` does not.
+pub fn run_server(addr: SocketAddr, shard: Shard, options: ServerOptions) -> Result<()> {
     let listener = TcpListener::bind(addr)?;
     shard.stats.set_listener(Listener {
         addr: listener.local_addr()?,
@@ -138,6 +144,7 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
     spawn_active_expiry(&shard)?;
     // The single thread's counter of executed commands, for INFO
     let commands = shard.stats.command_counter();
+    let password = options.password();
     let listener_fd = types::Fd(listener.as_raw_fd());
     // Pause before accepting again when the process runs out of resources.
     // Must outlive the timeout operations that point at it.
@@ -174,7 +181,7 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
                     stream.set_nodelay(true).ok();
                     let entry = connections.vacant_entry();
                     let key = entry.key();
-                    let session = Session::connected(&shard.stats, &commands);
+                    let session = Session::connected(&shard.stats, &commands, password.as_ref());
                     let conn = entry.insert(Connection::new(stream, session));
                     pending.push_back(conn.read_entry(key));
                     pending.push_back(accept_entry(listener_fd));

@@ -32,16 +32,32 @@ fn main() -> Result<()> {
     let use_uring = args.iter().any(|a| a == "--backend=uring");
 
     // --busy-poll-us=N: busy-poll window of the mio backend (0 disables it)
+    // --requirepass PASSWORD (or --requirepass=PASSWORD): clients must AUTH
     let mut options = net::ServerOptions::default();
     let mut busy_poll_given = false;
-    for arg in &args[1..] {
+    let mut rest = args[1..].iter();
+    while let Some(arg) = rest.next() {
         if let Some(value) = arg.strip_prefix("--busy-poll-us=") {
             let micros: u64 = value
                 .parse()
                 .map_err(|_| anyhow::anyhow!("invalid --busy-poll-us value: {value:?}"))?;
             options.busy_poll = Duration::from_micros(micros);
             busy_poll_given = true;
+        } else if let Some(value) = arg.strip_prefix("--requirepass=") {
+            options.requirepass = Some(value.to_string());
+        } else if arg == "--requirepass" {
+            let value = rest
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("--requirepass needs a password"))?;
+            options.requirepass = Some(value.clone());
         }
+    }
+    if options
+        .requirepass
+        .as_deref()
+        .is_some_and(|p| !p.is_empty())
+    {
+        log::info!("clients must authenticate (requirepass is set)");
     }
 
     // Parse the default server address (0.0.0.0:7379)
@@ -69,7 +85,8 @@ fn main() -> Result<()> {
         if busy_poll_given {
             log::warn!("--busy-poll-us only applies to the default (mio) backend");
         }
-        return net_uring::run_shard(0, addr, shard);
+        println!("🚀 Starting Ignix with io_uring backend");
+        return net_uring::run_server(addr, shard, options);
     }
 
     if use_uring {

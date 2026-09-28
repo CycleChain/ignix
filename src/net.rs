@@ -6,8 +6,8 @@
  * using mio for async I/O operations.
  */
 
-use crate::protocol::{write_error, Request, RequestParser};
-use crate::session::Session;
+use crate::protocol::{write_error, Parsed, RequestParser};
+use crate::session::{Password, Session, NOAUTH};
 use crate::shard::{spawn_active_expiry, Shard};
 use crate::stats::{Listener, LocalCounter};
 use anyhow::*;
@@ -64,10 +64,10 @@ pub fn bind_reuseport(addr: SocketAddr) -> Result<TcpListener> {
 /// Default busy-poll window of [`ServerOptions`]
 pub const DEFAULT_BUSY_POLL: Duration = Duration::from_micros(50);
 
-/// Tuning options for [`run_server`]
+/// Options of [`run_server`]
 ///
 /// Start from [`ServerOptions::default`] and change the fields you need.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 #[non_exhaustive]
 pub struct ServerOptions {
     /// How long a worker keeps polling for new events without sleeping after
@@ -78,13 +78,36 @@ pub struct ServerOptions {
     /// to be woken as well. Polling briefly keeps latency low while traffic
     /// flows, at the cost of CPU time under load. An idle server sleeps.
     pub busy_poll: Duration,
+    /// The password clients must give with AUTH (or HELLO's AUTH option,
+    /// as user `default`) before running other commands, like Redis
+    /// `requirepass`; `None` (the default) or an empty password needs none.
+    /// `Debug` does not show it.
+    pub requirepass: Option<String>,
 }
 
 impl Default for ServerOptions {
     fn default() -> Self {
         Self {
             busy_poll: DEFAULT_BUSY_POLL,
+            requirepass: None,
         }
+    }
+}
+
+impl std::fmt::Debug for ServerOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ServerOptions")
+            .field("busy_poll", &self.busy_poll)
+            .field("requirepass", &self.requirepass.as_ref().map(|_| ".."))
+            .finish()
+    }
+}
+
+impl ServerOptions {
+    /// The password connections need, if any
+    pub(crate) fn password(&self) -> Option<Password> {
+        let password = self.requirepass.as_deref().filter(|p| !p.is_empty())?;
+        Some(Password::new(password.as_bytes()))
     }
 }
 
@@ -137,11 +160,13 @@ pub fn run_server(addr: SocketAddr, shard: Shard, options: ServerOptions) -> Res
 
     let mut handles = Vec::new();
 
+    let password = options.password();
     for (id, listener) in listeners.into_iter().enumerate() {
         let shard = shard.clone();
         let busy_poll = options.busy_poll;
+        let password = password.clone();
         handles.push(std::thread::spawn(move || {
-            if let Err(e) = run_worker_loop(id, listener, shard, busy_poll) {
+            if let Err(e) = run_worker_loop(id, listener, shard, busy_poll, password) {
                 log::error!("worker {id} stopped: {e:#}");
             }
         }));
@@ -167,7 +192,7 @@ struct Conn {
     /// Replies not written to the socket yet
     wbuf: BytesMut,
     /// Parsed requests, reused between reads
-    reqs: Vec<Request>,
+    reqs: Vec<Parsed>,
     /// The client's connection state
     session: Session,
     /// Set after EOF, a protocol error or QUIT: stop reading, flush `wbuf`,
@@ -206,14 +231,17 @@ pub(crate) fn handle_input(
     session: &mut Session,
     rbuf: &mut BytesMut,
     parser: &mut RequestParser,
-    reqs: &mut Vec<Request>,
+    reqs: &mut Vec<Parsed>,
     wbuf: &mut BytesMut,
 ) -> bool {
-    let parsed = parser.parse(rbuf, reqs);
+    let parsed = parser.parse_split(rbuf, reqs);
     for req in reqs.drain(..) {
         match req {
-            Request::Cmd(cmd) => shard.exec_session(cmd, session, wbuf),
-            Request::Invalid(message) => write_error(&message, wbuf),
+            Parsed::Cmd(cmd) => shard.exec_session(cmd, session, wbuf),
+            Parsed::Invalid(message) => write_error(&message, wbuf),
+            // Redis checks authentication before the command's own checks
+            Parsed::Rejected(_) if !session.is_authenticated() => write_error(NOAUTH, wbuf),
+            Parsed::Rejected(message) => write_error(&message, wbuf),
         }
         if session.is_closing() {
             // Dropping the iterator drops the requests after QUIT
@@ -252,6 +280,7 @@ fn run_worker_loop(
     mut listener: TcpListener,
     shard: Arc<Shard>,
     busy_poll: Duration,
+    password: Option<Password>,
 ) -> Result<()> {
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(1024);
@@ -293,7 +322,7 @@ fn run_worker_loop(
                     id,
                     poll.registry(),
                     &listener,
-                    (&shard, &commands),
+                    (&shard, &commands, password.as_ref()),
                     &mut clients,
                     &mut next_tok,
                 ),
@@ -322,7 +351,7 @@ fn accept_all(
     id: usize,
     registry: &Registry,
     listener: &TcpListener,
-    (shard, commands): (&Shard, &Arc<LocalCounter>),
+    (shard, commands, password): (&Shard, &Arc<LocalCounter>, Option<&Password>),
     clients: &mut HashMap<usize, Conn>,
     next_tok: &mut usize,
 ) {
@@ -337,7 +366,7 @@ fn accept_all(
                     log::warn!("worker {id}: cannot register a new connection: {e}");
                     continue;
                 }
-                let session = Session::connected(&shard.stats, commands);
+                let session = Session::connected(&shard.stats, commands, password);
                 clients.insert(tok, Conn::new(sock, session));
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -482,12 +511,16 @@ mod tests {
     /// Run `input` through `handle_input` on a new connection; returns
     /// whether the connection stays open and the replies.
     fn run_input(shard: &Shard, input: &[u8]) -> (bool, Vec<u8>) {
-        let mut session = Session::new();
+        run_input_in(shard, &mut Session::new(), input)
+    }
+
+    /// Run `input` through `handle_input` for the connection of `session`
+    fn run_input_in(shard: &Shard, session: &mut Session, input: &[u8]) -> (bool, Vec<u8>) {
         let mut rbuf = BytesMut::from(input);
         let mut wbuf = BytesMut::new();
         let open = handle_input(
             shard,
-            &mut session,
+            session,
             &mut rbuf,
             &mut RequestParser::new(),
             &mut Vec::new(),
@@ -508,6 +541,50 @@ mod tests {
             (false, b"+PONG\r\n+OK\r\n".to_vec())
         );
         assert_eq!(shard.dict.get(b"k"), None);
+    }
+
+    #[test]
+    fn before_auth_errors_come_in_redis_order() {
+        let shard = Shard::new(0, None);
+        let mut session = Session::with_password(b"secret");
+        let requests: [&[&[u8]]; 12] = [
+            // The command's own checks come after authentication...
+            &[b"SET", b"k", b"v", b"EX", b"abc"],
+            &[b"MSET", b"a", b"b", b"c"],
+            &[b"CLIENT", b"SETNAME", b"a b"],
+            // ...but the name, the number of arguments and the subcommand
+            // before it
+            &[b"FOO", b"x"],
+            &[b"GET"],
+            &[b"CLIENT", b"FOO"],
+            &[b"CLIENT", b"SETNAME"],
+            // Commands allowed before authentication check everything
+            &[b"HELLO", b"4"],
+            &[b"AUTH", b"a", b"b", b"c"],
+            &[b"AUTH", b"secret"],
+            &[b"SET", b"k", b"v", b"EX", b"abc"],
+            &[b"MSET", b"a", b"b", b"c"],
+        ];
+        let input: Vec<u8> = requests.iter().flat_map(|args| request(args)).collect();
+        let expected = [
+            "-NOAUTH Authentication required.",
+            "-NOAUTH Authentication required.",
+            "-NOAUTH Authentication required.",
+            "-ERR unknown command 'FOO', with args beginning with: 'x' ",
+            "-ERR wrong number of arguments for 'get' command",
+            "-ERR unknown subcommand 'FOO'. Try CLIENT HELP.",
+            "-ERR wrong number of arguments for 'client|setname' command",
+            "-NOPROTO unsupported protocol version",
+            "-ERR syntax error",
+            "+OK",
+            "-ERR value is not an integer or out of range",
+            "-ERR wrong number of arguments for 'mset' command",
+        ]
+        .map(|line| format!("{line}\r\n"))
+        .concat();
+        let (open, replies) = run_input_in(&shard, &mut session, &input);
+        assert!(open);
+        assert_eq!(String::from_utf8_lossy(&replies), expected);
     }
 
     #[test]

@@ -8,6 +8,7 @@
 use crate::protocol::{is_printable_ascii, ClientInfo, Protocol};
 use crate::stats::{LocalCounter, Stats};
 use bytes::Bytes;
+use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
@@ -17,6 +18,50 @@ static NEXT_ID: AtomicU64 = AtomicU64::new(1);
 /// Error for a client name that `CLIENT LIST` could not show
 pub(crate) const INVALID_CLIENT_NAME: &str =
     "ERR Client names cannot contain spaces, newlines or special characters.";
+
+/// Reply to a command a client runs before authenticating
+pub(crate) const NOAUTH: &str = "NOAUTH Authentication required.";
+
+/// Reply to HELLO from a client that has not authenticated, and did not
+/// with HELLO's AUTH option
+pub(crate) const HELLO_NOAUTH: &str = "NOAUTH HELLO must be called with the client already \
+    authenticated, otherwise the HELLO AUTH <user> <pass> option can be used to authenticate \
+    the client and select the RESP protocol version at the same time";
+
+/// Reply to a wrong user or password
+const WRONGPASS: &str = "WRONGPASS invalid username-password pair or user is disabled.";
+
+/// Reply to AUTH with a password alone when the server has no password
+const AUTH_WITHOUT_PASSWORD: &str = "ERR AUTH <password> called without any password \
+    configured for the default user. Are you sure your configuration is correct?";
+
+/// The password clients must give before running commands; its `Debug`
+/// output does not show it
+#[derive(Clone)]
+pub(crate) struct Password(Arc<[u8]>);
+
+impl Password {
+    pub(crate) fn new(password: &[u8]) -> Self {
+        Self(password.into())
+    }
+
+    /// Whether `given` is the password, compared in a time that does not
+    /// depend on where the two differ
+    fn matches(&self, given: &[u8]) -> bool {
+        let expected = &self.0[..];
+        let mut differ = given.len() ^ expected.len();
+        for (i, &byte) in expected.iter().enumerate() {
+            differ |= usize::from(byte ^ given.get(i).copied().unwrap_or(0));
+        }
+        differ == 0
+    }
+}
+
+impl fmt::Debug for Password {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Password(..)")
+    }
+}
 
 /// State of one client connection
 ///
@@ -32,6 +77,11 @@ pub struct Session {
     lib_name: Option<Bytes>,
     lib_ver: Option<Bytes>,
     closing: bool,
+    /// The password to give with AUTH or HELLO AUTH, if one is needed
+    password: Option<Password>,
+    /// Set until the client gives the password: meanwhile it may only run
+    /// AUTH, HELLO and QUIT
+    needs_auth: bool,
     /// Set for a connection of the server, which counts it in its statistics
     client: Option<Client>,
 }
@@ -60,10 +110,21 @@ impl Session {
         }
     }
 
+    /// The session of a new connection that must authenticate with
+    /// `password` (AUTH or HELLO's AUTH option) before running other
+    /// commands, like a Redis server with `requirepass`
+    pub fn with_password(password: &[u8]) -> Self {
+        Self::new().require(Some(&Password::new(password)))
+    }
+
     /// The session of a new server connection, counted in `stats` while it
     /// lives; its commands are counted in `commands`, the counter of the
     /// worker thread that serves it
-    pub(crate) fn connected(stats: &Arc<Stats>, commands: &Arc<LocalCounter>) -> Self {
+    pub(crate) fn connected(
+        stats: &Arc<Stats>,
+        commands: &Arc<LocalCounter>,
+        password: Option<&Password>,
+    ) -> Self {
         stats.client_connected();
         Self {
             client: Some(Client {
@@ -71,6 +132,15 @@ impl Session {
                 commands: commands.clone(),
             }),
             ..Self::new()
+        }
+        .require(password)
+    }
+
+    fn require(self, password: Option<&Password>) -> Self {
+        Self {
+            needs_auth: password.is_some(),
+            password: password.cloned(),
+            ..self
         }
     }
 
@@ -104,6 +174,34 @@ impl Session {
     /// The client library's version, from `CLIENT SETINFO LIB-VER`
     pub fn lib_ver(&self) -> Option<&Bytes> {
         self.lib_ver.as_ref()
+    }
+
+    /// Whether the client may run any command: it has given the password, or
+    /// none is needed
+    pub fn is_authenticated(&self) -> bool {
+        !self.needs_auth
+    }
+
+    /// Authenticate as `username` (`default` when `None`) with `password`,
+    /// like Redis AUTH: `default` is the only user, and without a password
+    /// it accepts any, but AUTH with a password alone is then an error. A
+    /// failure leaves the session as it was.
+    pub(crate) fn authenticate(
+        &mut self,
+        username: Option<&[u8]>,
+        password: &[u8],
+    ) -> Result<(), &'static str> {
+        let accepted = match (&self.password, username) {
+            (_, Some(user)) if user != b"default" => false,
+            (None, None) => return Err(AUTH_WITHOUT_PASSWORD),
+            (None, Some(_)) => true,
+            (Some(expected), _) => expected.matches(password),
+        };
+        if !accepted {
+            return Err(WRONGPASS);
+        }
+        self.needs_auth = false;
+        Ok(())
     }
 
     /// Whether the client has asked to close the connection (`QUIT`): the
@@ -166,5 +264,51 @@ mod tests {
         assert_eq!(session.name().map(|n| &n[..]), Some(&b"worker-1"[..]));
         assert_eq!(session.set_name(Bytes::new()), Ok(()));
         assert_eq!(session.name(), None);
+    }
+
+    #[test]
+    fn passwords_match_only_themselves() {
+        let password = Password::new(b"secret");
+        assert!(password.matches(b"secret"));
+        for wrong in [
+            &b""[..],
+            b"secre",
+            b"secret!",
+            b"Secret",
+            b"secreu",
+            b"xsecret",
+        ] {
+            assert!(!password.matches(wrong), "{wrong:?}");
+        }
+        assert!(Password::new(b"").matches(b""));
+        assert!(!format!("{:?}", Session::with_password(b"secret")).contains("secret"));
+    }
+
+    #[test]
+    fn authentication_follows_redis() {
+        let mut session = Session::with_password(b"secret");
+        assert!(!session.is_authenticated());
+        assert_eq!(session.authenticate(None, b"wrong"), Err(WRONGPASS));
+        assert_eq!(
+            session.authenticate(Some(b"other"), b"secret"),
+            Err(WRONGPASS)
+        );
+        assert!(!session.is_authenticated());
+        assert_eq!(session.authenticate(None, b"secret"), Ok(()));
+        assert!(session.is_authenticated());
+        // A failure afterwards does not undo it
+        assert_eq!(
+            session.authenticate(Some(b"default"), b"wrong"),
+            Err(WRONGPASS)
+        );
+        assert!(session.is_authenticated());
+        assert_eq!(session.authenticate(Some(b"default"), b"secret"), Ok(()));
+
+        // Without a password, `default` accepts any, but not AUTH <password>
+        let mut session = Session::new();
+        assert!(session.is_authenticated());
+        assert_eq!(session.authenticate(None, b"x"), Err(AUTH_WITHOUT_PASSWORD));
+        assert_eq!(session.authenticate(Some(b"default"), b"x"), Ok(()));
+        assert_eq!(session.authenticate(Some(b"other"), b"x"), Err(WRONGPASS));
     }
 }

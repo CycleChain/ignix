@@ -1372,3 +1372,112 @@ fn incrby_family_checks_arity() {
         assert_eq!(exec(&shard(), args), arity_error(name));
     }
 }
+
+const NOAUTH: &[u8] = b"-NOAUTH Authentication required.\r\n";
+const WRONGPASS: &[u8] = b"-WRONGPASS invalid username-password pair or user is disabled.\r\n";
+
+#[test]
+fn a_session_with_a_password_runs_commands_only_after_auth() {
+    let s = shard();
+    let mut session = Session::with_password(b"secret");
+    assert!(!session.is_authenticated());
+    assert_eq!(exec_in(&s, &mut session, &[b"SET", b"k", b"v"]), NOAUTH);
+    assert_eq!(exec_in(&s, &mut session, &[b"PING"]), NOAUTH);
+    assert_eq!(exec_in(&s, &mut session, &[b"AUTH", b"wrong"]), WRONGPASS);
+    assert_eq!(
+        exec_in(&s, &mut session, &[b"AUTH", b"other", b"secret"]),
+        WRONGPASS
+    );
+    assert_eq!(exec_in(&s, &mut session, &[b"AUTH", b"secret"]), b"+OK\r\n");
+    assert!(session.is_authenticated());
+    assert_eq!(exec_in(&s, &mut session, &[b"SET", b"k", b"v"]), b"+OK\r\n");
+    // A failed AUTH afterwards keeps the connection authenticated
+    assert_eq!(exec_in(&s, &mut session, &[b"AUTH", b"wrong"]), WRONGPASS);
+    assert_eq!(exec_in(&s, &mut session, &[b"GET", b"k"]), b"$1\r\nv\r\n");
+    assert_eq!(
+        exec_in(&s, &mut session, &[b"AUTH", b"default", b"secret"]),
+        b"+OK\r\n"
+    );
+    // Only the command that was refused went unexecuted
+    assert_eq!(s.dict.len(), 1);
+}
+
+#[test]
+fn quit_needs_no_auth() {
+    let s = shard();
+    let mut session = Session::with_password(b"secret");
+    assert_eq!(exec_in(&s, &mut session, &[b"QUIT"]), b"+OK\r\n");
+    assert!(session.is_closing());
+}
+
+#[test]
+fn hello_authenticates_or_refuses_like_redis() {
+    let s = shard();
+    let noauth = b"-NOAUTH HELLO must be called with the client already authenticated, \
+        otherwise the HELLO AUTH <user> <pass> option can be used to authenticate the client \
+        and select the RESP protocol version at the same time\r\n";
+    let mut session = Session::with_password(b"secret");
+    assert_eq!(exec_in(&s, &mut session, &[b"HELLO"]), noauth);
+    // Version and option errors come first
+    assert_eq!(
+        exec_in(&s, &mut session, &[b"HELLO", b"4"]),
+        b"-NOPROTO unsupported protocol version\r\n"
+    );
+    assert_eq!(
+        exec_in(&s, &mut session, &[b"HELLO", b"3", b"AUTH", b"default"]),
+        b"-ERR Syntax error in HELLO option 'AUTH'\r\n"
+    );
+    // SETNAME is applied before the refusal, as in Redis
+    assert_eq!(
+        exec_in(&s, &mut session, &[b"HELLO", b"3", b"SETNAME", b"early"]),
+        noauth
+    );
+    assert_eq!(session.protocol(), Protocol::Resp2);
+    assert_eq!(session.name().map(|n| &n[..]), Some(&b"early"[..]));
+    assert_eq!(
+        exec_in(
+            &s,
+            &mut session,
+            &[b"HELLO", b"3", b"AUTH", b"default", b"wrong"]
+        ),
+        WRONGPASS
+    );
+    let id = session.id();
+    assert_eq!(
+        exec_in(
+            &s,
+            &mut session,
+            &[b"HELLO", b"3", b"AUTH", b"default", b"secret"]
+        ),
+        hello_reply(3, id)
+    );
+    assert!(session.is_authenticated());
+    assert_eq!(exec_in(&s, &mut session, &[b"GET", b"k"]), b"_\r\n");
+}
+
+#[test]
+fn auth_without_a_password_set_follows_redis() {
+    let s = shard();
+    let mut session = Session::new();
+    assert_eq!(
+        exec_in(&s, &mut session, &[b"AUTH", b"x"]),
+        b"-ERR AUTH <password> called without any password configured for the default user. \
+          Are you sure your configuration is correct?\r\n"
+    );
+    assert_eq!(
+        exec_in(&s, &mut session, &[b"AUTH", b"default", b"x"]),
+        b"+OK\r\n"
+    );
+    assert_eq!(
+        exec_in(&s, &mut session, &[b"AUTH", b"other", b"x"]),
+        WRONGPASS
+    );
+    assert_eq!(
+        exec_in(&s, &mut session, &[b"AUTH", b"a", b"b", b"c"]),
+        b"-ERR syntax error\r\n"
+    );
+    assert_eq!(
+        exec(&s, &[b"AUTH"]),
+        b"-ERR wrong number of arguments for 'auth' command\r\n"
+    );
+}

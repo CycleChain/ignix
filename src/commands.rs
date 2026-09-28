@@ -51,6 +51,15 @@ pub(crate) enum Kind {
     GetDel,
     GetEx,
     MSetNx,
+    Auth,
+}
+
+impl Kind {
+    /// Whether a client that has not authenticated yet may run the command
+    /// (Redis `no-auth` commands)
+    pub(crate) fn allowed_before_auth(self) -> bool {
+        matches!(self, Kind::Auth | Kind::Hello | Kind::Quit)
+    }
 }
 
 /// The static description of a command
@@ -172,6 +181,7 @@ commands! {
     GETDEL = "getdel", 2, GetDel;
     GETEX = "getex", -2, GetEx;
     MSETNX = "msetnx", -3, MSetNx;
+    AUTH = "auth", -2, Auth;
 }
 
 #[cfg(test)]

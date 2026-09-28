@@ -76,6 +76,7 @@ world
 | `SELECT index` | Select a database; only database 0 exists | `SELECT 0` → `+OK` |
 | `QUIT` | Reply, then close the connection; requests sent after it are dropped | `QUIT` → `+OK` |
 | `HELLO [protover [AUTH username password] [SETNAME clientname]]` | Switch to RESP2 or RESP3 and describe the server | `HELLO 3` → `%7\r\n$6\r\nserver...` |
+| `AUTH [username] password` | Authenticate the connection when the server runs with `--requirepass` (the only user is `default`) | `AUTH secret` → `+OK` |
 | `CLIENT ID\|GETNAME\|SETNAME\|SETINFO\|HELP` | The connection's id and name, the client library's name and version | `CLIENT SETNAME app` → `+OK` |
 | `INFO [section ...]` | Server, clients, persistence, stats, replication and keyspace sections, in Redis's format | `INFO keyspace` → `# Keyspace\r\ndb0:keys=2,...` |
 | `CONFIG GET parameter [parameter ...]` | Configuration parameters matching names or glob patterns | `CONFIG GET save` → `*2\r\n$4\r\nsave\r\n$0\r\n` |
@@ -115,6 +116,7 @@ Replies and error messages match Redis 7, for example `-ERR wrong number of argu
 ### Command-line Options
 
 - `--backend=uring`: use the io_uring backend (Linux only; elsewhere Ignix falls back to mio).
+- `--requirepass PASSWORD` (or `--requirepass=PASSWORD`): clients must authenticate with `AUTH PASSWORD`, `AUTH default PASSWORD` or `HELLO 3 AUTH default PASSWORD` before running other commands, as with Redis `requirepass`; the others get `-NOAUTH Authentication required.`. The password is compared in constant time. Clients pass it as usual, for example `redis-cli -a PASSWORD` or `redis://:PASSWORD@host:7379`.
 - `--busy-poll-us=N`: how long a worker of the default (mio) backend keeps polling for new events after its last one before it sleeps, in microseconds; the default is 50 and `0` disables busy-polling. It trades CPU time for latency: an idle server uses no CPU either way, at 1,000 requests per second the server used about 10% of a CPU instead of 5% in our measurements, and under sustained load every busy worker uses a full core.
 
 ### Environment Variables
@@ -323,7 +325,7 @@ Monitor AOF: `tail -f ignix.aof`
 - No inline commands (plain text lines such as `PING` typed into telnet); requests must be RESP arrays.
 - Expired keys are removed when a command touches them and by a background cycle ten times a second, as in Redis; until then they still count in `DBSIZE`.
 - The AOF is write-only: it is not loaded on startup, so data does not survive a restart, and it is never compacted, so it grows with every write. In one of our benchmark sessions `ignix.aof` grew to 13.8 GB while Redis, which rewrites its AOF, used 2.3 GB.
-- No authentication, and the server listens on the fixed address `0.0.0.0:7379`; do not expose it to untrusted networks.
+- The server listens on the fixed address `0.0.0.0:7379`, and without `--requirepass` any client can use it; do not expose it to untrusted networks. There are no ACL users besides `default`, and no TLS.
 - The io_uring backend runs on a single thread.
 - No clustering or replication.
 
