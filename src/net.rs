@@ -103,6 +103,14 @@ pub fn run_server(addr: SocketAddr, shard: Shard, options: ServerOptions) -> Res
         .map(|n| n.get())
         .unwrap_or(4);
 
+    // Bind every worker's listener before starting any worker, so that an
+    // address that cannot be used is an error instead of a running server
+    // that accepts nothing.
+    let listeners = (0..threads)
+        .map(|_| bind_reuseport(addr))
+        .collect::<Result<Vec<_>>>()
+        .with_context(|| format!("cannot listen on {addr}"))?;
+
     println!(
         "🚀 Starting Ignix with {} worker threads (Multi-Reactor)",
         threads
@@ -110,24 +118,24 @@ pub fn run_server(addr: SocketAddr, shard: Shard, options: ServerOptions) -> Res
 
     let mut handles = Vec::new();
 
-    for id in 0..threads {
+    for (id, listener) in listeners.into_iter().enumerate() {
         let shard = shard.clone();
         let busy_poll = options.busy_poll;
         handles.push(std::thread::spawn(move || {
-            if let Err(e) = run_worker_loop(id, addr, shard, busy_poll) {
+            if let Err(e) = run_worker_loop(id, listener, shard, busy_poll) {
                 log::error!("worker {id} stopped: {e:#}");
             }
         }));
     }
 
-    // Wait for all threads (they should run forever)
+    // Workers run until they fail
     for h in handles {
         if h.join().is_err() {
             log::error!("a worker thread panicked");
         }
     }
 
-    Ok(())
+    bail!("every worker thread has stopped")
 }
 
 /// Per-connection state of the mio backend
@@ -197,17 +205,16 @@ fn poll_timeout(busy_poll: Duration, idle_for: Option<Duration>) -> Option<Durat
 }
 
 /// Main event loop for a single worker thread
+///
+/// Each worker has its own listener bound to the same port (SO_REUSEPORT).
 fn run_worker_loop(
     id: usize,
-    addr: SocketAddr,
+    mut listener: TcpListener,
     shard: Arc<Shard>,
     busy_poll: Duration,
 ) -> Result<()> {
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(1024);
-
-    // Each worker binds its own listener to the same port (SO_REUSEPORT)
-    let mut listener = bind_reuseport(addr)?;
 
     const LISTENER: Token = Token(0);
     poll.registry()
@@ -385,6 +392,24 @@ fn would_block(e: &std::io::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn run_server_fails_when_it_cannot_listen() {
+        // A listener without SO_REUSEPORT keeps the port to itself
+        let taken = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = taken.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let result = run_server(addr, Shard::new(0, None), ServerOptions::default());
+            let _ = tx.send(result.is_err());
+        });
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(10)),
+            Ok(true),
+            "run_server must return an error when the address is in use"
+        );
+        drop(taken);
+    }
 
     #[test]
     fn workers_poll_without_blocking_only_inside_the_busy_poll_window() {
