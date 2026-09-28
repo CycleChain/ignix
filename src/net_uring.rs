@@ -15,7 +15,7 @@
 use crate::net::handle_input;
 use crate::protocol::{Request, RequestParser};
 use crate::session::Session;
-use crate::shard::Shard;
+use crate::shard::{spawn_active_expiry, Shard};
 use crate::stats::Listener;
 use anyhow::Result;
 use bytes::{Buf, BytesMut};
@@ -25,6 +25,7 @@ use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::sync::Arc;
 
 /// Size of the kernel read buffer of each connection
 const READ_BUF: usize = 4096;
@@ -132,6 +133,9 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
         addr: listener.local_addr()?,
         api: "io_uring",
     });
+    // Shared with the expiry thread, which stops once the shard is dropped
+    let shard = Arc::new(shard);
+    spawn_active_expiry(&shard)?;
     // The single thread's counter of executed commands, for INFO
     let commands = shard.stats.command_counter();
     let listener_fd = types::Fd(listener.as_raw_fd());

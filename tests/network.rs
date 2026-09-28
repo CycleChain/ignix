@@ -10,7 +10,7 @@ use common::req;
 use std::io::{BufRead, BufReader, ErrorKind, Read, Write};
 use std::net::{Shutdown, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 const ADDR: &str = "127.0.0.1:7379";
 
@@ -264,6 +264,31 @@ fn info_counts_connections_and_commands() {
 
     let replies = roundtrip(&req(&[b"CONFIG", b"GET", b"port"]), 1);
     assert_eq!(replies[0], b"*2\r\n$4\r\nport\r\n$4\r\n7379\r\n");
+}
+
+#[test]
+#[ignore = "requires a running ignix server on 127.0.0.1:7379"]
+fn expired_keys_are_removed_without_being_touched() {
+    let expired = || info_field(&roundtrip(&req(&[b"INFO", b"stats"]), 1)[0], "expired_keys");
+    let before = expired();
+    let keys: Vec<String> = (0..20)
+        .map(|i| unique_key(&format!("expiring-{i}")))
+        .collect();
+    let mut data = Vec::new();
+    for key in &keys {
+        data.extend(req(&[b"SET", key.as_bytes(), b"v", b"PX", b"1"]));
+    }
+    roundtrip(&data, keys.len());
+    // Nothing touches the keys again, so only the background expiry cycle
+    // (ten times a second) can remove and count them
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while expired() < before + keys.len() as u64 {
+        assert!(
+            Instant::now() < deadline,
+            "the expired keys were not removed"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
 }
 
 #[test]

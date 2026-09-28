@@ -8,7 +8,7 @@
 
 use crate::protocol::{write_error, Request, RequestParser};
 use crate::session::Session;
-use crate::shard::Shard;
+use crate::shard::{spawn_active_expiry, Shard};
 use crate::stats::{Listener, LocalCounter};
 use anyhow::*;
 use bytes::{Buf, BytesMut};
@@ -127,6 +127,8 @@ pub fn run_server(addr: SocketAddr, shard: Shard, options: ServerOptions) -> Res
             api: EVENT_API,
         });
     }
+    // Stops by itself once the workers have stopped and the shard is dropped
+    spawn_active_expiry(&shard).context("cannot start the expiry thread")?;
 
     println!(
         "🚀 Starting Ignix with {} worker threads (Multi-Reactor)",

@@ -23,6 +23,15 @@ use crate::stats::Stats;
 use crate::storage::{unix_ms, Dict, ExpireResult, GetExChange, GetExEffect, GetExResult};
 use bytes::{Bytes, BytesMut};
 use std::sync::Arc;
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+/// How often the background expiry cycle runs, like Redis's default `hz 10`
+const EXPIRE_CYCLE_PERIOD: Duration = Duration::from_millis(100);
+
+/// How long one background expiry cycle may run: a quarter of its period,
+/// as in Redis
+const EXPIRE_CYCLE_BUDGET: Duration = Duration::from_millis(25);
 
 /// Choose how to store a value written by SET or MSET.
 ///
@@ -210,6 +219,26 @@ pub struct Shard {
     pub stats: Arc<Stats>,
 }
 
+/// Start a thread that removes the expired keys of `shard` in the
+/// background: ten times a second it runs [`Shard::expire_cycle`] for at
+/// most 25 ms, like Redis's active expiry. The thread stops once `shard` is
+/// dropped.
+///
+/// The servers of this crate start one; a program running commands through
+/// its own `Shard` can too.
+pub fn spawn_active_expiry(shard: &Arc<Shard>) -> std::io::Result<JoinHandle<()>> {
+    let shard = Arc::downgrade(shard);
+    std::thread::Builder::new()
+        .name("ignix-expire".into())
+        .spawn(move || loop {
+            std::thread::sleep(EXPIRE_CYCLE_PERIOD);
+            let Some(shard) = shard.upgrade() else {
+                return;
+            };
+            shard.expire_cycle(EXPIRE_CYCLE_BUDGET);
+        })
+}
+
 impl Shard {
     /// Create a new shard with the given ID and optional AOF handle
     ///
@@ -220,12 +249,12 @@ impl Shard {
         let stats: Arc<Stats> = Arc::default();
         let mut dict = Dict::default();
         let (log, counters) = (aof.clone(), stats.clone());
-        // A key removed because it expired is counted and logged as DEL,
-        // unless the command replaces it anyway
-        dict.set_on_expired(Box::new(move |key: &Bytes, replaced: bool| {
-            counters.key_expired();
+        // Keys removed because they expired are counted and logged as DEL,
+        // unless the command replaces them anyway
+        dict.set_on_expired(Box::new(move |keys: &[Bytes], replaced: bool| {
+            counters.keys_expired(keys.len());
             if let (Some(aof), false) = (&log, replaced) {
-                aof.write_owned(emit_aof_del(std::slice::from_ref(key)));
+                aof.write_owned(emit_aof_del(keys));
             }
         }));
         Self {
@@ -234,6 +263,17 @@ impl Shard {
             aof,
             stats,
         }
+    }
+
+    /// Remove expired keys for at most `budget`, the way the background
+    /// thread of [`spawn_active_expiry`] does ten times a second, and return
+    /// how many were removed. They are counted in INFO `expired_keys` and
+    /// logged to the AOF as `DEL`.
+    ///
+    /// Expired keys are also removed whenever a command touches them; this
+    /// reclaims the memory of those that no command touches again.
+    pub fn expire_cycle(&self, budget: Duration) -> usize {
+        self.dict.expire_cycle(Instant::now() + budget)
     }
 
     /// SET with options (also SETNX, GETSET, SETEX and PSETEX): sets the key

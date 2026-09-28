@@ -321,7 +321,7 @@ Monitor AOF: `tail -f ignix.aof`
 - `SCAN` visits the keyspace one shard (1/1024 of the keys) at a time, so with many keys a step returns more keys than `COUNT`; like in Redis, every key that exists during the whole iteration is returned, and here exactly once.
 - A single database: `SELECT` accepts only index 0.
 - No inline commands (plain text lines such as `PING` typed into telnet); requests must be RESP arrays.
-- Expired keys are removed when they are next accessed, so they still count in `DBSIZE` until then (as in Redis between its expiry cycles).
+- Expired keys are removed when a command touches them and by a background cycle ten times a second, as in Redis; until then they still count in `DBSIZE`.
 - The AOF is write-only: it is not loaded on startup, so data does not survive a restart, and it is never compacted, so it grows with every write. In one of our benchmark sessions `ignix.aof` grew to 13.8 GB while Redis, which rewrites its AOF, used 2.3 GB.
 - No authentication, and the server listens on the fixed address `0.0.0.0:7379`; do not expose it to untrusted networks.
 - The io_uring backend runs on a single thread.

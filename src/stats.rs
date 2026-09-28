@@ -115,8 +115,8 @@ impl Stats {
         self.connected_clients.fetch_sub(1, Ordering::Relaxed);
     }
 
-    pub(crate) fn key_expired(&self) {
-        self.expired_keys.fetch_add(1, Ordering::Relaxed);
+    pub(crate) fn keys_expired(&self, count: usize) {
+        self.expired_keys.fetch_add(count as u64, Ordering::Relaxed);
     }
 }
 

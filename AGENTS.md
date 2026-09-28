@@ -82,8 +82,12 @@ boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler 
   `Cmd`'nin `#[repr(u8)]` olması da etiketi bir alanın boş değerlerine gizlemeyi önler. Sık bir
   komut eklerken ya da bu yapıyı değiştirirken callgrind ile ölç. Sunucuda tek bir
   `Arc<Shard>` paylaşılır.
-- `src/storage.rs`: `Dict` = 1024 × `CachePadded<RwLock<hashbrown::HashMap<Bytes, Entry>>>`
-  (anahtar bir kez hash'lenir, parça ve yuva aynı hash'ten; `Entry { value, expires_at }`);
+- `src/storage.rs`: `Dict` = 1024 × `CachePadded<RwLock<Table>>`; `Table` (iç `table` modülü)
+  bir `hashbrown::HashMap<Bytes, Entry>` ile süreli anahtar sayısını ve bir sonraki süpürme
+  zamanını tutar. Girdiler yalnızca `Table::slot` üzerinden (`Occupied::{replace, set_expiry,
+  remove, value_mut}`, `Vacant::insert`) değişir, sayaç böylece hep doğru kalır; bu API'yi
+  atlayan kod yazma. Anahtar bir kez hash'lenir, parça ve yuva aynı hash'ten;
+  `Entry { value, expires_at }`;
   `get`, `set`, `del`, `rename`, `exists`, `len`, `clear`, `incr`/`incr_by` (parçanın yazma
   kilidi altında atomik, `Result<i64, IncrError>` döner). Çok anahtarlı komutlar anahtarlarının
   parçalarını `lock_keys` (yazma: `set_many`, `del_many`, `rename`) ya da `read_many` (okuma:
@@ -96,6 +100,10 @@ boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler 
   `on_expired` kancasıyla (Shard: sayaç + AOF'a `DEL`) bildirilir. SET/MSET/RENAME hedefi gibi
   anahtarı zaten değiştiren komutlarda kanca `replaced` ile çağrılır ve `DEL` yazılmaz: SET
   kaydı uygulamadan önce yazıldığı için `DEL` ondan sonra gelip anahtarı silerdi.
+  Etkin silme: `Dict::expire_cycle` parçaları sırayla dolaşır, `sweep_due` olanları yazma
+  kilidi altında `extract_if` ile süpürür (parça başına en çok `SWEEP_LIMIT` = 1000 anahtar,
+  kancaya parça başına tek çağrı, yani tek `DEL` kaydı). Sunucular `spawn_active_expiry` ile
+  `ignix-expire` iş parçacığını başlatır (saniyede 10 kez, en çok 25 ms, Redis gibi).
 - `src/aof.rs`: `spawn_aof_writer` (dosyayı önce açar, açamazsa `Err` döner; ayrı iş
   parçacığı, 4096 kapasiteli sınırlı kanal; kayıtlar en geç bir saniye içinde `sync_data` ile
   diske işlenir) ve ikili güvenli `emit_aof_*` kodlayıcıları.

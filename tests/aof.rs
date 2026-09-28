@@ -325,6 +325,49 @@ fn set_family_logs_what_a_replay_needs() {
 }
 
 #[test]
+fn keys_removed_by_the_expiry_cycle_are_logged_as_del() {
+    let dir = temp_dir("expire-cycle");
+    let path = dir.join("test.aof");
+    let shard = Shard::new(0, Some(spawn_aof_writer(path.to_str().unwrap()).unwrap()));
+    // A time long past: the keys are stored already expired
+    let gone: Vec<Vec<u8>> = (0..50).map(|i| format!("gone{i}").into_bytes()).collect();
+    for key in &gone {
+        exec(&shard, &[b"SET", key, b"v", b"PXAT", b"1"]);
+    }
+    exec(&shard, &[b"SET", b"kept", b"v", b"PX", b"3600000"]);
+    exec(&shard, &[b"SET", b"plain", b"v"]);
+
+    assert_eq!(shard.expire_cycle(Duration::from_secs(60)), gone.len());
+    assert_eq!(shard.stats.expired_keys(), gone.len() as u64);
+    assert_eq!(shard.dict.len(), 2);
+
+    exec(&shard, &[b"SET", b"marker", b"end"]);
+    let data = wait_for(&path, b"$6\r\nmarker\r\n$3\r\nend\r\n");
+    drop(shard);
+    let _ = std::fs::remove_dir_all(&dir);
+    let mut buf = BytesMut::from(&data[..]);
+    let mut cmds = Vec::new();
+    parse_many(&mut buf, &mut cmds).expect("every record is a complete RESP command");
+    // Each removed key is in exactly one DEL, after its SET
+    let mut deleted = Vec::new();
+    for cmd in &cmds {
+        if let Cmd::Del(keys) = cmd {
+            deleted.extend(keys.iter().map(|k| k.to_vec()));
+        }
+    }
+    deleted.sort();
+    let mut expected = gone.clone();
+    expected.sort();
+    assert_eq!(deleted, expected);
+    let first_del = cmds.iter().position(|c| matches!(c, Cmd::Del(_))).unwrap();
+    let last_set = cmds
+        .iter()
+        .rposition(|c| matches!(c, Cmd::SetWith(..)))
+        .unwrap();
+    assert!(last_set < first_del);
+}
+
+#[test]
 fn failed_incr_is_not_logged() {
     let data = aof_after("incr", &[&[b"SET", b"t", b"abc"], &[b"INCR", b"t"]]);
     assert!(
