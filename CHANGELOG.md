@@ -10,11 +10,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Security
 - **Remote crash on malformed requests**: a negative or oversized bulk length (e.g. `*1\r\n$-5\r\n`) made the parser overflow, and a huge element count (`*9223372036854775807\r\n`) made it try to allocate that many elements. Because the release profile uses `panic = "abort"`, a single packet from any client terminated the whole server. Lengths are now parsed with checked arithmetic, bulk strings are limited to 512 MiB and element counts to `INT_MAX` (as in Redis), and malformed input is answered with `ERR Protocol error: ...`.
 
+- **One large request could stall a worker for seconds**: every read parsed a partial request again from its start and copied all of its arguments again, so a request arriving in many pieces took quadratic time. A 2.5 MB `DEL` with 200,000 keys arriving in 4 KiB reads kept a worker busy for 4.6 s (release build), during which its other connections waited. Each connection now keeps a `RequestParser` that continues where it stopped; the same request takes 31 ms.
+
 ### Added
 - **`INCRBY`, `DECRBY` and `DECR`**, with the same integer rules and error messages as Redis. redis-py implements `incr()` with `INCRBY`, so counters did not work with it before. New API: `Cmd::IncrBy(key, delta)` (DECRBY and DECR are parsed as negative deltas), `Dict::incr_by` and `emit_aof_incrby`.
 - **Multi-key `DEL` and `EXISTS`, `PING [message]`**: `DEL` removes every given key and replies with the number removed, `EXISTS` counts every existing argument (repeated keys count each time), and `PING message` echoes the message as a bulk string, as in Redis.
 - **Busy-polling** (mio backend): after its last event a worker keeps polling for new events without blocking for 50 µs before it sleeps, because waking a sleeping worker cost the client more than serving the request. `--busy-poll-us=N` sets the window and `--busy-poll-us=0` disables it; an idle server still sleeps. Library users can pass `ServerOptions` (field `busy_poll`, default `DEFAULT_BUSY_POLL`) to the new `run_server`; `run_shard` uses the defaults.
 - **`AofHandle::write_owned`**: hands an encoded record (such as the result of `emit_aof_set`) to the writer thread without the copy that `write(&[u8])` makes.
+- **`RequestParser`**: an incremental request parser for servers reading from sockets; it remembers how far a partial request was parsed, so each call only looks at new bytes. `parse_requests` is unchanged and still parses a partial request from its start on every call.
 - **Request API for servers**: `protocol::parse_requests` parses every complete request into `Request::Cmd` or `Request::Invalid(error_line)` and only fails on protocol errors, and `protocol::write_error` writes a RESP error reply (`-ERR ...`).
 
 ### Changed
