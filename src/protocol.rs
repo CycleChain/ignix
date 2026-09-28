@@ -6,6 +6,7 @@
  * including command parsing, validation, and response formatting.
  */
 
+use crate::commands::{self, Kind};
 use anyhow::{bail, Result};
 use bytes::{Buf, BufMut, Bytes, BytesMut};
 
@@ -114,6 +115,10 @@ pub(crate) fn parse_canonical_i64(s: &[u8]) -> Option<i64> {
 /// Returns `Ok(None)` while the line is incomplete, the position after the
 /// line and the value once it is complete, and `invalid` as the error when the
 /// line is malformed.
+///
+/// Always inlined: it runs for every header, and left to itself the compiler
+/// stopped inlining it after unrelated changes to the parser.
+#[inline(always)]
 fn read_int_line(data: &[u8], pos: usize, invalid: &'static str) -> Result<Option<(usize, i64)>> {
     let rest = &data[pos..];
     let window = &rest[..rest.len().min(MAX_INT_LINE + 1)];
@@ -260,38 +265,6 @@ impl RequestParser {
     }
 }
 
-/// Commands known to the parser, with the name Redis uses in error messages.
-#[derive(Clone, Copy)]
-enum Kind {
-    Ping,
-    Get,
-    Set,
-    Del,
-    Rename,
-    Exists,
-    Incr,
-    IncrBy,
-    Decr,
-    DecrBy,
-    MGet,
-    MSet,
-}
-
-const COMMANDS: [(&str, Kind); 12] = [
-    ("ping", Kind::Ping),
-    ("get", Kind::Get),
-    ("set", Kind::Set),
-    ("del", Kind::Del),
-    ("rename", Kind::Rename),
-    ("exists", Kind::Exists),
-    ("incr", Kind::Incr),
-    ("incrby", Kind::IncrBy),
-    ("decr", Kind::Decr),
-    ("decrby", Kind::DecrBy),
-    ("mget", Kind::MGet),
-    ("mset", Kind::MSet),
-];
-
 /// SET options that Redis supports but Ignix does not implement yet.
 const UNSUPPORTED_SET_OPTIONS: [&str; 8] =
     ["NX", "XX", "GET", "EX", "PX", "EXAT", "PXAT", "KEEPTTL"];
@@ -300,23 +273,22 @@ const UNSUPPORTED_SET_OPTIONS: [&str; 8] =
 ///
 /// On failure returns a complete RESP error line worded like Redis 7.
 fn command_from_frame(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String> {
-    let Some(&(name, kind)) = COMMANDS
-        .iter()
-        .find(|(name, _)| items[0].eq_ignore_ascii_case(name.as_bytes()))
-    else {
+    let Some(spec) = commands::lookup(&items[0]) else {
         return Err(unknown_command_error(&items));
     };
+    let kind = spec.kind;
 
     let argc = items.len();
+    let arity_error = || format!("ERR wrong number of arguments for '{}' command", spec.name);
+    if !spec.arity_matches(argc) {
+        return Err(arity_error());
+    }
+    // Limits Redis checks in the commands themselves, with the same error
     let arity_ok = match kind {
         Kind::Ping => argc <= 2,
-        Kind::Get | Kind::Incr | Kind::Decr => argc == 2,
-        Kind::Rename | Kind::IncrBy | Kind::DecrBy => argc == 3,
-        Kind::Set => argc >= 3,
-        Kind::Del | Kind::Exists | Kind::MGet => argc >= 2,
-        Kind::MSet => argc >= 3 && argc % 2 == 1,
+        Kind::MSet => argc % 2 == 1,
+        _ => true,
     };
-    let arity_error = || format!("ERR wrong number of arguments for '{name}' command");
     if !arity_ok {
         return Err(arity_error());
     }

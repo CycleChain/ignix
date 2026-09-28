@@ -1,5 +1,6 @@
 // Core modules for Ignix key-value store
 pub mod aof; // AOF writer + emit helpers for persistence
+mod commands; // command table: names and arity
 pub mod net; // bind_reuseport + run_shard (server loop)
 pub mod net_uring;
 pub mod protocol; // RESP parser + encoders + Cmd enum
