@@ -1278,15 +1278,23 @@ mod tests {
     #[test]
     fn set_many_and_del_many_with_keys_in_most_shards() {
         let dict = Dict::default();
-        let keys: Vec<Bytes> = (0..5_000).map(|i| key(&format!("key:{i}"))).collect();
-        let shards: std::collections::HashSet<usize> =
-            keys.iter().map(|k| dict.locate(k).1).collect();
-        assert!(shards.contains(&0) && shards.contains(&(SHARDS - 1)));
+        // At least 5,000 keys, and more until the first and the last shard
+        // have one: the hash that picks the shard is seeded at random, so a
+        // fixed number of keys misses one of them now and then
+        let mut keys = Vec::new();
+        let mut shards = std::collections::HashSet::new();
+        while keys.len() < 5_000 || !(shards.contains(&0) && shards.contains(&(SHARDS - 1))) {
+            let k = key(&format!("key:{}", keys.len()));
+            shards.insert(dict.locate(&k).1);
+            keys.push(k);
+        }
         let pairs = keys.iter().zip(0..).map(|(k, i)| (k.clone(), i)).collect();
         dict.set_many(pairs, Value::Int, || ());
         let mut values = Vec::new();
         dict.read_many(&keys, |value| values.push(value.cloned()));
-        let expected: Vec<_> = (0..5_000).map(|i| Some(Value::Int(i))).collect();
+        let expected: Vec<_> = (0..keys.len() as i64)
+            .map(|i| Some(Value::Int(i)))
+            .collect();
         assert_eq!(values, expected);
         let mut removed = keys.clone();
         dict.del_many(&mut removed, |_| ());
