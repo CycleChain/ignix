@@ -26,7 +26,7 @@ Ignix (from "Ignite" + "Index") is a Redis-protocol compatible, in-memory key-va
 - **Allocation-free replies**: replies are written straight into the connection's output buffer.
 - **RESP parsing**: requests are RESP arrays of bulk strings, parsed with the same length rules and limits as Redis (at most 512 MB per argument).
 - **Concurrent storage**: `DashMap<Bytes, Value>`; canonical integers are stored as numbers, everything else byte for byte.
-- **AOF persistence**: dedicated writer thread, bounded channel for back-pressure, fsync at most once per second.
+- **AOF persistence**: dedicated writer thread fed by a bounded channel (back-pressure); queued records are written in batches and synced at most once per second.
 
 ## 🚀 Quick Start
 

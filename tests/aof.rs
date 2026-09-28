@@ -4,8 +4,12 @@
 mod common;
 
 use bytes::Bytes;
+use bytes::BytesMut;
 use common::exec;
-use ignix::{emit_aof_incr, emit_aof_mset, emit_aof_rename, emit_aof_set, spawn_aof_writer, Shard};
+use ignix::{
+    emit_aof_incr, emit_aof_mset, emit_aof_rename, emit_aof_set, parse_many, spawn_aof_writer, Cmd,
+    Shard,
+};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -155,4 +159,102 @@ fn incrby_and_decr_are_logged_with_their_increment() {
         &data,
         b"*3\r\n$6\r\nINCRBY\r\n$1\r\nk\r\n$1\r\n2\r\n"
     ));
+}
+
+/// Wait until the AOF file holds exactly `expected` bytes and return them.
+fn wait_for_len(path: &Path, expected: usize) -> Vec<u8> {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let data = std::fs::read(path).unwrap_or_default();
+        if data.len() >= expected {
+            return data;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for {expected} bytes in the AOF, got {}",
+            data.len()
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+}
+
+#[test]
+fn concurrent_writers_keep_their_order_and_records_stay_whole() {
+    let dir = temp_dir("concurrent");
+    let path = dir.join("test.aof");
+    let aof = spawn_aof_writer(path.to_str().unwrap()).unwrap();
+    let (threads, per_thread) = (4, 5000);
+    std::thread::scope(|scope| {
+        for t in 0..threads {
+            let aof = aof.clone();
+            scope.spawn(move || {
+                for i in 0..per_thread {
+                    aof.write_owned(emit_aof_set(format!("t{t}:{i}").as_bytes(), b"value"));
+                }
+            });
+        }
+    });
+    aof.write_owned(emit_aof_set(b"marker", b"end"));
+    let data = wait_for(&path, b"$6\r\nmarker\r\n$3\r\nend\r\n");
+    let _ = std::fs::remove_dir_all(&dir);
+
+    let mut buf = BytesMut::from(&data[..]);
+    let mut cmds = Vec::new();
+    parse_many(&mut buf, &mut cmds).expect("every record is a complete RESP command");
+    assert!(buf.is_empty(), "the file ends with a complete record");
+    assert_eq!(cmds.len(), threads * per_thread + 1);
+    let mut next = vec![0; threads];
+    for cmd in &cmds[..cmds.len() - 1] {
+        let Cmd::Set(key, _) = cmd else {
+            panic!("unexpected record {cmd:?}")
+        };
+        let key = std::str::from_utf8(key).unwrap();
+        let (t, i) = key[1..].split_once(':').unwrap();
+        let (t, i): (usize, usize) = (t.parse().unwrap(), i.parse().unwrap());
+        assert_eq!(i, next[t], "records of writer {t} are out of order");
+        next[t] += 1;
+    }
+}
+
+#[test]
+fn large_record_keeps_its_place_between_small_ones() {
+    let dir = temp_dir("large-record");
+    let path = dir.join("test.aof");
+    let aof = spawn_aof_writer(path.to_str().unwrap()).unwrap();
+    let records = [
+        emit_aof_set(b"before", b"1"),
+        emit_aof_set(b"large", &vec![b'x'; 3 << 20]),
+        emit_aof_set(b"after", b"2"),
+    ];
+    for record in &records {
+        aof.write(record);
+    }
+    let expected = records.concat();
+    let data = wait_for_len(&path, expected.len());
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        data == expected,
+        "the records must be written in order, byte for byte"
+    );
+}
+
+#[test]
+fn records_sent_before_the_last_handle_is_dropped_are_written() {
+    let dir = temp_dir("drop");
+    let path = dir.join("test.aof");
+    let aof = spawn_aof_writer(path.to_str().unwrap()).unwrap();
+    let records: Vec<Vec<u8>> = (0..1000)
+        .map(|i| emit_aof_set(format!("key{i}").as_bytes(), b"v"))
+        .collect();
+    for record in &records {
+        aof.write(record);
+    }
+    drop(aof);
+    let expected = records.concat();
+    let data = wait_for_len(&path, expected.len());
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(
+        data == expected,
+        "every record sent before the drop must be written"
+    );
 }

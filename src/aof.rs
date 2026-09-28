@@ -8,13 +8,24 @@
 
 use crate::protocol::{fmt_i64, fmt_u64};
 use anyhow::*;
-use crossbeam::channel::{bounded, RecvTimeoutError, Sender};
+use crossbeam::channel::{bounded, Receiver, RecvTimeoutError, Sender};
+use std::fs::File;
 use std::io::Write;
 use std::result::Result::{Err, Ok};
 use std::time::{Duration, Instant};
 
 /// How often written records are synced to disk
 const SYNC_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Most bytes of queued records collected into one write; a larger record is
+/// written on its own
+const MAX_BATCH: usize = 1 << 20;
+
+/// Pause after each write, so that records queue up in the meantime and the
+/// next write covers many of them. Senders only wake the writer when it is
+/// blocked waiting for a record, and waking it for every record cost the
+/// workers more CPU than the rest of a SET.
+const GROUP_COMMIT_DELAY: Duration = Duration::from_micros(200);
 
 /// How long the writer may block waiting for the next record: until the next
 /// sync is due while written records are unsynced, otherwise indefinitely.
@@ -46,7 +57,9 @@ pub struct AofHandle {
 ///   run without persistence
 ///
 /// # Behavior
-/// * Each record is written to the file as soon as it is received
+/// * Records are appended in the order they were sent. The writer collects
+///   every queued record into one write, then pauses for 200 µs so that the
+///   next write covers the records sent meanwhile
 /// * Written data is synced to disk about one second after the previous sync
 ///   at the latest, so no record stays unsynced for more than a second, also
 ///   when no more writes arrive
@@ -55,7 +68,7 @@ pub fn spawn_aof_writer(path: &str) -> Result<AofHandle> {
     // Open the file here, so a path that cannot be used is reported to the
     // caller instead of panicking in the writer thread (which, with
     // `panic = "abort"`, would terminate the whole server).
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)
@@ -67,67 +80,131 @@ pub fn spawn_aof_writer(path: &str) -> Result<AofHandle> {
     // Spawn dedicated AOF writer thread
     std::thread::Builder::new()
         .name("aof-writer".into())
-        .spawn(move || {
-            let mut last_sync = Instant::now();
-            let mut unsynced = false;
-            let mut write_failing = false;
-
-            loop {
-                // Wake up when the next sync is due, not a full interval after
-                // the last record: that left records unsynced for up to two
-                // intervals.
-                let received = match receive_timeout(unsynced, last_sync.elapsed()) {
-                    Some(timeout) => rx.recv_timeout(timeout),
-                    None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
-                };
-                match received {
-                    Ok(buf) => match file.write_all(&buf) {
-                        Ok(()) => {
-                            unsynced = true;
-                            write_failing = false;
-                        }
-                        Err(e) => {
-                            if !write_failing {
-                                log::error!("AOF write failed, records are being lost: {e}");
-                            }
-                            write_failing = true;
-                        }
-                    },
-                    Err(RecvTimeoutError::Timeout) => {}
-                    // Every handle is gone: sync what was written and exit
-                    Err(RecvTimeoutError::Disconnected) => {
-                        if unsynced {
-                            let _ = file.sync_data();
-                        }
-                        break;
-                    }
-                }
-
-                if unsynced && last_sync.elapsed() >= SYNC_INTERVAL {
-                    if let Err(e) = file.sync_data() {
-                        log::error!("AOF sync failed: {e}");
-                    }
-                    unsynced = false;
-                    last_sync = Instant::now();
-                }
-            }
-        })?;
+        .spawn(move || run_writer(file, rx))?;
 
     Ok(AofHandle { tx })
+}
+
+/// The AOF file with its sync and error state
+struct AofFile {
+    file: File,
+    unsynced: bool,
+    last_sync: Instant,
+    write_failing: bool,
+}
+
+impl AofFile {
+    fn write(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
+        }
+        match self.file.write_all(bytes) {
+            Ok(()) => {
+                self.unsynced = true;
+                self.write_failing = false;
+            }
+            Err(e) => {
+                // Log the first failure of a streak, not every record
+                if !self.write_failing {
+                    log::error!("AOF write failed, records are being lost: {e}");
+                }
+                self.write_failing = true;
+            }
+        }
+    }
+
+    fn sync(&mut self) {
+        if let Err(e) = self.file.sync_data() {
+            log::error!("AOF sync failed: {e}");
+        }
+        self.unsynced = false;
+        self.last_sync = Instant::now();
+    }
+}
+
+/// Body of the writer thread
+fn run_writer(file: File, rx: Receiver<Vec<u8>>) {
+    let mut aof = AofFile {
+        file,
+        unsynced: false,
+        last_sync: Instant::now(),
+        write_failing: false,
+    };
+    let mut batch = Vec::with_capacity(64 * 1024);
+
+    loop {
+        // Wake up when the next sync is due, not a full interval after the
+        // last record: that left records unsynced for up to two intervals.
+        let received = match receive_timeout(aof.unsynced, aof.last_sync.elapsed()) {
+            Some(timeout) => rx.recv_timeout(timeout),
+            None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+        };
+        let wrote = match received {
+            Ok(record) => {
+                // Take the records queued behind it too, so one write covers
+                // them all.
+                let mut next = Some(record);
+                while let Some(record) = next {
+                    if record.len() >= MAX_BATCH {
+                        // Keep the order without copying the large record
+                        aof.write(&batch);
+                        batch.clear();
+                        aof.write(&record);
+                    } else {
+                        batch.extend_from_slice(&record);
+                    }
+                    next = if batch.len() < MAX_BATCH {
+                        rx.try_recv().ok()
+                    } else {
+                        None
+                    };
+                }
+                aof.write(&batch);
+                batch.clear();
+                true
+            }
+            Err(RecvTimeoutError::Timeout) => false,
+            // Every handle is gone and every record has been received: sync
+            // what was written and exit
+            Err(RecvTimeoutError::Disconnected) => {
+                if aof.unsynced {
+                    aof.sync();
+                }
+                return;
+            }
+        };
+
+        if aof.unsynced && aof.last_sync.elapsed() >= SYNC_INTERVAL {
+            aof.sync();
+        }
+        if wrote {
+            std::thread::sleep(GROUP_COMMIT_DELAY);
+        }
+    }
 }
 
 impl AofHandle {
     /// Write a command to the AOF
     ///
-    /// Sends the command bytes to the background writer thread.
-    /// This is non-blocking and returns immediately.
+    /// Copies `bytes` and sends them to the background writer thread; use
+    /// [`AofHandle::write_owned`] to hand over an encoded record without the
+    /// copy. Returns immediately unless the queue (4096 records) is full.
     ///
     /// # Arguments
     /// * `bytes` - RESP-formatted command bytes to write
     #[inline]
     pub fn write(&self, bytes: &[u8]) {
+        self.write_owned(bytes.to_vec());
+    }
+
+    /// Send an encoded record, such as the result of [`emit_aof_set`], to the
+    /// background writer thread without copying it
+    ///
+    /// Returns immediately unless the queue (4096 records) is full.
+    #[inline]
+    pub fn write_owned(&self, record: Vec<u8>) {
         // Send to background thread, ignore errors (channel closed)
-        let _ = self.tx.send(bytes.to_vec());
+        let _ = self.tx.send(record);
     }
 }
 

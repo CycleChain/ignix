@@ -96,7 +96,7 @@ impl Shard {
                 // Log to AOF if persistence is enabled
                 // We do this before moving k and v into the dictionary
                 if let Some(a) = &self.aof {
-                    a.write(&emit_aof_set(&k, &v));
+                    a.write_owned(emit_aof_set(&k, &v));
                 }
 
                 self.dict.set(k, encode_value(v));
@@ -111,7 +111,7 @@ impl Shard {
                 keys.retain(|k| self.dict.del(k));
                 if let Some(a) = &self.aof {
                     if !keys.is_empty() {
-                        a.write(&emit_aof_del(&keys));
+                        a.write_owned(emit_aof_del(&keys));
                     }
                 }
                 write_integer(keys.len() as i64, out);
@@ -124,7 +124,7 @@ impl Shard {
                 let record = self.aof.as_ref().map(|_| emit_aof_rename(&from, &to));
                 if self.dict.rename(from, to) {
                     if let (Some(a), Some(record)) = (&self.aof, record) {
-                        a.write(&record);
+                        a.write_owned(record);
                     }
                     write_simple("OK", out);
                 } else {
@@ -147,7 +147,7 @@ impl Shard {
                     Ok(v) => {
                         // Log only successful increments
                         if let (Some(a), Some(key)) = (&self.aof, aof_key) {
-                            a.write(&emit_aof_incr(&key));
+                            a.write_owned(emit_aof_incr(&key));
                         }
                         write_integer(v, out);
                     }
@@ -161,7 +161,7 @@ impl Shard {
                 match self.dict.incr_by(k, delta) {
                     Ok(v) => {
                         if let (Some(a), Some(key)) = (&self.aof, aof_key) {
-                            a.write(&emit_aof_incrby(&key, delta));
+                            a.write_owned(emit_aof_incrby(&key, delta));
                         }
                         write_integer(v, out);
                     }
@@ -183,7 +183,7 @@ impl Shard {
             Cmd::MSet(pairs) => {
                 // Log all sets to AOF as a single operation
                 if let Some(a) = &self.aof {
-                    a.write(&emit_aof_mset(&pairs));
+                    a.write_owned(emit_aof_mset(&pairs));
                 }
 
                 // Set all key-value pairs
