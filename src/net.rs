@@ -22,6 +22,15 @@ use std::sync::Arc;
 /// Size of read buffer for incoming data
 const READ_BUF: usize = 4096;
 
+/// Whether a short read may end the read loop before `WouldBlock`.
+///
+/// Linux epoll (edge-triggered, as mio registers sockets) raises a new event
+/// for every later arrival of data or FIN, and a read that returns less than
+/// the buffer means the receive queue was empty, so the extra read that would
+/// only return `EAGAIN` can be skipped. Other platforms re-arm only after
+/// `WouldBlock`, so they keep reading until then.
+const STOP_AFTER_SHORT_READ: bool = cfg!(target_os = "linux");
+
 use socket2::{Domain, Protocol, Socket, Type};
 
 /// Bind a TCP listener with SO_REUSEPORT support
@@ -244,6 +253,9 @@ fn drive(
     }
 
     if (ev.is_readable() || ev.is_read_closed()) && !conn.closing {
+        // A FIN that arrived together with data is reported in this event
+        // only, so after the peer closed keep reading until EOF.
+        let peer_closed = ev.is_read_closed();
         // Edge-triggered: read until the socket is drained.
         loop {
             match conn.sock.read(tmp_buf) {
@@ -251,7 +263,14 @@ fn drive(
                     conn.closing = true;
                     break;
                 }
-                Ok(n) => conn.rbuf.extend_from_slice(&tmp_buf[..n]),
+                Ok(n) => {
+                    conn.rbuf.extend_from_slice(&tmp_buf[..n]);
+                    // A short read drained the socket (TCP urgent data, which
+                    // RESP clients never send, is the only exception).
+                    if STOP_AFTER_SHORT_READ && n < tmp_buf.len() && !peer_closed {
+                        break;
+                    }
+                }
                 Err(ref e) if e.kind() == ErrorKind::Interrupted => continue,
                 Err(ref e) if would_block(e) => break,
                 Err(_) => return false,

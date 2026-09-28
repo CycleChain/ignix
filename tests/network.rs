@@ -245,6 +245,52 @@ fn large_reply_is_flushed_after_the_client_half_closes() {
     assert_eof(&mut reader);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires a running ignix server on 127.0.0.1:7379"]
+fn half_closed_client_with_a_pipeline_longer_than_the_read_buffer_gets_every_reply() {
+    // Several times the server's 4 KiB read buffer, with the FIN in the same
+    // burst: full reads, a short read and EOF all come from one event.
+    let key = unique_key("half-close-pipeline");
+    let count = 300;
+    let data = req(&[b"SET", key.as_bytes(), b"value"]).repeat(count);
+    let mut stream = connect();
+    send_and_half_close(&mut stream, &data);
+    let mut reader = BufReader::new(stream);
+    for _ in 0..count {
+        assert_eq!(read_reply(&mut reader), b"+OK\r\n");
+    }
+    assert_eof(&mut reader);
+}
+
+#[test]
+#[ignore = "requires a running ignix server on 127.0.0.1:7379"]
+fn half_close_after_the_replies_closes_the_connection() {
+    let mut stream = connect();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    stream.write_all(&req(&[b"PING"])).unwrap();
+    assert_eq!(read_reply(&mut reader), b"+PONG\r\n");
+    // The FIN arrives on its own, after the request was read.
+    stream.shutdown(Shutdown::Write).unwrap();
+    assert_eof(&mut reader);
+}
+
+#[test]
+#[ignore = "requires a running ignix server on 127.0.0.1:7379"]
+fn request_sent_one_byte_at_a_time_is_answered() {
+    let key = unique_key("byte-by-byte");
+    let mut stream = connect();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    // With TCP_NODELAY every byte is its own segment and its own read.
+    for byte in req(&[b"SET", key.as_bytes(), b"v"]) {
+        stream.write_all(&[byte]).unwrap();
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(read_reply(&mut reader), b"+OK\r\n");
+    stream.write_all(&req(&[b"GET", key.as_bytes()])).unwrap();
+    assert_eq!(read_reply(&mut reader), b"$1\r\nv\r\n");
+}
+
 #[test]
 #[ignore = "requires a running ignix server on 127.0.0.1:7379"]
 fn many_pipelined_pings_are_all_answered() {
