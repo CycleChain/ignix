@@ -73,6 +73,10 @@ pub fn spawn_aof_writer(path: &str) -> Result<AofHandle> {
         .append(true)
         .open(path)
         .with_context(|| format!("cannot open AOF file {path}"))?;
+    let len = file
+        .metadata()
+        .with_context(|| format!("cannot read the size of AOF file {path}"))?
+        .len();
 
     // Bounded channel to provide backpressure under heavy write load
     let (tx, rx) = bounded::<Vec<u8>>(4096);
@@ -80,30 +84,81 @@ pub fn spawn_aof_writer(path: &str) -> Result<AofHandle> {
     // Spawn dedicated AOF writer thread
     std::thread::Builder::new()
         .name("aof-writer".into())
-        .spawn(move || run_writer(file, rx))?;
+        .spawn(move || run_writer(AofFile::new(file, len), rx))?;
 
     Ok(AofHandle { tx })
 }
 
+/// Where the writer thread puts records: the AOF file, or a fake in tests
+trait AofSink: Write {
+    /// Cut the file back to `len` bytes
+    fn truncate(&mut self, len: u64) -> std::io::Result<()>;
+    /// Make the written data durable
+    fn sync(&mut self) -> std::io::Result<()>;
+}
+
+impl AofSink for File {
+    fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+        self.set_len(len)
+    }
+
+    fn sync(&mut self) -> std::io::Result<()> {
+        self.sync_data()
+    }
+}
+
 /// The AOF file with its sync and error state
-struct AofFile {
-    file: File,
+struct AofFile<W> {
+    file: W,
+    /// File length up to the end of the last complete record
+    len: u64,
+    /// A failed write left part of a record after `len` that could not be
+    /// removed yet; nothing may be appended after it
+    torn: bool,
     unsynced: bool,
     last_sync: Instant,
     write_failing: bool,
 }
 
-impl AofFile {
+impl<W: AofSink> AofFile<W> {
+    fn new(file: W, len: u64) -> Self {
+        Self {
+            file,
+            len,
+            torn: false,
+            unsynced: false,
+            last_sync: Instant::now(),
+            write_failing: false,
+        }
+    }
+
     fn write(&mut self, bytes: &[u8]) {
         if bytes.is_empty() {
             return;
         }
-        match self.file.write_all(bytes) {
+        // Never append after part of a record, or every later record would
+        // be misread: cut it off first (as Redis does), or drop the records.
+        if self.torn && self.file.truncate(self.len).is_ok() {
+            self.torn = false;
+        }
+        let result = if self.torn {
+            Err(std::io::Error::other(
+                "the file ends with part of a record that cannot be removed",
+            ))
+        } else {
+            self.file.write_all(bytes)
+        };
+        match result {
             Ok(()) => {
+                self.len += bytes.len() as u64;
                 self.unsynced = true;
                 self.write_failing = false;
             }
             Err(e) => {
+                // write_all may have written part of the bytes before failing
+                if !self.torn {
+                    self.torn = self.file.truncate(self.len).is_err();
+                }
                 // Log the first failure of a streak, not every record
                 if !self.write_failing {
                     log::error!("AOF write failed, records are being lost: {e}");
@@ -114,22 +169,17 @@ impl AofFile {
     }
 
     fn sync(&mut self) {
-        if let Err(e) = self.file.sync_data() {
-            log::error!("AOF sync failed: {e}");
+        match self.file.sync() {
+            Ok(()) => self.unsynced = false,
+            // The data stays unsynced, so the next interval tries again
+            Err(e) => log::error!("AOF sync failed, retrying in a second: {e}"),
         }
-        self.unsynced = false;
         self.last_sync = Instant::now();
     }
 }
 
 /// Body of the writer thread
-fn run_writer(file: File, rx: Receiver<Vec<u8>>) {
-    let mut aof = AofFile {
-        file,
-        unsynced: false,
-        last_sync: Instant::now(),
-        write_failing: false,
-    };
+fn run_writer<W: AofSink>(mut aof: AofFile<W>, rx: Receiver<Vec<u8>>) {
     let mut batch = Vec::with_capacity(64 * 1024);
 
     loop {
@@ -316,6 +366,92 @@ pub fn emit_aof_del(keys: &[Bytes]) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// In-memory sink that can fail writes after a byte limit, truncation and
+    /// syncs
+    #[derive(Default)]
+    struct FakeSink {
+        data: Vec<u8>,
+        write_limit: Option<usize>,
+        fail_truncate: bool,
+        fail_sync: bool,
+    }
+
+    impl Write for FakeSink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let room = match self.write_limit {
+                Some(limit) => limit.saturating_sub(self.data.len()),
+                None => buf.len(),
+            };
+            if room == 0 {
+                return Err(std::io::Error::other("disk full"));
+            }
+            let n = room.min(buf.len());
+            self.data.extend_from_slice(&buf[..n]);
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl AofSink for FakeSink {
+        fn truncate(&mut self, len: u64) -> std::io::Result<()> {
+            if self.fail_truncate {
+                return Err(std::io::Error::other("truncate failed"));
+            }
+            self.data.truncate(len as usize);
+            Ok(())
+        }
+
+        fn sync(&mut self) -> std::io::Result<()> {
+            if self.fail_sync {
+                return Err(std::io::Error::other("sync failed"));
+            }
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failed_write_is_cut_off_before_the_next_record() {
+        let mut aof = AofFile::new(FakeSink::default(), 0);
+        aof.write(b"first");
+        // The disk fills up in the middle of the next batch
+        aof.file.write_limit = Some(8);
+        aof.write(b"second");
+        aof.file.write_limit = None;
+        aof.write(b"third");
+        assert_eq!(aof.file.data, b"firstthird");
+    }
+
+    #[test]
+    fn nothing_is_appended_after_a_partial_record_that_cannot_be_removed() {
+        let mut aof = AofFile::new(FakeSink::default(), 0);
+        aof.write(b"first");
+        aof.file.write_limit = Some(8);
+        aof.file.fail_truncate = true;
+        aof.write(b"second");
+        aof.file.write_limit = None;
+        aof.write(b"third");
+        assert_eq!(aof.file.data, b"firstsec", "no record after a torn one");
+        // Once the partial record can be removed, writing resumes
+        aof.file.fail_truncate = false;
+        aof.write(b"fourth");
+        assert_eq!(aof.file.data, b"firstfourth");
+    }
+
+    #[test]
+    fn failed_sync_is_retried() {
+        let mut aof = AofFile::new(FakeSink::default(), 0);
+        aof.write(b"record");
+        aof.file.fail_sync = true;
+        aof.sync();
+        assert!(aof.unsynced, "a failed sync must not count as durable");
+        aof.file.fail_sync = false;
+        aof.sync();
+        assert!(!aof.unsynced);
+    }
 
     #[test]
     fn writer_wakes_up_when_the_next_sync_is_due() {
