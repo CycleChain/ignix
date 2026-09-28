@@ -115,9 +115,14 @@ Replies and error messages match Redis 7, for example `-ERR wrong number of argu
 
 ### Command-line Options
 
-- `--backend=uring`: use the io_uring backend (Linux only; elsewhere Ignix falls back to mio).
+- `--bind ADDR`: the IPv4 or IPv6 address to listen on (default `0.0.0.0`, every IPv4 address); `--bind 127.0.0.1` keeps the server local.
+- `--port N`: the TCP port (default `7379`).
+- `--backend uring`: use the io_uring backend (Linux only; elsewhere Ignix falls back to mio).
 - `--requirepass PASSWORD` (or `--requirepass=PASSWORD`): clients must authenticate with `AUTH PASSWORD`, `AUTH default PASSWORD` or `HELLO 3 AUTH default PASSWORD` before running other commands, as with Redis `requirepass`; the others get `-NOAUTH Authentication required.`. The password is compared in constant time. Clients pass it as usual, for example `redis-cli -a PASSWORD` or `redis://:PASSWORD@host:7379`.
-- `--busy-poll-us=N`: how long a worker of the default (mio) backend keeps polling for new events after its last one before it sleeps, in microseconds; the default is 50 and `0` disables busy-polling. It trades CPU time for latency: an idle server uses no CPU either way, at 1,000 requests per second the server used about 10% of a CPU instead of 5% in our measurements, and under sustained load every busy worker uses a full core.
+- `--busy-poll-us N`: how long a worker of the default (mio) backend keeps polling for new events after its last one before it sleeps, in microseconds; the default is 50 and `0` disables busy-polling. It trades CPU time for latency: an idle server uses no CPU either way, at 1,000 requests per second the server used about 10% of a CPU instead of 5% in our measurements, and under sustained load every busy worker uses a full core.
+- `-h`/`--help` and `-V`/`--version`.
+
+Every option also takes the form `--option=value`. An unknown option or an invalid value prints the usage to stderr and exits with code 2.
 
 ### Environment Variables
 
@@ -325,7 +330,8 @@ Monitor AOF: `tail -f ignix.aof`
 - No inline commands (plain text lines such as `PING` typed into telnet); requests must be RESP arrays.
 - Expired keys are removed when a command touches them and by a background cycle ten times a second, as in Redis; until then they still count in `DBSIZE`.
 - The AOF is write-only: it is not loaded on startup, so data does not survive a restart, and it is never compacted, so it grows with every write. In one of our benchmark sessions `ignix.aof` grew to 13.8 GB while Redis, which rewrites its AOF, used 2.3 GB.
-- The server listens on the fixed address `0.0.0.0:7379`, and without `--requirepass` any client can use it; do not expose it to untrusted networks. There are no ACL users besides `default`, and no TLS.
+- By default the server listens on every IPv4 address, and without `--requirepass` any client can use it; do not expose it to untrusted networks. There are no ACL users besides `default`, no TLS, and one address per server (`--bind`).
+- The mio backend listens with `SO_REUSEPORT`, so a second Ignix started on the same port shares it without an error.
 - The io_uring backend runs on a single thread.
 - No clustering or replication.
 

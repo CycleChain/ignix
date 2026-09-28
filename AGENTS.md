@@ -21,7 +21,7 @@ hacmi. Uyumluluğu Redis belgesine göre, başarımı ölçümle doğrula; ikisi
 |---|---|
 | Bağımlılıklar | `cargo fetch` |
 | Derleme | `cargo build` (hızlı), `cargo build --release` (LTO, codegen-units=1; yavaş) |
-| Sunucu | `cargo run --release`; `0.0.0.0:7379` dinler, çalışma dizinine `ignix.aof` yazar |
+| Sunucu | `cargo run --release`; varsayılan `0.0.0.0:7379` (`--bind`, `--port`), çalışma dizinine `ignix.aof` yazar; bayraklar `-- --help` ile |
 | io_uring arka ucu | `cargo run --release -- --backend=uring` (yalnızca Linux; başka yerde mio'ya düşer) |
 | Ayrıntılı günlük | `RUST_LOG=debug cargo run --release` |
 | Örnek istemci | `cargo run --example client` (sunucu açıkken) |
@@ -114,8 +114,10 @@ boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler 
   diske işlenir) ve ikili güvenli `emit_aof_*` kodlayıcıları.
 - `src/lib.rs`: modüller, `pub use` yeniden dışa aktarımları ve `DEFAULT_ADDR`
   (`0.0.0.0:7379`). Bunlar crates.io'daki genel API'dir.
-- `src/bin/ignix.rs`: giriş noktası; mimalloc global ayırıcı, `--backend=uring` argümanı, AOF
-  (`ignix.aof` açılamazsa AOF'suz sürer).
+- `src/bin/ignix.rs`: giriş noktası; mimalloc global ayırıcı, birim testli `parse_args`
+  (`--bind`, `--port`, `--requirepass`, `--backend`, `--busy-poll-us`, `--help`, `--version`;
+  her biri `--bayrak=değer` biçiminde de; bilinmeyen bayrak ya da geçersiz değer kullanımı
+  yazdırıp 2 koduyla çıkar), AOF (`ignix.aof` açılamazsa AOF'suz sürer).
 
 Desteklenen komutlar: PING, ECHO, QUIT, SELECT (yalnızca 0), HELLO, CLIENT (ID, GETNAME,
 SETNAME, SETINFO, HELP), INFO, CONFIG (GET, HELP), GET, SET, DEL, UNLINK, EXISTS, TYPE, DBSIZE,
@@ -129,7 +131,7 @@ PX, EXAT, PXAT, KEEPTTL), SETEX, PSETEX, SETNX, GETSET, GETDEL, GETEX, MSETNX, A
 | Yol | İçerik |
 |---|---|
 | `src/` | kütüphane ve sunucu (yukarıda) |
-| `tests/` | `common/` (RESP isteğiyle komut yürüten yardımcılar), `basic.rs`, `commands.rs` (komut semantiği), `aof.rs`, `protocol_framing.rs`, `protocol_api.rs`, `resp.rs`; sunucu isteyen `network.rs` ve `large_payloads.rs` (`#[ignore]`) |
+| `tests/` | `common/` (RESP isteğiyle komut yürüten yardımcılar), `basic.rs`, `commands.rs` (komut semantiği), `aof.rs`, `protocol_framing.rs`, `protocol_api.rs`, `resp.rs`; ikiliyi çalıştıran `server_flags.rs` (sunucu açan testi kendi boş portunda, `#[ignore]`); sunucu isteyen `network.rs` ve `large_payloads.rs` (`#[ignore]`) |
 | `benches/` | criterion: `exec.rs`, `resp.rs` (`harness = false`) |
 | `examples/` | `client.rs` (cargo örneği); Python ve Node.js istemcileri, `verify_connection.*` |
 | `benchmarks/` | Redis'e karşı Python benchmark paketi: `run_all.py`, `scripts/`, `quick_benchmark.py`, `run_*.sh` |
@@ -147,9 +149,10 @@ Bugünkü `main` için geçerlidir. Görevin konusu değilse düzeltmeye kalkma;
 
 - **Ağ testleri sunucu ister:** `tests/network.rs` ve `tests/large_payloads.rs` çalışan bir
   sunucuya bağlanır ve `#[ignore]` ile işaretlidir; `.hub/sunucu-testleri.sh` kullan.
-- **Sabit port, paylaşılan port:** adres `DEFAULT_ADDR`'dır, bayrakla değişmez. SO_REUSEPORT
-  yüzünden aynı makinedeki ikinci bir `ignix` hata vermeden aynı portu paylaşır; sunucu
-  başlatmadan önce `lsof -nP -iTCP:7379 -sTCP:LISTEN` ile portun boş olduğunu doğrula.
+- **Paylaşılan port:** varsayılan adres `0.0.0.0:7379`'dur (`--bind`, `--port` değiştirir;
+  `.hub/sunucu-testleri.sh` ve ağ testleri 7379 kullanır). SO_REUSEPORT yüzünden aynı
+  makinedeki ikinci bir `ignix` hata vermeden aynı portu paylaşır; sunucu başlatmadan önce
+  `lsof -nP -iTCP:7379 -sTCP:LISTEN` ile portun boş olduğunu doğrula.
   `benchmarks/run_*.sh` port doluysa başlamaz ve yalnızca kendi başlattığı süreçleri durdurur.
 - **Protokol kapsamı:** RESP2 ve `HELLO 3` sonrası RESP3 (`Session::protocol`; null `_`, map
   `%` olur); istekler yalnızca RESP dizisi biçiminde, satır içi (inline) komutlar yok. Geçersiz komut `-ERR ...` alır ve bağlantı sürer; bozuk RESP

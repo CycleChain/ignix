@@ -144,19 +144,18 @@ pub fn run_server(addr: SocketAddr, shard: Shard, options: ServerOptions) -> Res
         .map(|_| bind_reuseport(addr))
         .collect::<Result<Vec<_>>>()
         .with_context(|| format!("cannot listen on {addr}"))?;
-    if let Some(bound) = listeners.first().and_then(|l| l.local_addr().ok()) {
-        shard.stats.set_listener(Listener {
-            addr: bound,
-            api: EVENT_API,
-        });
-    }
+    let bound = listeners
+        .first()
+        .and_then(|l| l.local_addr().ok())
+        .unwrap_or(addr);
+    shard.stats.set_listener(Listener {
+        addr: bound,
+        api: EVENT_API,
+    });
     // Stops by itself once the workers have stopped and the shard is dropped
     spawn_active_expiry(&shard).context("cannot start the expiry thread")?;
 
-    println!(
-        "🚀 Starting Ignix with {} worker threads (Multi-Reactor)",
-        threads
-    );
+    println!("🚀 Ignix listening on {bound} with {threads} worker threads (Multi-Reactor)");
 
     let mut handles = Vec::new();
 

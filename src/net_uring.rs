@@ -123,11 +123,7 @@ fn is_retryable(res: i32) -> bool {
 }
 
 /// Run the io_uring server with default options; see [`run_server`]
-pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> {
-    println!(
-        "🚀 Starting Ignix with io_uring backend (Shard {})",
-        shard_id
-    );
+pub fn run_shard(_shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> {
     run_server(addr, shard, ServerOptions::default())
 }
 
@@ -135,10 +131,12 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
 /// `options`, `requirepass` applies and `busy_poll` does not.
 pub fn run_server(addr: SocketAddr, shard: Shard, options: ServerOptions) -> Result<()> {
     let listener = TcpListener::bind(addr)?;
+    let bound = listener.local_addr()?;
     shard.stats.set_listener(Listener {
-        addr: listener.local_addr()?,
+        addr: bound,
         api: "io_uring",
     });
+    println!("🚀 Ignix listening on {bound} with the io_uring backend");
     // Shared with the expiry thread, which stops once the shard is dropped
     let shard = Arc::new(shard);
     spawn_active_expiry(&shard)?;
