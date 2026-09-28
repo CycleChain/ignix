@@ -5,7 +5,7 @@
  * commands such as `HELLO` and `QUIT` change.
  */
 
-use crate::protocol::Protocol;
+use crate::protocol::{is_printable_ascii, ClientInfo, Protocol};
 use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -27,6 +27,8 @@ pub struct Session {
     id: u64,
     protocol: Protocol,
     name: Option<Bytes>,
+    lib_name: Option<Bytes>,
+    lib_ver: Option<Bytes>,
     closing: bool,
 }
 
@@ -54,6 +56,16 @@ impl Session {
         self.name.as_ref()
     }
 
+    /// The client library's name, from `CLIENT SETINFO LIB-NAME`
+    pub fn lib_name(&self) -> Option<&Bytes> {
+        self.lib_name.as_ref()
+    }
+
+    /// The client library's version, from `CLIENT SETINFO LIB-VER`
+    pub fn lib_ver(&self) -> Option<&Bytes> {
+        self.lib_ver.as_ref()
+    }
+
     /// Whether the client has asked to close the connection (`QUIT`): the
     /// replies written so far must be sent, then the connection closed
     /// without running any later request.
@@ -68,11 +80,21 @@ impl Session {
     /// Set the client name; an empty name removes it. Like Redis, a name
     /// may only contain printable ASCII characters other than space.
     pub(crate) fn set_name(&mut self, name: Bytes) -> Result<(), &'static str> {
-        if !name.iter().all(|b| (b'!'..=b'~').contains(b)) {
+        if !is_printable_ascii(&name) {
             return Err(INVALID_CLIENT_NAME);
         }
         self.name = (!name.is_empty()).then_some(name);
         Ok(())
+    }
+
+    /// Record a client attribute; the value must already be checked with
+    /// `is_printable_ascii`. An empty value removes it.
+    pub(crate) fn set_info(&mut self, info: ClientInfo, value: Bytes) {
+        let value = (!value.is_empty()).then_some(value);
+        match info {
+            ClientInfo::LibName => self.lib_name = value,
+            ClientInfo::LibVer => self.lib_ver = value,
+        }
     }
 
     pub(crate) fn close(&mut self) {

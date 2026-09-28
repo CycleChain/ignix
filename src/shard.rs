@@ -97,6 +97,23 @@ fn write_mget(dict: &Dict, keys: &[Bytes], protocol: Protocol, out: &mut BytesMu
     }
 }
 
+/// `CLIENT HELP`, in Redis's words, for the subcommands Ignix supports
+const CLIENT_HELP: [&str; 13] = [
+    "CLIENT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+    "GETNAME",
+    "    Return the name of the current connection.",
+    "ID",
+    "    Return the ID of the current connection.",
+    "SETINFO <option> <value>",
+    "    Set client meta attr. Options are:",
+    "    * LIB-NAME: the client lib name.",
+    "    * LIB-VER: the client lib version.",
+    "SETNAME <name>",
+    "    Assign the name <name> to the current connection.",
+    "HELP",
+    "    Prints this help.",
+];
+
 /// Run HELLO's options in order, stopping at the first that fails (Redis
 /// applies each one as it goes), then switch to `protocol` and describe the
 /// server.
@@ -322,6 +339,27 @@ impl Shard {
 
             // HELLO [protover [AUTH username password] [SETNAME clientname]]
             Cmd::Hello { protocol, options } => hello(protocol, &options, session, out),
+
+            // CLIENT subcommands about the current connection
+            Cmd::ClientId => write_integer(session.id() as i64, out),
+            Cmd::ClientGetName => match session.name() {
+                Some(name) => write_bulk(name, out),
+                None => write_nil(session.protocol(), out),
+            },
+            Cmd::ClientSetName(name) => match session.set_name(name) {
+                Ok(()) => write_simple("OK", out),
+                Err(error) => write_error(error, out),
+            },
+            Cmd::ClientSetInfo(info, value) => {
+                session.set_info(info, value);
+                write_simple("OK", out);
+            }
+            Cmd::ClientHelp => {
+                write_array_len(CLIENT_HELP.len(), out);
+                for line in CLIENT_HELP {
+                    write_simple(line, out);
+                }
+            }
         }
     }
 }

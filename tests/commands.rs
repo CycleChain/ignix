@@ -224,6 +224,105 @@ fn hello_applies_options_in_order_until_one_fails() {
 }
 
 #[test]
+fn client_id_is_the_session_id() {
+    let s = shard();
+    let mut session = Session::new();
+    let id = session.id();
+    assert_eq!(
+        exec_in(&s, &mut session, &[b"CLIENT", b"ID"]),
+        format!(":{id}\r\n").into_bytes()
+    );
+    assert_eq!(
+        exec_in(&s, &mut session, &[b"client", b"id"]),
+        format!(":{id}\r\n").into_bytes()
+    );
+}
+
+#[test]
+fn client_setname_and_getname() {
+    let s = shard();
+    let mut session = Session::new();
+    assert_eq!(
+        exec_in(&s, &mut session, &[b"CLIENT", b"GETNAME"]),
+        b"$-1\r\n"
+    );
+    assert_eq!(
+        exec_in(&s, &mut session, &[b"CLIENT", b"SETNAME", b"n1"]),
+        b"+OK\r\n"
+    );
+    assert_eq!(
+        exec_in(&s, &mut session, &[b"CLIENT", b"GETNAME"]),
+        b"$2\r\nn1\r\n"
+    );
+    assert_eq!(
+        exec_in(&s, &mut session, &[b"CLIENT", b"SETNAME", b"a b"]),
+        b"-ERR Client names cannot contain spaces, newlines or special characters.\r\n"
+    );
+    // An empty name removes the name; RESP3 sends the null as "_"
+    exec_in(&s, &mut session, &[b"CLIENT", b"SETNAME", b""]);
+    exec_in(&s, &mut session, &[b"HELLO", b"3"]);
+    assert_eq!(
+        exec_in(&s, &mut session, &[b"CLIENT", b"GETNAME"]),
+        b"_\r\n"
+    );
+}
+
+#[test]
+fn client_setinfo_records_the_library_name_and_version() {
+    let s = shard();
+    let mut session = Session::new();
+    for (attribute, value) in [(&b"LIB-NAME"[..], &b"redis-py"[..]), (b"lib-ver", b"8.1.0")] {
+        assert_eq!(
+            exec_in(&s, &mut session, &[b"CLIENT", b"SETINFO", attribute, value]),
+            b"+OK\r\n"
+        );
+    }
+    assert_eq!(session.lib_name().map(|v| &v[..]), Some(&b"redis-py"[..]));
+    assert_eq!(session.lib_ver().map(|v| &v[..]), Some(&b"8.1.0"[..]));
+    assert_eq!(
+        exec(&s, &[b"CLIENT", b"SETINFO", b"LIB-FOO", b"x"]),
+        b"-ERR Unrecognized option 'LIB-FOO'\r\n"
+    );
+    assert_eq!(
+        exec(&s, &[b"CLIENT", b"SETINFO", b"LIB-NAME", b"a b"]),
+        b"-ERR LIB-NAME cannot contain spaces, newlines or special characters.\r\n"
+    );
+}
+
+#[test]
+fn client_checks_subcommands_and_their_arity_like_redis() {
+    let s = shard();
+    assert_eq!(exec(&s, &[b"CLIENT"]), arity_error("client"));
+    assert_eq!(
+        exec(&s, &[b"CLIENT", b"FOO"]),
+        b"-ERR unknown subcommand 'FOO'. Try CLIENT HELP.\r\n"
+    );
+    assert_eq!(
+        exec(&s, &[b"CLIENT", b"foo", b"bar"]),
+        b"-ERR unknown subcommand 'foo'. Try CLIENT HELP.\r\n"
+    );
+    for (args, name) in [
+        (&[&b"CLIENT"[..], b"ID", b"x"][..], "client|id"),
+        (&[b"CLIENT", b"GETNAME", b"x"], "client|getname"),
+        (&[b"CLIENT", b"SETNAME"], "client|setname"),
+        (&[b"CLIENT", b"SETNAME", b"a", b"b"], "client|setname"),
+        (&[b"CLIENT", b"SETINFO", b"LIB-NAME"], "client|setinfo"),
+    ] {
+        assert_eq!(exec(&s, args), arity_error(name));
+    }
+}
+
+#[test]
+fn client_help_lists_the_supported_subcommands() {
+    let s = shard();
+    let reply = exec(&s, &[b"CLIENT", b"HELP"]);
+    assert!(reply.starts_with(
+        b"*13\r\n+CLIENT <subcommand> [<arg> [value] [opt] ...]. Subcommands are:\r\n"
+    ));
+    assert!(reply.ends_with(b"+HELP\r\n+    Prints this help.\r\n"));
+}
+
+#[test]
 fn get_with_extra_argument_is_an_arity_error() {
     let s = shard();
     exec(&s, &[b"SET", b"a", b"1"]);

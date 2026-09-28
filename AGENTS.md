@@ -63,7 +63,8 @@ boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler 
   `commands!` makrosuyla); `lookup` adı küçük harfe indirgenmiş bir `u128`'e paketleyip eşler.
   Yeni komut önce buraya eklenir.
 - `src/session.rs`: `Session`, bağlantı başına durum: istemci kimliği (bağlantı başına bir kez
-  genel sayaçtan), protokol (RESP2/RESP3), istemci adı, QUIT'in kapanış bayrağı.
+  genel sayaçtan), protokol (RESP2/RESP3), istemci adı, kütüphane adı ve sürümü (`CLIENT
+  SETINFO`), QUIT'in kapanış bayrağı.
 - `src/shard.rs`: `Shard { id, dict, aof }`, 64 bayta hizalı (`test_shard_alignment` sınar);
   komut semantiği `exec_session` içinde (`exec` yeni bir oturumla onu çağırır). Sunucuda tek
   bir `Arc<Shard>` paylaşılır.
@@ -82,8 +83,8 @@ boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler 
 - `src/bin/ignix.rs`: giriş noktası; mimalloc global ayırıcı, `--backend=uring` argümanı, AOF
   (`ignix.aof` açılamazsa AOF'suz sürer).
 
-Desteklenen komutlar: PING, ECHO, QUIT, SELECT (yalnızca 0), HELLO, GET, SET, DEL, EXISTS,
-INCR, INCRBY, DECR, DECRBY, RENAME, MGET, MSET.
+Desteklenen komutlar: PING, ECHO, QUIT, SELECT (yalnızca 0), HELLO, CLIENT (ID, GETNAME,
+SETNAME, SETINFO, HELP), GET, SET, DEL, EXISTS, INCR, INCRBY, DECR, DECRBY, RENAME, MGET, MSET.
 
 ## Dizin haritası
 

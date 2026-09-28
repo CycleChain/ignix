@@ -33,6 +33,16 @@ pub enum Protocol {
     Resp3,
 }
 
+/// Client attributes set with `CLIENT SETINFO`
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ClientInfo {
+    /// `LIB-NAME`: the name of the client library
+    LibName,
+    /// `LIB-VER`: the version of the client library
+    LibVer,
+}
+
 /// Redis-compatible commands supported by Ignix
 ///
 /// Each variant represents a specific Redis command with its parameters.
@@ -80,6 +90,17 @@ pub enum Cmd {
         /// later one fails.
         options: Vec<Bytes>,
     },
+    /// CLIENT ID - the id of the connection
+    ClientId,
+    /// CLIENT GETNAME - the name of the connection, or null
+    ClientGetName,
+    /// CLIENT SETNAME name - name the connection; an empty name removes it
+    ClientSetName(Bytes),
+    /// CLIENT SETINFO LIB-NAME|LIB-VER value - record the client library's
+    /// name or version
+    ClientSetInfo(ClientInfo, Bytes),
+    /// CLIENT HELP - describe the supported CLIENT subcommands
+    ClientHelp,
 }
 
 /// Value types that can be stored in Ignix
@@ -373,6 +394,7 @@ fn command_from_frame(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String>
             Cmd::Echo(message)
         }
         Kind::Quit => Cmd::Quit,
+        Kind::Client => client_command(items)?,
         Kind::Hello => {
             let mut args = items.into_iter();
             let protocol = match args.next() {
@@ -405,6 +427,60 @@ fn command_from_frame(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String>
         }
     };
     Ok(cmd)
+}
+
+/// Build a `CLIENT` subcommand from the arguments after `CLIENT`.
+fn client_command(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String> {
+    let subcommand = &items[0];
+    let (name, arity) = match subcommand.to_ascii_lowercase().as_slice() {
+        b"id" => ("id", 1),
+        b"getname" => ("getname", 1),
+        b"setname" => ("setname", 2),
+        b"setinfo" => ("setinfo", 3),
+        b"help" => ("help", 1),
+        _ => {
+            let shown = String::from_utf8_lossy(&subcommand[..subcommand.len().min(128)]);
+            return Err(format!(
+                "ERR unknown subcommand '{shown}'. Try CLIENT HELP."
+            ));
+        }
+    };
+    if items.len() != arity {
+        return Err(format!(
+            "ERR wrong number of arguments for 'client|{name}' command"
+        ));
+    }
+    Ok(match name {
+        "id" => Cmd::ClientId,
+        "getname" => Cmd::ClientGetName,
+        "help" => Cmd::ClientHelp,
+        "setname" => Cmd::ClientSetName(items.pop().unwrap_or_default()),
+        _ => {
+            let value = items.pop().unwrap_or_default();
+            let attribute = &items[1];
+            let info = if attribute.eq_ignore_ascii_case(b"lib-name") {
+                ClientInfo::LibName
+            } else if attribute.eq_ignore_ascii_case(b"lib-ver") {
+                ClientInfo::LibVer
+            } else {
+                let attribute = String::from_utf8_lossy(attribute);
+                return Err(format!("ERR Unrecognized option '{attribute}'"));
+            };
+            if !is_printable_ascii(&value) {
+                let attribute = String::from_utf8_lossy(attribute);
+                return Err(format!(
+                    "ERR {attribute} cannot contain spaces, newlines or special characters."
+                ));
+            }
+            Cmd::ClientSetInfo(info, value)
+        }
+    })
+}
+
+/// Whether `value` only has printable ASCII characters other than space, as
+/// client names and attributes must (so `CLIENT LIST` can split on spaces)
+pub(crate) fn is_printable_ascii(value: &[u8]) -> bool {
+    value.iter().all(|b| (b'!'..=b'~').contains(b))
 }
 
 /// `ERR unknown command ...`, truncated like Redis: the name is cut to 128

@@ -76,6 +76,7 @@ world
 | `SELECT index` | Select a database; only database 0 exists | `SELECT 0` → `+OK` |
 | `QUIT` | Reply, then close the connection; requests sent after it are dropped | `QUIT` → `+OK` |
 | `HELLO [protover [AUTH username password] [SETNAME clientname]]` | Switch to RESP2 or RESP3 and describe the server | `HELLO 3` → `%7\r\n$6\r\nserver...` |
+| `CLIENT ID\|GETNAME\|SETNAME\|SETINFO\|HELP` | The connection's id and name, the client library's name and version | `CLIENT SETNAME app` → `+OK` |
 | `SET key value` | Set a value | `SET key value` → `+OK` |
 | `GET key` | Get a value | `GET key` → `$5\r\nvalue` |
 | `DEL key [key ...]` | Delete keys, reply with the number removed | `DEL a b` → `:2` |
@@ -298,7 +299,7 @@ Monitor AOF: `tail -f ignix.aof`
 
 ## 🐛 Known Limitations
 
-- Limited command set compared with Redis (no `KEYS`, `INFO`, `CLIENT`, `CONFIG`, ...).
+- Limited command set compared with Redis (no `KEYS`, `INFO`, `CONFIG`, ...); `CLIENT` supports only `ID`, `GETNAME`, `SETNAME`, `SETINFO` and `HELP`.
 - A single database: `SELECT` accepts only index 0.
 - No inline commands (plain text lines such as `PING` typed into telnet); requests must be RESP arrays.
 - No key expiry: `SET` options and `EXPIRE` are not implemented.

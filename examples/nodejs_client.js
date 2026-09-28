@@ -30,9 +30,7 @@ async function main() {
                 connectTimeout: 5000,
                 // Fail instead of retrying forever when Ignix is not running
                 reconnectStrategy: false
-            },
-            // Ignix does not implement CLIENT SETINFO
-            disableClientInfo: true
+            }
         });
         
         // Handle connection events

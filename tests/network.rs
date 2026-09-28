@@ -123,21 +123,13 @@ fn unknown_command_gets_an_error_and_the_connection_stays_usable() {
 
 #[test]
 #[ignore = "requires a running ignix server on 127.0.0.1:7379"]
-fn redis_py_client_setinfo_handshake_does_not_break_the_connection() {
-    // redis-py 5 and node-redis 4.7 send these right after connecting.
+fn client_setinfo_handshake_is_accepted() {
+    // redis-py 5+ and node-redis 4.7 send these right after connecting.
     let mut data = req(&[b"CLIENT", b"SETINFO", b"LIB-NAME", b"redis-py"]);
     data.extend(req(&[b"CLIENT", b"SETINFO", b"LIB-VER", b"5.0.0"]));
     data.extend(req(&[b"PING"]));
     let replies = roundtrip(&data, 3);
-    assert_eq!(
-        replies[0],
-        b"-ERR unknown command 'CLIENT', with args beginning with: 'SETINFO' 'LIB-NAME' 'redis-py' \r\n"
-    );
-    assert_eq!(
-        replies[1],
-        b"-ERR unknown command 'CLIENT', with args beginning with: 'SETINFO' 'LIB-VER' '5.0.0' \r\n"
-    );
-    assert_eq!(replies[2], b"+PONG\r\n");
+    assert_eq!(replies, [&b"+OK\r\n"[..], b"+OK\r\n", b"+PONG\r\n"]);
 }
 
 #[test]
