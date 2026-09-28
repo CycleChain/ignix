@@ -199,6 +199,31 @@ fn mset_preserves_non_canonical_integer_strings() {
 }
 
 #[test]
+fn mget_keeps_the_order_of_small_large_and_missing_values() {
+    let s = shard();
+    // Values over 16 KiB are written after the shard locks are released
+    let large = vec![b'x'; 20_000];
+    exec(
+        &s,
+        &[b"MSET", b"small", b"v", b"large", &large, b"int", b"42"],
+    );
+    let reply = exec(
+        &s,
+        &[b"MGET", b"small", b"large", b"missing", b"int", b"small"],
+    );
+    let expected = [
+        b"*5\r\n".as_slice(),
+        &bulk(b"v"),
+        &bulk(&large),
+        b"$-1\r\n",
+        &bulk(b"42"),
+        &bulk(b"v"),
+    ]
+    .concat();
+    assert_eq!(reply, expected);
+}
+
+#[test]
 fn set_round_trips_canonical_integers() {
     let s = shard();
     let values: [&[u8]; 5] = [

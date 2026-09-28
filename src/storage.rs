@@ -121,6 +121,60 @@ impl Dict {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Lock the shards of `keys` with `lock`, in ascending order, and
+    /// return the guards and each key's hash with the index of its shard's
+    /// guard.
+    fn lock_shards<'k, G>(
+        &self,
+        keys: impl IntoIterator<Item = &'k [u8]>,
+        lock: impl Fn(usize) -> G,
+    ) -> (Vec<G>, Vec<(u64, usize)>) {
+        // The shards in use, as a bitmap, and how many there are
+        let mut used = [0u64; SHARDS / 64];
+        let mut count = 0;
+        let mut keys: Vec<(u64, usize)> = keys
+            .into_iter()
+            .map(|k| {
+                let (hash, shard) = self.locate(k);
+                let (word, bit) = (shard / 64, 1 << (shard % 64));
+                count += usize::from(used[word] & bit == 0);
+                used[word] |= bit;
+                (hash, shard)
+            })
+            .collect();
+        let mut guard_of = [0u16; SHARDS];
+        let mut guards = Vec::with_capacity(count);
+        for (word, &bits) in used.iter().enumerate() {
+            let mut bits = bits;
+            while bits != 0 {
+                let shard = word * 64 + bits.trailing_zeros() as usize;
+                bits &= bits - 1;
+                guard_of[shard] = guards.len() as u16;
+                guards.push(lock(shard));
+            }
+        }
+        for (_, slot) in &mut keys {
+            *slot = usize::from(guard_of[*slot]);
+        }
+        (guards, keys)
+    }
+
+    /// Write-lock the shards of `keys` together, for a change to several
+    /// keys that other threads must not see half done. The dictionary must
+    /// not be used while the locks are held.
+    ///
+    /// Several shards are only ever locked in ascending order, here and in
+    /// [`Dict::read_many`], so threads locking overlapping keys cannot
+    /// deadlock; every other operation holds one lock at a time.
+    pub(crate) fn lock_keys<'k>(&self, keys: impl IntoIterator<Item = &'k [u8]>) -> LockedKeys<'_> {
+        let (guards, keys) = self.lock_shards(keys, |shard| self.write_shard(shard));
+        LockedKeys {
+            hasher: &self.hasher,
+            guards,
+            keys,
+        }
+    }
+
     /// Number of keys
     pub fn len(&self) -> usize {
         (0..SHARDS).map(|i| self.read_shard(i).len()).sum()
@@ -168,6 +222,23 @@ impl Dict {
             .map(|(_, entry)| &entry.value))
     }
 
+    /// Call `f` with the value of each of `keys`, in order, while the shards
+    /// of all of them are read-locked, so no other thread changes any of the
+    /// keys in between (MGET, EXISTS). `f` must not use the dictionary.
+    pub(crate) fn read_many(&self, keys: &[Bytes], mut f: impl FnMut(Option<&Value>)) {
+        if let [key] = keys {
+            return self.read(key, f);
+        }
+        let keys_bytes = keys.iter().map(|k| &k[..]);
+        let (guards, located) = self.lock_shards(keys_bytes, |shard| self.read_shard(shard));
+        for (key, &(hash, guard)) in keys.iter().zip(&located) {
+            f(guards[guard]
+                .raw_entry()
+                .from_key_hashed_nocheck(hash, &key[..])
+                .map(|(_, entry)| &entry.value));
+        }
+    }
+
     // note: Direct mutable references are not exposed; use entry APIs for atomic updates.
 
     /// Set a key-value pair
@@ -187,6 +258,16 @@ impl Dict {
             RawEntryMut::Vacant(entry) => {
                 entry.insert_hashed_nocheck(hash, k, Entry::new(v));
             }
+        }
+    }
+
+    /// Set several keys at once (MSET), storing `encode(value)` for each:
+    /// other threads see either none or all of the new values. A repeated key
+    /// keeps its last value.
+    pub(crate) fn set_many<V>(&self, pairs: Vec<(Bytes, V)>, encode: impl Fn(V) -> Value) {
+        let mut locked = self.lock_keys(pairs.iter().map(|(k, _)| &k[..]));
+        for (i, (k, v)) in pairs.into_iter().enumerate() {
+            locked.insert(i, k, Entry::new(encode(v)));
         }
     }
 
@@ -216,10 +297,31 @@ impl Dict {
         }
     }
 
+    /// Delete several keys at once (DEL): other threads see either none or
+    /// all of them removed. Only the keys that were removed stay in `keys`,
+    /// a repeated key once.
+    pub(crate) fn del_many(&self, keys: &mut Vec<Bytes>) {
+        if let [key] = &keys[..] {
+            if !self.del(key) {
+                keys.clear();
+            }
+            return;
+        }
+        let mut locked = self.lock_keys(keys.iter().map(|k| &k[..]));
+        let mut i = 0;
+        // `retain` visits the keys once each, in order
+        keys.retain(|key| {
+            let removed = locked.remove(i, key).is_some();
+            i += 1;
+            removed
+        });
+    }
+
     /// Rename a key
     ///
-    /// Moves the value from the old key to the new key.
-    /// The old key is deleted and the new key gets the value.
+    /// Moves the value from the old key to the new key, replacing any value
+    /// the new key had. Other threads see the value under exactly one of the
+    /// two names.
     ///
     /// # Arguments
     /// * `from` - Current key name as owned Bytes
@@ -235,30 +337,11 @@ impl Dict {
             return self.exists(&from);
         }
 
-        // Remove, then insert; readers can see neither name in between
-        let (hash, shard) = self.locate(&from);
-        let removed = match self
-            .write_shard(shard)
-            .raw_entry_mut()
-            .from_key_hashed_nocheck(hash, &from[..])
-        {
-            RawEntryMut::Occupied(entry) => Some(entry.remove()),
-            RawEntryMut::Vacant(_) => None,
-        };
-        let Some(entry) = removed else {
+        let mut locked = self.lock_keys([&from[..], &to[..]]);
+        let Some(entry) = locked.remove(0, &from) else {
             return false;
         };
-        let (hash, shard) = self.locate(&to);
-        match self
-            .write_shard(shard)
-            .raw_entry_mut()
-            .from_key_hashed_nocheck(hash, &to[..])
-        {
-            RawEntryMut::Occupied(mut slot) => *slot.get_mut() = entry,
-            RawEntryMut::Vacant(slot) => {
-                slot.insert_hashed_nocheck(hash, to, entry);
-            }
-        }
+        locked.insert(1, to, entry);
         true
     }
 
@@ -321,9 +404,54 @@ impl Dict {
     }
 }
 
+/// Write locks on the shards of a list of keys, from [`Dict::lock_keys`]
+///
+/// A key is addressed by its position in that list, and every method must be
+/// given the key at that position.
+pub(crate) struct LockedKeys<'a> {
+    hasher: &'a RandomState,
+    /// The locked shards, in ascending order
+    guards: Vec<RwLockWriteGuard<'a, Table>>,
+    /// Each key's hash and the index of its shard's guard
+    keys: Vec<(u64, usize)>,
+}
+
+impl LockedKeys<'_> {
+    /// The hash and the table of key `i`
+    fn table(&mut self, i: usize, key: &[u8]) -> (u64, &mut Table) {
+        let (hash, guard) = self.keys[i];
+        debug_assert_eq!(hash, self.hasher.hash_one(key), "key {i} was not locked");
+        (hash, &mut self.guards[guard])
+    }
+
+    /// Remove key `i`, returning its entry
+    pub(crate) fn remove(&mut self, i: usize, key: &[u8]) -> Option<Entry> {
+        let (hash, table) = self.table(i, key);
+        match table.raw_entry_mut().from_key_hashed_nocheck(hash, key) {
+            RawEntryMut::Occupied(entry) => Some(entry.remove()),
+            RawEntryMut::Vacant(_) => None,
+        }
+    }
+
+    /// Store `entry` under key `i`, replacing any previous entry
+    pub(crate) fn insert(&mut self, i: usize, key: Bytes, entry: Entry) {
+        let (hash, table) = self.table(i, &key);
+        match table
+            .raw_entry_mut()
+            .from_key_hashed_nocheck(hash, &key[..])
+        {
+            RawEntryMut::Occupied(mut slot) => *slot.get_mut() = entry,
+            RawEntryMut::Vacant(slot) => {
+                slot.insert_hashed_nocheck(hash, key, entry);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn key(s: &str) -> Bytes {
         Bytes::copy_from_slice(s.as_bytes())
@@ -355,6 +483,25 @@ mod tests {
     }
 
     #[test]
+    fn set_many_and_del_many_with_keys_in_most_shards() {
+        let dict = Dict::default();
+        let keys: Vec<Bytes> = (0..5_000).map(|i| key(&format!("key:{i}"))).collect();
+        let shards: std::collections::HashSet<usize> =
+            keys.iter().map(|k| dict.locate(k).1).collect();
+        assert!(shards.contains(&0) && shards.contains(&(SHARDS - 1)));
+        let pairs = keys.iter().zip(0..).map(|(k, i)| (k.clone(), i)).collect();
+        dict.set_many(pairs, Value::Int);
+        let mut values = Vec::new();
+        dict.read_many(&keys, |value| values.push(value.cloned()));
+        let expected: Vec<_> = (0..5_000).map(|i| Some(Value::Int(i))).collect();
+        assert_eq!(values, expected);
+        let mut removed = keys.clone();
+        dict.del_many(&mut removed);
+        assert_eq!(removed, keys);
+        assert!(dict.is_empty());
+    }
+
+    #[test]
     fn keys_survive_table_growth() {
         let dict = Dict::default();
         for i in 0..200_000 {
@@ -378,5 +525,108 @@ mod tests {
         assert_eq!(dict.get(&other_shard), Some(Value::Str(key("v"))));
         assert!(!dict.exists(&a) && !dict.exists(&same_shard));
         assert_eq!(dict.len(), 1);
+    }
+
+    /// Run `write` while another thread keeps reading `keys` with
+    /// `read_many` and calls `check` with their values.
+    fn check_while_writing(
+        dict: &Dict,
+        keys: &[Bytes],
+        check: impl Fn(&[Option<Value>]) + Sync,
+        write: impl FnOnce(),
+    ) {
+        let done = AtomicBool::new(false);
+        std::thread::scope(|s| {
+            let reader = s.spawn(|| {
+                let mut values = Vec::new();
+                while !done.load(Ordering::Relaxed) {
+                    values.clear();
+                    dict.read_many(keys, |value| values.push(value.cloned()));
+                    check(&values);
+                }
+            });
+            write();
+            done.store(true, Ordering::Relaxed);
+            reader.join().unwrap();
+        });
+    }
+
+    #[test]
+    fn opposite_renames_do_not_deadlock_or_lose_the_key() {
+        let dict = Dict::default();
+        let (a, same_shard, other_shard) = keys_by_shard(&dict);
+        for b in [same_shard, other_shard] {
+            dict.clear();
+            dict.set(a.clone(), Value::Int(1));
+            let exactly_one = |values: &[Option<Value>]| {
+                let found = values.iter().filter(|v| v.is_some()).count();
+                assert_eq!(found, 1, "{values:?}");
+            };
+            check_while_writing(&dict, &[a.clone(), b.clone()], exactly_one, || {
+                std::thread::scope(|s| {
+                    for (from, to) in [(&a, &b), (&b, &a)] {
+                        let dict = &dict;
+                        s.spawn(move || {
+                            for _ in 0..20_000 {
+                                dict.rename(from.clone(), to.clone());
+                            }
+                        });
+                    }
+                });
+            });
+            assert_eq!(dict.len(), 1);
+            assert!(dict.exists(&a) != dict.exists(&b));
+        }
+    }
+
+    #[test]
+    fn mset_and_del_are_seen_all_at_once() {
+        let dict = Dict::default();
+        // Two keys in one shard and one in another
+        let (a, b, c) = keys_by_shard(&dict);
+        let keys = [a, b, c];
+        let all_same = |values: &[Option<Value>]| {
+            assert!(values.windows(2).all(|w| w[0] == w[1]), "{values:?}");
+        };
+        check_while_writing(&dict, &keys, all_same, || {
+            for i in 0..20_000 {
+                let pairs = keys.iter().map(|k| (k.clone(), i)).collect();
+                dict.set_many(pairs, Value::Int);
+                if i % 2 == 1 {
+                    let mut removed = keys.to_vec();
+                    dict.del_many(&mut removed);
+                    assert_eq!(removed.len(), 3);
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn repeated_keys_in_set_many_and_del_many() {
+        let dict = Dict::default();
+        let (a, b, c) = keys_by_shard(&dict);
+        dict.set_many(
+            vec![
+                (a.clone(), Value::Int(1)),
+                (c.clone(), Value::Int(2)),
+                (a.clone(), Value::Int(3)),
+            ],
+            |v| v,
+        );
+        assert_eq!(dict.get(&a), Some(Value::Int(3)));
+        assert_eq!(dict.len(), 2);
+
+        let mut keys = vec![a.clone(), b.clone(), a.clone(), c.clone()];
+        dict.del_many(&mut keys);
+        assert_eq!(keys, [&a, &c]);
+        assert!(dict.is_empty());
+
+        // A single key does not go through `lock_keys`
+        dict.set(a.clone(), Value::Int(1));
+        let mut keys = vec![a.clone()];
+        dict.del_many(&mut keys);
+        assert_eq!(keys, [&a]);
+        dict.del_many(&mut keys);
+        assert!(keys.is_empty());
     }
 }

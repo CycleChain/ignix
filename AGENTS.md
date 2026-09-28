@@ -63,7 +63,10 @@ hata yanıtı yazılır ve bağlantı, yanıtlar boşaltıldıktan sonra kapanı
 - `src/storage.rs`: `Dict` = 1024 × `CachePadded<RwLock<hashbrown::HashMap<Bytes, Entry>>>`
   (anahtar bir kez hash'lenir, parça ve yuva aynı hash'ten; `Entry { value, expires_at }`);
   `get`, `set`, `del`, `rename`, `exists`, `len`, `clear`, `incr`/`incr_by` (parçanın yazma
-  kilidi altında atomik, `Result<i64, IncrError>` döner).
+  kilidi altında atomik, `Result<i64, IncrError>` döner). Çok anahtarlı komutlar anahtarlarının
+  parçalarını `lock_keys` (yazma: `set_many`, `del_many`, `rename`) ya da `read_many` (okuma:
+  MGET, EXISTS) ile birlikte ve artan sırada kilitler; birden çok parçayı başka yoldan
+  kilitleme ve kilitler tutulurken `Dict`'i kullanma (kilitlenme).
 - `src/aof.rs`: `spawn_aof_writer` (dosyayı önce açar, açamazsa `Err` döner; ayrı iş
   parçacığı, 4096 kapasiteli sınırlı kanal; kayıtlar en geç bir saniye içinde `sync_data` ile
   diske işlenir) ve ikili güvenli `emit_aof_*` kodlayıcıları.

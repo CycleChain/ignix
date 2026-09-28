@@ -25,7 +25,7 @@ Ignix (from "Ignite" + "Index") is a Redis-protocol compatible, in-memory key-va
 - **Busy-polling**: waking a sleeping thread costs more than serving a small request, especially on virtual machines, so after its last event a worker polls without blocking for 50 µs before it sleeps. An idle server sleeps.
 - **Allocation-free replies**: replies are written straight into the connection's output buffer.
 - **RESP parsing**: requests are RESP arrays of bulk strings, parsed with the same length rules and limits as Redis (at most 512 MB per argument).
-- **Concurrent storage**: the keyspace is split into 1024 hashbrown tables, each behind its own read-write lock; a key is hashed once (SipHash with random keys) to pick its shard and its slot. Canonical integers are stored as numbers, everything else byte for byte.
+- **Concurrent storage**: the keyspace is split into 1024 hashbrown tables, each behind its own read-write lock; a key is hashed once (SipHash with random keys) to pick its shard and its slot. A command on several keys (`MSET`, `MGET`, `DEL`, `EXISTS`, `RENAME`) locks all of their shards together, always in ascending order, so like in Redis it is atomic. Canonical integers are stored as numbers, everything else byte for byte.
 - **AOF persistence**: dedicated writer thread fed by a bounded channel (back-pressure); queued records are written in batches and synced at most once per second.
 
 ## 🚀 Quick Start
@@ -298,7 +298,6 @@ Monitor AOF: `tail -f ignix.aof`
 - RESP2 only: no RESP3 or `HELLO`, and no inline commands (plain text lines such as `PING` typed into telnet).
 - No key expiry: `SET` options and `EXPIRE` are not implemented.
 - The AOF is write-only: it is not loaded on startup, so data does not survive a restart, and it is never compacted, so it grows with every write. In one of our benchmark sessions `ignix.aof` grew to 13.8 GB while Redis, which rewrites its AOF, used 2.3 GB.
-- Multi-key commands (`MSET`, `DEL`, `RENAME`) are not atomic with respect to other connections.
 - No authentication, and the server listens on the fixed address `0.0.0.0:7379`; do not expose it to untrusted networks.
 - The io_uring backend runs on a single thread.
 - No clustering or replication.

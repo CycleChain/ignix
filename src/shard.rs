@@ -69,6 +69,29 @@ fn write_get(dict: &Dict, key: &[u8], out: &mut BytesMut) {
     }
 }
 
+/// Write the MGET reply values for `keys`, all read while their shards are
+/// locked together.
+///
+/// Values are copied like in [`write_get`] up to the first large one; from
+/// there on they are cloned and written after the locks are released.
+fn write_mget(dict: &Dict, keys: &[Bytes], out: &mut BytesMut) {
+    let mut later = Vec::new();
+    dict.read_many(keys, |value| {
+        let large = matches!(
+            value,
+            Some(Value::Str(v)) | Some(Value::Blob(v)) if v.len() > COPY_UNDER_LOCK_MAX
+        );
+        if large || !later.is_empty() {
+            later.push(value.cloned());
+        } else {
+            write_value(value, out);
+        }
+    });
+    for value in &later {
+        write_value(value.as_ref(), out);
+    }
+}
+
 /// A shard represents a single execution unit
 ///
 /// Each shard has its own storage dictionary and optional AOF handle
@@ -133,7 +156,7 @@ impl Shard {
             Cmd::Del(mut keys) => {
                 // Keep only the keys that were removed; a repeated key is
                 // removed (and counted) once, like in Redis.
-                keys.retain(|k| self.dict.del(k));
+                self.dict.del_many(&mut keys);
                 if let Some(a) = &self.aof {
                     if !keys.is_empty() {
                         a.write_owned(emit_aof_del(&keys));
@@ -160,8 +183,10 @@ impl Shard {
             // EXISTS key [key ...] - count existing keys; repeated keys count
             // every time, like in Redis
             Cmd::Exists(keys) => {
-                let existing = keys.iter().filter(|k| self.dict.exists(k)).count();
-                write_integer(existing as i64, out);
+                let mut existing = 0;
+                self.dict
+                    .read_many(&keys, |value| existing += value.is_some() as i64);
+                write_integer(existing, out);
             }
 
             // INCR key - increment numeric value
@@ -197,11 +222,7 @@ impl Shard {
             // MGET key1 key2 ... - get multiple keys
             Cmd::MGet(keys) => {
                 write_array_len(keys.len(), out);
-
-                // Get each key and format as RESP
-                for k in keys {
-                    write_get(&self.dict, &k, out);
-                }
+                write_mget(&self.dict, &keys, out);
             }
 
             // MSET key1 value1 key2 value2 ... - set multiple key-value pairs
@@ -211,10 +232,8 @@ impl Shard {
                     a.write_owned(emit_aof_mset(&pairs));
                 }
 
-                // Set all key-value pairs
-                for (k, v) in pairs {
-                    self.dict.set(k, encode_value(v));
-                }
+                // Set all key-value pairs at once
+                self.dict.set_many(pairs, encode_value);
 
                 write_simple("OK", out);
             }
