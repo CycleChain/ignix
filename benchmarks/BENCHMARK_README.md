@@ -121,9 +121,7 @@ server.
   ```
 
   Pass `-t set,get`: the default test list starts with `PING_INLINE`, and
-  Ignix does not implement inline commands. `redis-benchmark` prints a
-  warning about `CONFIG GET`, which Ignix does not support; the results are
-  not affected.
+  Ignix does not implement inline commands.
 
 ## Output files
 

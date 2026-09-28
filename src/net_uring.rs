@@ -16,6 +16,7 @@ use crate::net::handle_input;
 use crate::protocol::{Request, RequestParser};
 use crate::session::Session;
 use crate::shard::Shard;
+use crate::stats::Listener;
 use anyhow::Result;
 use bytes::{Buf, BytesMut};
 use io_uring::{opcode, squeue, types, IoUring};
@@ -60,7 +61,7 @@ struct Connection {
 }
 
 impl Connection {
-    fn new(stream: TcpStream) -> Self {
+    fn new(stream: TcpStream, session: Session) -> Self {
         Self {
             stream,
             read_buffer: Box::new([0u8; READ_BUF]),
@@ -68,7 +69,7 @@ impl Connection {
             parser: RequestParser::new(),
             write_buf: BytesMut::new(),
             reqs: Vec::with_capacity(32),
-            session: Session::new(),
+            session,
             closing: false,
         }
     }
@@ -127,6 +128,12 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
     );
 
     let listener = TcpListener::bind(addr)?;
+    shard.stats.set_listener(Listener {
+        addr: listener.local_addr()?,
+        api: "io_uring",
+    });
+    // The single thread's counter of executed commands, for INFO
+    let commands = shard.stats.command_counter();
     let listener_fd = types::Fd(listener.as_raw_fd());
     // Pause before accepting again when the process runs out of resources.
     // Must outlive the timeout operations that point at it.
@@ -163,7 +170,8 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
                     stream.set_nodelay(true).ok();
                     let entry = connections.vacant_entry();
                     let key = entry.key();
-                    let conn = entry.insert(Connection::new(stream));
+                    let session = Session::connected(&shard.stats, &commands);
+                    let conn = entry.insert(Connection::new(stream, session));
                     pending.push_back(conn.read_entry(key));
                     pending.push_back(accept_entry(listener_fd));
                 }

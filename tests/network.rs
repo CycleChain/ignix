@@ -230,6 +230,42 @@ fn hello_3_switches_the_connection_to_resp3() {
     assert_eq!(replies[3], b"$-1\r\n");
 }
 
+/// The value of `field` in an INFO reply
+fn info_field(reply: &[u8], field: &str) -> u64 {
+    let text = String::from_utf8_lossy(reply);
+    let prefix = format!("{field}:");
+    text.lines()
+        .find_map(|line| line.strip_prefix(&prefix))
+        .unwrap_or_else(|| panic!("no {field} in {text:?}"))
+        .parse()
+        .unwrap()
+}
+
+#[test]
+#[ignore = "requires a running ignix server on 127.0.0.1:7379"]
+fn info_counts_connections_and_commands() {
+    let mut stream = connect();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+    stream.write_all(&req(&[b"INFO", b"stats"])).unwrap();
+    let before = read_reply(&mut reader);
+    // Another connection, and two more commands on this one
+    roundtrip(&req(&[b"PING"]), 1);
+    let mut data = req(&[b"PING"]);
+    data.extend(req(&[b"INFO"]));
+    stream.write_all(&data).unwrap();
+    read_reply(&mut reader);
+    let after = read_reply(&mut reader);
+    let received = |reply: &[u8]| info_field(reply, "total_connections_received");
+    let commands = |reply: &[u8]| info_field(reply, "total_commands_processed");
+    assert!(received(&after) > received(&before));
+    assert!(commands(&after) >= commands(&before) + 3);
+    assert!(info_field(&after, "connected_clients") >= 1);
+    assert_eq!(info_field(&after, "tcp_port"), 7379);
+
+    let replies = roundtrip(&req(&[b"CONFIG", b"GET", b"port"]), 1);
+    assert_eq!(replies[0], b"*2\r\n$4\r\nport\r\n$4\r\n7379\r\n");
+}
+
 #[test]
 #[ignore = "requires a running ignix server on 127.0.0.1:7379"]
 fn empty_multibulk_gets_no_reply() {

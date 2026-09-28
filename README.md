@@ -77,6 +77,8 @@ world
 | `QUIT` | Reply, then close the connection; requests sent after it are dropped | `QUIT` → `+OK` |
 | `HELLO [protover [AUTH username password] [SETNAME clientname]]` | Switch to RESP2 or RESP3 and describe the server | `HELLO 3` → `%7\r\n$6\r\nserver...` |
 | `CLIENT ID\|GETNAME\|SETNAME\|SETINFO\|HELP` | The connection's id and name, the client library's name and version | `CLIENT SETNAME app` → `+OK` |
+| `INFO [section ...]` | Server, clients, persistence, stats, replication and keyspace sections, in Redis's format | `INFO keyspace` → `# Keyspace\r\ndb0:keys=2,...` |
+| `CONFIG GET parameter [parameter ...]` | Configuration parameters matching names or glob patterns | `CONFIG GET save` → `*2\r\n$4\r\nsave\r\n$0\r\n` |
 | `SET key value` | Set a value | `SET key value` → `+OK` |
 | `GET key` | Get a value | `GET key` → `$5\r\nvalue` |
 | `DEL key [key ...]` | Delete keys, reply with the number removed | `DEL a b` → `:2` |
@@ -305,7 +307,8 @@ Monitor AOF: `tail -f ignix.aof`
 
 ## 🐛 Known Limitations
 
-- Limited command set compared with Redis (no `INFO`, `CONFIG`, ...); `CLIENT` supports only `ID`, `GETNAME`, `SETNAME`, `SETINFO` and `HELP`.
+- Limited command set compared with Redis; `CLIENT` supports only `ID`, `GETNAME`, `SETNAME`, `SETINFO` and `HELP`, and `CONFIG` only `GET` (a fixed set of parameters, such as `save`, `appendonly`, `maxmemory` and `port`) and `HELP`.
+- `INFO` has no memory or CPU sections.
 - `SCAN` visits the keyspace one shard (1/1024 of the keys) at a time, so with many keys a step returns more keys than `COUNT`; like in Redis, every key that exists during the whole iteration is returned, and here exactly once.
 - A single database: `SELECT` accepts only index 0.
 - No inline commands (plain text lines such as `PING` typed into telnet); requests must be RESP arrays.

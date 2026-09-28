@@ -6,8 +6,10 @@
  */
 
 use crate::protocol::{is_printable_ascii, ClientInfo, Protocol};
+use crate::stats::{LocalCounter, Stats};
 use bytes::Bytes;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 /// The id of the next connection's session; Redis numbers clients from 1
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -30,6 +32,23 @@ pub struct Session {
     lib_name: Option<Bytes>,
     lib_ver: Option<Bytes>,
     closing: bool,
+    /// Set for a connection of the server, which counts it in its statistics
+    client: Option<Client>,
+}
+
+/// The place of a server connection in the server's statistics: counted
+/// as connected until it is dropped
+#[derive(Debug)]
+struct Client {
+    stats: Arc<Stats>,
+    /// The commands counter of the worker thread serving the connection
+    commands: Arc<LocalCounter>,
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.stats.client_disconnected();
+    }
 }
 
 impl Session {
@@ -38,6 +57,27 @@ impl Session {
         Self {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             ..Self::default()
+        }
+    }
+
+    /// The session of a new server connection, counted in `stats` while it
+    /// lives; its commands are counted in `commands`, the counter of the
+    /// worker thread that serves it
+    pub(crate) fn connected(stats: &Arc<Stats>, commands: &Arc<LocalCounter>) -> Self {
+        stats.client_connected();
+        Self {
+            client: Some(Client {
+                stats: stats.clone(),
+                commands: commands.clone(),
+            }),
+            ..Self::new()
+        }
+    }
+
+    /// Count an executed command in the server's statistics
+    pub(crate) fn count_command(&self) {
+        if let Some(client) = &self.client {
+            client.commands.increment();
         }
     }
 

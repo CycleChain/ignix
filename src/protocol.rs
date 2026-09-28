@@ -135,6 +135,13 @@ pub enum Cmd {
         /// Only keys holding values of this type are returned
         type_name: Option<Bytes>,
     },
+    /// INFO \[section ...\] - describe the server
+    Info(Vec<Bytes>),
+    /// CONFIG GET parameter \[parameter ...\] - configuration parameters
+    /// matching the names or glob patterns, with their values
+    ConfigGet(Vec<Bytes>),
+    /// CONFIG HELP - describe the supported CONFIG subcommands
+    ConfigHelp,
 }
 
 /// Value types that can be stored in Ignix
@@ -452,6 +459,8 @@ fn command_from_frame(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String>
             Cmd::Keys(pattern)
         }
         Kind::Scan => scan_command(items)?,
+        Kind::Info => Cmd::Info(items),
+        Kind::Config => config_command(items)?,
         Kind::Client => client_command(items)?,
         Kind::Hello => {
             let mut args = items.into_iter();
@@ -546,6 +555,28 @@ fn scan_command(items: Vec<Bytes>) -> std::result::Result<Cmd, String> {
         count,
         type_name,
     })
+}
+
+/// Build a `CONFIG` subcommand from the arguments after `CONFIG`.
+fn config_command(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String> {
+    let subcommand = &items[0];
+    if subcommand.eq_ignore_ascii_case(b"get") {
+        if items.len() < 2 {
+            return Err("ERR wrong number of arguments for 'config|get' command".to_string());
+        }
+        items.remove(0);
+        Ok(Cmd::ConfigGet(items))
+    } else if subcommand.eq_ignore_ascii_case(b"help") {
+        if items.len() != 1 {
+            return Err("ERR wrong number of arguments for 'config|help' command".to_string());
+        }
+        Ok(Cmd::ConfigHelp)
+    } else {
+        let shown = String::from_utf8_lossy(&subcommand[..subcommand.len().min(128)]);
+        Err(format!(
+            "ERR unknown subcommand '{shown}'. Try CONFIG HELP."
+        ))
+    }
 }
 
 /// Build a `CLIENT` subcommand from the arguments after `CLIENT`.
@@ -884,6 +915,21 @@ fn write_header(kind: u8, n: usize, out: &mut BytesMut) {
     out.put_u8(kind);
     out.put_slice(digits);
     out.put_slice(b"\r\n");
+}
+
+/// Write a text reply, as Redis sends INFO: a bulk string in RESP2, and in
+/// RESP3 a verbatim string in the `txt` format (`=<len>\r\ntxt:<text>\r\n`)
+pub fn write_verbatim(protocol: Protocol, text: &[u8], out: &mut BytesMut) {
+    match protocol {
+        Protocol::Resp2 => write_bulk(text, out),
+        Protocol::Resp3 => {
+            write_header(b'=', 4 + text.len(), out);
+            out.reserve(4 + text.len() + 2);
+            out.put_slice(b"txt:");
+            out.put_slice(text);
+            out.put_slice(b"\r\n");
+        }
+    }
 }
 
 /// Write array length header (`*<count>\r\n`) directly to buffer

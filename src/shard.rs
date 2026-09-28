@@ -11,13 +11,16 @@ use crate::aof::{
     emit_aof_mset, emit_aof_rename, emit_aof_set, AofHandle,
 };
 use crate::glob::Pattern;
+use crate::info::{write_config_get, write_info, REDIS_VERSION};
 use crate::protocol::{
     fmt_i64, fmt_u64, parse_canonical_i64, write_array_len, write_bulk, write_error, write_integer,
     write_map_len, write_nil, write_simple, Cmd, FlushMode, Protocol, Value,
 };
 use crate::session::Session;
+use crate::stats::Stats;
 use crate::storage::Dict;
 use bytes::{Bytes, BytesMut};
+use std::sync::Arc;
 
 /// Choose how to store a value written by SET or MSET.
 ///
@@ -36,10 +39,6 @@ fn encode_value(v: Bytes) -> Value {
 /// lock is held; larger ones are cloned (a reference count) and written after
 /// the lock is released, so a long copy never holds up writers.
 const COPY_UNDER_LOCK_MAX: usize = 16 * 1024;
-
-/// The Redis version whose commands and replies Ignix follows, reported by
-/// `HELLO`
-const REDIS_VERSION: &str = "7.0.0";
 
 /// Write a stored value, or null when the key is missing, as a GET reply.
 ///
@@ -102,6 +101,23 @@ fn write_mget(dict: &Dict, keys: &[Bytes], protocol: Protocol, out: &mut BytesMu
 /// other patterns, also matches the empty key, as in Redis)
 fn glob(pattern: &[u8]) -> Option<Pattern> {
     (pattern != b"*").then(|| Pattern::new(pattern, false))
+}
+
+/// `CONFIG HELP`, in Redis's words, for the subcommands Ignix supports
+const CONFIG_HELP: [&str; 5] = [
+    "CONFIG <subcommand> [<arg> [value] [opt] ...]. Subcommands are:",
+    "GET <pattern>",
+    "    Return parameters matching the glob-like <pattern> and their values.",
+    "HELP",
+    "    Prints this help.",
+];
+
+/// Write a HELP reply: one status line per line of text
+fn write_help(lines: &[&str], out: &mut BytesMut) {
+    write_array_len(lines.len(), out);
+    for line in lines {
+        write_simple(line, out);
+    }
 }
 
 /// `CLIENT HELP`, in Redis's words, for the subcommands Ignix supports
@@ -187,6 +203,8 @@ pub struct Shard {
     pub dict: Dict,
     /// Optional AOF handle for persistence
     pub aof: Option<AofHandle>,
+    /// Counters reported by INFO
+    pub stats: Arc<Stats>,
 }
 
 impl Shard {
@@ -200,6 +218,7 @@ impl Shard {
             id,
             dict: Dict::default(),
             aof,
+            stats: Arc::default(),
         }
     }
 
@@ -235,6 +254,7 @@ impl Shard {
     /// server must send the replies and close the connection without
     /// running any later request.
     pub fn exec_session(&self, cmd: Cmd, session: &mut Session, out: &mut BytesMut) {
+        session.count_command();
         match cmd {
             // PING [message] - connectivity test; echoes the message when given
             Cmd::Ping(None) => write_simple("PONG", out),
@@ -418,12 +438,14 @@ impl Shard {
                 session.set_info(info, value);
                 write_simple("OK", out);
             }
-            Cmd::ClientHelp => {
-                write_array_len(CLIENT_HELP.len(), out);
-                for line in CLIENT_HELP {
-                    write_simple(line, out);
-                }
-            }
+            Cmd::ClientHelp => write_help(&CLIENT_HELP, out),
+
+            // INFO [section ...]
+            Cmd::Info(sections) => write_info(self, &sections, session.protocol(), out),
+
+            // CONFIG GET parameter [parameter ...] / CONFIG HELP
+            Cmd::ConfigGet(patterns) => write_config_get(self, &patterns, session.protocol(), out),
+            Cmd::ConfigHelp => write_help(&CONFIG_HELP, out),
         }
     }
 }

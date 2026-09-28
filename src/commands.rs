@@ -33,6 +33,8 @@ pub(crate) enum Kind {
     FlushAll,
     Keys,
     Scan,
+    Info,
+    Config,
 }
 
 /// The static description of a command
@@ -136,6 +138,8 @@ commands! {
     FLUSHALL = "flushall", -1, FlushAll;
     KEYS = "keys", 2, Keys;
     SCAN = "scan", -2, Scan;
+    INFO = "info", -1, Info;
+    CONFIG = "config", -2, Config;
 }
 
 #[cfg(test)]

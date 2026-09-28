@@ -66,6 +66,11 @@ boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler 
   `stringmatchlen` ile aynı sonucu verir (işaretli `char` aralıkları, kapanmamış `[`, 1000 yıldız
   sınırı dahil), ama özyinelemesizdir. Davranışı değiştirmeden önce testlerindeki Redis 7.0.15
   çıktılarına bak.
+- `src/info.rs`: INFO (bölümler Redis sırasıyla; RESP3'te verbatim) ve CONFIG GET (sabit
+  parametre tablosu); HELLO ve INFO'nun bildirdiği `REDIS_VERSION` (7.0.0).
+- `src/stats.rs`: `Stats` (`Shard::stats`): bağlantı sayaçları bağlantı başına bir kez, komut
+  sayacı her worker iş parçacığının kendi `LocalCounter`'ında (tek yazar, atomik
+  oku-değiştir-yaz yok); INFO toplar. İstek yoluna paylaşılan atomik ekleme.
 - `src/session.rs`: `Session`, bağlantı başına durum: istemci kimliği (bağlantı başına bir kez
   genel sayaçtan), protokol (RESP2/RESP3), istemci adı, kütüphane adı ve sürümü (`CLIENT
   SETINFO`), QUIT'in kapanış bayrağı.
@@ -90,8 +95,8 @@ boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler 
   (`ignix.aof` açılamazsa AOF'suz sürer).
 
 Desteklenen komutlar: PING, ECHO, QUIT, SELECT (yalnızca 0), HELLO, CLIENT (ID, GETNAME,
-SETNAME, SETINFO, HELP), GET, SET, DEL, UNLINK, EXISTS, TYPE, DBSIZE, KEYS, SCAN, FLUSHDB,
-FLUSHALL, INCR, INCRBY, DECR, DECRBY, RENAME, MGET, MSET.
+SETNAME, SETINFO, HELP), INFO, CONFIG (GET, HELP), GET, SET, DEL, UNLINK, EXISTS, TYPE, DBSIZE,
+KEYS, SCAN, FLUSHDB, FLUSHALL, INCR, INCRBY, DECR, DECRBY, RENAME, MGET, MSET.
 
 ## Dizin haritası
 

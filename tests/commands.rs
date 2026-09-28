@@ -562,6 +562,130 @@ fn scan_option_errors_match_redis() {
     assert_eq!(exec(&s, &[b"SCAN"]), arity_error("scan"));
 }
 
+/// The text of an INFO reply (a bulk string)
+fn info_text(s: &Shard, args: &[&[u8]]) -> String {
+    let reply = exec(s, args);
+    String::from_utf8(bulk_strings(&reply).remove(0)).unwrap()
+}
+
+#[test]
+fn info_describes_the_server_in_redis_sections() {
+    let s = shard();
+    let text = info_text(&s, &[b"INFO"]);
+    assert!(text.starts_with("# Server\r\nredis_version:7.0.0\r\nignix_version:"));
+    let headers: Vec<&str> = text.lines().filter(|l| l.starts_with('#')).collect();
+    assert_eq!(
+        headers,
+        [
+            "# Server",
+            "# Clients",
+            "# Persistence",
+            "# Stats",
+            "# Replication",
+            "# Keyspace"
+        ]
+    );
+    // Sections are separated by an empty line, and the text ends with a line end
+    assert!(text.contains("\r\n\r\n# Clients\r\nconnected_clients:"));
+    assert!(text.ends_with("# Keyspace\r\n"));
+    assert!(text.contains("\r\naof_enabled:0\r\n"));
+    assert!(text.contains("\r\nrole:master\r\n"));
+}
+
+#[test]
+fn info_keyspace_counts_the_keys() {
+    let s = shard();
+    assert_eq!(
+        exec(&s, &[b"INFO", b"keyspace"]),
+        b"$12\r\n# Keyspace\r\n\r\n"
+    );
+    exec(&s, &[b"MSET", b"a", b"1", b"b", b"2"]);
+    assert_eq!(
+        info_text(&s, &[b"INFO", b"KEYSPACE"]),
+        "# Keyspace\r\ndb0:keys=2,expires=0,avg_ttl=0\r\n"
+    );
+}
+
+#[test]
+fn info_sections_come_in_redis_order_and_unknown_ones_are_left_out() {
+    let s = shard();
+    let text = info_text(&s, &[b"INFO", b"replication", b"clients", b"nosuch"]);
+    assert!(text.starts_with("# Clients\r\n"), "{text}");
+    assert!(text.contains("\r\n\r\n# Replication\r\n"), "{text}");
+    assert_eq!(exec(&s, &[b"INFO", b"foo"]), b"$0\r\n\r\n");
+    let everything = info_text(&s, &[b"INFO", b"everything"]);
+    assert_eq!(everything.matches("\r\n# ").count() + 1, 6);
+}
+
+#[test]
+fn info_is_a_verbatim_string_in_resp3() {
+    let s = shard();
+    let mut session = Session::new();
+    exec_in(&s, &mut session, &[b"HELLO", b"3"]);
+    assert_eq!(
+        exec_in(&s, &mut session, &[b"INFO", b"keyspace"]),
+        b"=16\r\ntxt:# Keyspace\r\n\r\n"
+    );
+}
+
+#[test]
+fn config_get_reports_parameters_by_name_or_pattern() {
+    let s = shard();
+    assert_eq!(
+        exec(&s, &[b"CONFIG", b"GET", b"save"]),
+        b"*2\r\n$4\r\nsave\r\n$0\r\n\r\n"
+    );
+    assert_eq!(
+        exec(&s, &[b"CONFIG", b"GET", b"appendonly", b"save"]),
+        b"*4\r\n$10\r\nappendonly\r\n$2\r\nno\r\n$4\r\nsave\r\n$0\r\n\r\n"
+    );
+    // An exact name is found ignoring case and reported as given
+    assert_eq!(
+        exec(&s, &[b"CONFIG", b"GET", b"MAXMEMORY"]),
+        b"*2\r\n$9\r\nMAXMEMORY\r\n$1\r\n0\r\n"
+    );
+    // Patterns ignore case too; each parameter appears once
+    let reply = exec(
+        &s,
+        &[
+            b"CONFIG",
+            b"GET",
+            b"MAXMEMORY*",
+            b"maxmemory",
+            b"maxmemory-policy",
+        ],
+    );
+    assert_eq!(
+        bulk_strings(&reply),
+        [&b"maxmemory"[..], b"0", b"maxmemory-policy", b"noeviction"]
+    );
+    assert_eq!(exec(&s, &[b"CONFIG", b"GET", b"nosuch"]), b"*0\r\n");
+}
+
+#[test]
+fn config_get_is_a_map_in_resp3() {
+    let s = shard();
+    let mut session = Session::new();
+    exec_in(&s, &mut session, &[b"HELLO", b"3"]);
+    assert_eq!(
+        exec_in(&s, &mut session, &[b"CONFIG", b"GET", b"databases"]),
+        b"%1\r\n$9\r\ndatabases\r\n$1\r\n1\r\n"
+    );
+}
+
+#[test]
+fn config_checks_subcommands_and_their_arity_like_redis() {
+    let s = shard();
+    assert_eq!(exec(&s, &[b"CONFIG"]), arity_error("config"));
+    assert_eq!(exec(&s, &[b"CONFIG", b"GET"]), arity_error("config|get"));
+    assert_eq!(
+        exec(&s, &[b"CONFIG", b"FOO"]),
+        b"-ERR unknown subcommand 'FOO'. Try CONFIG HELP.\r\n"
+    );
+    let help = exec(&s, &[b"CONFIG", b"HELP"]);
+    assert!(help.starts_with(b"*5\r\n+CONFIG <subcommand> [<arg> [value] [opt] ...]."));
+}
+
 #[test]
 fn get_with_extra_argument_is_an_arity_error() {
     let s = shard();

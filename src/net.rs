@@ -9,6 +9,7 @@
 use crate::protocol::{write_error, Request, RequestParser};
 use crate::session::Session;
 use crate::shard::Shard;
+use crate::stats::{Listener, LocalCounter};
 use anyhow::*;
 use bytes::{Buf, BytesMut};
 use hashbrown::HashMap;
@@ -94,6 +95,15 @@ pub fn run_shard(_shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()>
     run_server(addr, shard, ServerOptions::default())
 }
 
+/// The event API mio uses on this platform, reported by INFO
+const EVENT_API: &str = if cfg!(any(target_os = "linux", target_os = "android")) {
+    "epoll"
+} else if cfg!(windows) {
+    "iocp"
+} else {
+    "kqueue"
+};
+
 /// Run the main server with Multi-Reactor architecture
 ///
 /// Spawns one thread per CPU core. Each thread runs its own event loop
@@ -111,6 +121,12 @@ pub fn run_server(addr: SocketAddr, shard: Shard, options: ServerOptions) -> Res
         .map(|_| bind_reuseport(addr))
         .collect::<Result<Vec<_>>>()
         .with_context(|| format!("cannot listen on {addr}"))?;
+    if let Some(bound) = listeners.first().and_then(|l| l.local_addr().ok()) {
+        shard.stats.set_listener(Listener {
+            addr: bound,
+            api: EVENT_API,
+        });
+    }
 
     println!(
         "🚀 Starting Ignix with {} worker threads (Multi-Reactor)",
@@ -160,14 +176,14 @@ struct Conn {
 }
 
 impl Conn {
-    fn new(sock: TcpStream) -> Self {
+    fn new(sock: TcpStream, session: Session) -> Self {
         Self {
             sock,
             rbuf: BytesMut::with_capacity(READ_BUF),
             parser: RequestParser::new(),
             wbuf: BytesMut::new(),
             reqs: Vec::with_capacity(32),
-            session: Session::new(),
+            session,
             closing: false,
             interest: Interest::READABLE,
         }
@@ -244,6 +260,8 @@ fn run_worker_loop(
 
     let mut clients: HashMap<usize, Conn> = HashMap::new();
     let mut next_tok: usize = 1;
+    // This worker's counter of executed commands, for INFO
+    let commands = shard.stats.command_counter();
 
     // Buffer for reading from socket
     let mut tmp_buf = [0u8; READ_BUF];
@@ -269,7 +287,14 @@ fn run_worker_loop(
 
         for ev in events.iter() {
             match ev.token() {
-                LISTENER => accept_all(id, poll.registry(), &listener, &mut clients, &mut next_tok),
+                LISTENER => accept_all(
+                    id,
+                    poll.registry(),
+                    &listener,
+                    (&shard, &commands),
+                    &mut clients,
+                    &mut next_tok,
+                ),
                 Token(t) => {
                     let keep = match clients.get_mut(&t) {
                         Some(conn) => {
@@ -295,6 +320,7 @@ fn accept_all(
     id: usize,
     registry: &Registry,
     listener: &TcpListener,
+    (shard, commands): (&Shard, &Arc<LocalCounter>),
     clients: &mut HashMap<usize, Conn>,
     next_tok: &mut usize,
 ) {
@@ -309,7 +335,8 @@ fn accept_all(
                     log::warn!("worker {id}: cannot register a new connection: {e}");
                     continue;
                 }
-                clients.insert(tok, Conn::new(sock));
+                let session = Session::connected(&shard.stats, commands);
+                clients.insert(tok, Conn::new(sock, session));
             }
             Err(e) if e.kind() == ErrorKind::WouldBlock => break,
             Err(e)
