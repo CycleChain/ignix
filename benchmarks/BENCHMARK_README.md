@@ -92,6 +92,24 @@ server.
   `mktemp -d` (set `TMPDIR` to put it elsewhere) and deletes it at the end.
 - **Threads.** Ignix runs one event loop per CPU core; Redis executes
   commands on a single thread. Both share the machine with the client.
+- **Busy-polling.** An Ignix worker keeps polling for 50 µs after its last
+  event before it sleeps. Start Ignix with `--busy-poll-us=0` to compare
+  without it.
+- **Server-bound runs.** With a single `redis-benchmark` thread on a small
+  machine the client is usually the bottleneck, and much of what is
+  measured is the cost of waking the servers' threads. To measure the
+  servers, give them the same CPUs of their own and use several client
+  threads on the others:
+
+  ```bash
+  taskset -c 0-1 ./target/release/ignix
+  taskset -c 0-1 redis-server --port 6379 --appendonly yes --appendfsync everysec --save ""
+  taskset -c 2-3 redis-benchmark -p 7379 -t set,get -n 1000000 -c 50 -d 64 --threads 2 -q
+  ```
+
+- **Pauses between runs.** A pipelined SET run leaves up to a second of
+  AOF data to be synced and written back; wait a few seconds before the
+  next run, or that run is slowed down by the writeback.
 - **The client is the bottleneck.** These scripts use Python threads, which
   share one interpreter lock, so the numbers compare the servers under the
   same client rather than their maximum throughput. For server throughput
