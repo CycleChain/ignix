@@ -516,3 +516,89 @@ fn records_sent_before_the_last_handle_is_dropped_are_written() {
         "every record sent before the drop must be written"
     );
 }
+
+#[test]
+fn replaying_the_aof_gives_the_same_keys_despite_concurrent_writers() {
+    let dir = temp_dir("concurrent-same-keys");
+    let path = dir.join("test.aof");
+    let shard = Shard::new(0, Some(spawn_aof_writer(path.to_str().unwrap()).unwrap()));
+    let keys: Vec<String> = (0..16).map(|i| format!("k{i}")).collect();
+    let threads = 4;
+    let rounds = 200;
+    let barrier = std::sync::Barrier::new(threads);
+    let snapshot = |shard: &Shard| -> Vec<Option<ignix::Value>> {
+        keys.iter().map(|k| shard.dict.get(k.as_bytes())).collect()
+    };
+    let mut snapshots = Vec::new();
+    // In each round the writers go over the same keys at once, with
+    // commands that log their record before (SET, MSET) and after (DEL,
+    // INCR, RENAME) applying it. Between rounds, with no writer running,
+    // the keys are recorded and a marker is logged.
+    std::thread::scope(|scope| {
+        let (shard, keys, barrier) = (&shard, &keys, &barrier);
+        let writers: Vec<_> = (1..threads)
+            .map(|t| {
+                scope.spawn(move || {
+                    for round in 0..rounds {
+                        write_round(shard, keys, t, round);
+                        barrier.wait();
+                        barrier.wait();
+                    }
+                })
+            })
+            .collect();
+        for round in 0..rounds {
+            write_round(shard, keys, 0, round);
+            barrier.wait();
+            snapshots.push(snapshot(shard));
+            exec(shard, &[b"SET", b"marker", round.to_string().as_bytes()]);
+            barrier.wait();
+        }
+        for writer in writers {
+            writer.join().unwrap();
+        }
+    });
+    let last = format!(
+        "$6\r\nmarker\r\n${}\r\n{}\r\n",
+        (rounds - 1).to_string().len(),
+        rounds - 1
+    );
+    let data = wait_for(&path, last.as_bytes());
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // Replay the AOF, comparing the keys at each marker
+    let replayed = Shard::new(0, None);
+    let mut buf = BytesMut::from(&data[..]);
+    let mut cmds = Vec::new();
+    parse_many(&mut buf, &mut cmds).expect("every record is a complete RESP command");
+    let mut out = BytesMut::new();
+    let mut round = 0;
+    for cmd in cmds {
+        let marker = matches!(&cmd, Cmd::Set(key, _) if key == "marker");
+        replayed.exec(cmd, &mut out);
+        if marker {
+            assert_eq!(
+                snapshot(&replayed),
+                snapshots[round],
+                "the keys differ after replaying round {round}"
+            );
+            round += 1;
+        }
+    }
+    assert_eq!(round, rounds);
+}
+
+/// One writer's commands in one round of the test above
+fn write_round(shard: &Shard, keys: &[String], t: usize, round: usize) {
+    for key in keys {
+        let k = key.as_bytes();
+        let v = format!("{t}-{round}");
+        match (round + t) % 5 {
+            0 => exec(shard, &[b"SET", k, v.as_bytes()]),
+            1 => exec(shard, &[b"DEL", k]),
+            2 => exec(shard, &[b"INCR", k]),
+            3 => exec(shard, &[b"MSET", k, v.as_bytes(), b"other", b"x"]),
+            _ => exec(shard, &[b"RENAME", b"other", k]),
+        };
+    }
+}

@@ -720,6 +720,17 @@ impl Dict {
     /// * `v` - Value to store
     #[inline(always)]
     pub fn set(&self, k: Bytes, v: Value) {
+        self.set_logged(k, v, || ())
+    }
+
+    /// Like [`Dict::set`], then call `log` while the key's shard is still
+    /// locked.
+    ///
+    /// Every change that the AOF must record is logged this way, under the
+    /// lock of the changed keys, so that the records of a key are in the
+    /// order its changes were applied even when threads race on it.
+    #[inline(always)]
+    pub(crate) fn set_logged(&self, k: Bytes, v: Value, log: impl FnOnce()) {
         let (hash, shard) = self.locate(&k);
         let mut table = self.write_shard(shard);
         match table.slot(hash, &k) {
@@ -731,26 +742,36 @@ impl Dict {
             }
             Slot::Vacant(slot) => slot.insert(hash, k, Entry::new(v)),
         }
+        log();
     }
 
     /// Set several keys at once (MSET), storing `encode(value)` for each:
     /// other threads see either none or all of the new values. A repeated key
-    /// keeps its last value.
-    pub(crate) fn set_many<V>(&self, pairs: Vec<(Bytes, V)>, encode: impl Fn(V) -> Value) {
+    /// keeps its last value. `log` is called while the keys are still locked
+    /// (see [`Dict::set_logged`]).
+    pub(crate) fn set_many<V>(
+        &self,
+        pairs: Vec<(Bytes, V)>,
+        encode: impl Fn(V) -> Value,
+        log: impl FnOnce(),
+    ) {
         let mut locked = self.lock_keys(pairs.iter().map(|(k, _)| &k[..]));
         for (i, (k, v)) in pairs.into_iter().enumerate() {
             locked.insert(i, k, Entry::new(encode(v)));
         }
+        log();
     }
 
     /// SET with options, done atomically: returns the old value when
     /// `options.get` asks for it, and whether the key was set. Like Redis,
-    /// an expired key counts as missing.
+    /// an expired key counts as missing. `log` is called, while the key is
+    /// still locked, if the key was set.
     pub(crate) fn set_with(
         &self,
         key: Bytes,
         value: Value,
         options: SetOptions,
+        log: impl FnOnce(),
     ) -> (Option<Value>, bool) {
         let (hash, shard) = self.locate(&key);
         let mut table = self.write_shard(shard);
@@ -776,6 +797,7 @@ impl Dict {
                     self.expired(slot.key(), true);
                 }
                 slot.replace(Entry { value, expires_at });
+                log();
                 (old, true)
             }
             Slot::Vacant(slot) => {
@@ -787,18 +809,21 @@ impl Dict {
                     SetExpiry::Clear | SetExpiry::Keep => 0,
                 };
                 slot.insert(hash, key, Entry { value, expires_at });
+                log();
                 (None, true)
             }
         }
     }
 
     /// Set every pair if none of the keys exists (MSETNX), atomically;
-    /// returns whether they were set. Like Redis, expired keys met while
-    /// checking are removed.
+    /// returns whether they were set, when `log` is called with the keys
+    /// still locked. Like Redis, expired keys met while checking are
+    /// removed.
     pub(crate) fn set_many_if_absent<V>(
         &self,
         pairs: Vec<(Bytes, V)>,
         encode: impl Fn(V) -> Value,
+        log: impl FnOnce(),
     ) -> bool {
         let mut locked = self.lock_keys(pairs.iter().map(|(k, _)| &k[..]));
         for (i, (key, _)) in pairs.iter().enumerate() {
@@ -809,11 +834,13 @@ impl Dict {
         for (i, (k, v)) in pairs.into_iter().enumerate() {
             locked.insert(i, k, Entry::new(encode(v)));
         }
+        log();
         true
     }
 
-    /// Remove `key` and return its value (GETDEL)
-    pub(crate) fn take(&self, key: &[u8]) -> Option<Value> {
+    /// Remove `key` and return its value (GETDEL); `log` is called, with
+    /// the key still locked, if it was removed
+    pub(crate) fn take(&self, key: &[u8], log: impl FnOnce()) -> Option<Value> {
         let (hash, shard) = self.locate(key);
         let mut table = self.write_shard(shard);
         let Slot::Occupied(slot) = table.slot(hash, key) else {
@@ -824,15 +851,19 @@ impl Dict {
             self.expired(&key, false);
             return None;
         }
+        log();
         Some(entry.value)
     }
 
     /// Read `key` and change its expiry (GETEX), atomically. `change` is
     /// only called if the key exists, since Redis only checks the time then.
+    /// `log` is called with what changed, while the key is still locked,
+    /// unless nothing did.
     pub(crate) fn get_ex(
         &self,
         key: &[u8],
         change: impl FnOnce() -> Result<GetExChange, String>,
+        log: impl FnOnce(GetExEffect),
     ) -> GetExResult {
         let (hash, shard) = self.locate(key);
         let mut table = self.write_shard(shard);
@@ -871,6 +902,9 @@ impl Dict {
                 }
             }
         };
+        if effect != GetExEffect::Unchanged {
+            log(effect);
+        }
         GetExResult::Done(value, effect)
     }
 
@@ -886,6 +920,12 @@ impl Dict {
     /// * `false` if key didn't exist
     #[inline]
     pub fn del(&self, k: &[u8]) -> bool {
+        self.del_logged(k, || ())
+    }
+
+    /// Like [`Dict::del`], calling `log` while the key is still locked if it
+    /// was removed
+    fn del_logged(&self, k: &[u8], log: impl FnOnce()) -> bool {
         let (hash, shard) = self.locate(k);
         match self.write_shard(shard).slot(hash, k) {
             Slot::Occupied(slot) => {
@@ -893,6 +933,8 @@ impl Dict {
                 let expired = entry.expired(&mut Clock::default());
                 if expired {
                     self.expired(&key, false);
+                } else {
+                    log();
                 }
                 !expired
             }
@@ -902,10 +944,11 @@ impl Dict {
 
     /// Delete several keys at once (DEL): other threads see either none or
     /// all of them removed. Only the keys that were removed stay in `keys`,
-    /// a repeated key once.
-    pub(crate) fn del_many(&self, keys: &mut Vec<Bytes>) {
+    /// a repeated key once; unless none was, `log` is called with them while
+    /// they are still locked.
+    pub(crate) fn del_many(&self, keys: &mut Vec<Bytes>, log: impl FnOnce(&[Bytes])) {
         if let [key] = &keys[..] {
-            if !self.del(key) {
+            if !self.del_logged(key, || log(std::slice::from_ref(key))) {
                 keys.clear();
             }
             return;
@@ -918,6 +961,9 @@ impl Dict {
             i += 1;
             removed
         });
+        if !keys.is_empty() {
+            log(keys);
+        }
     }
 
     /// Rename a key
@@ -935,9 +981,20 @@ impl Dict {
     /// * `false` if source key didn't exist
     #[inline]
     pub fn rename(&self, from: Bytes, to: Bytes) -> bool {
+        self.rename_logged(from, to, || ())
+    }
+
+    /// Like [`Dict::rename`], calling `log` while both keys are still locked
+    /// if the rename succeeded
+    pub(crate) fn rename_logged(&self, from: Bytes, to: Bytes, log: impl FnOnce()) -> bool {
         // Renaming a key onto itself only succeeds if the key exists (Redis)
         if from == to {
-            return self.exists(&from);
+            return self.read_entry(&from, |entry| {
+                if entry.is_some() {
+                    log();
+                }
+                entry.is_some()
+            });
         }
 
         let mut locked = self.lock_keys([&from[..], &to[..]]);
@@ -945,6 +1002,7 @@ impl Dict {
             return false;
         };
         locked.insert(1, to, entry);
+        log();
         true
     }
 
@@ -966,8 +1024,15 @@ impl Dict {
     /// Set the expiry of `key` to `at`, a unix time in milliseconds, if
     /// `options` allow it (EXPIRE and its variants). Like Redis, a time that
     /// is not after now deletes the key, a key without an expiry never passes
-    /// GT and always passes LT.
-    pub(crate) fn expire(&self, key: &[u8], at: i64, options: ExpireOptions) -> ExpireResult {
+    /// GT and always passes LT. `log` is called with the result, while the
+    /// key is still locked, if the expiry was set or the key deleted.
+    pub(crate) fn expire(
+        &self,
+        key: &[u8],
+        at: i64,
+        options: ExpireOptions,
+        log: impl FnOnce(ExpireResult),
+    ) -> ExpireResult {
         let (hash, shard) = self.locate(key);
         let mut table = self.write_shard(shard);
         let Slot::Occupied(mut slot) = table.slot(hash, key) else {
@@ -989,7 +1054,7 @@ impl Dict {
         {
             return ExpireResult::Unchanged;
         }
-        match u64::try_from(at) {
+        let result = match u64::try_from(at) {
             Ok(at) if at > clock.now() => {
                 slot.set_expiry(at);
                 ExpireResult::Set
@@ -998,11 +1063,14 @@ impl Dict {
                 slot.remove();
                 ExpireResult::Deleted
             }
-        }
+        };
+        log(result);
+        result
     }
 
-    /// Remove the expiry of `key` (PERSIST); returns whether it had one
-    pub(crate) fn persist(&self, key: &[u8]) -> bool {
+    /// Remove the expiry of `key` (PERSIST); returns whether it had one, when
+    /// `log` is called with the key still locked
+    pub(crate) fn persist(&self, key: &[u8], log: impl FnOnce()) -> bool {
         let (hash, shard) = self.locate(key);
         let mut table = self.write_shard(shard);
         let Slot::Occupied(mut slot) = table.slot(hash, key) else {
@@ -1015,6 +1083,9 @@ impl Dict {
         }
         let had_expiry = slot.get().expires_at != 0;
         slot.set_expiry(0);
+        if had_expiry {
+            log();
+        }
         had_expiry
     }
 
@@ -1032,6 +1103,17 @@ impl Dict {
     ///
     /// Fails without changing the stored value like [`Dict::incr`].
     pub fn incr_by(&self, key: Bytes, delta: i64) -> Result<i64, IncrError> {
+        self.incr_by_logged(key, delta, || ())
+    }
+
+    /// Like [`Dict::incr_by`], calling `log` while the key is still locked
+    /// if the value changed
+    pub(crate) fn incr_by_logged(
+        &self,
+        key: Bytes,
+        delta: i64,
+        log: impl FnOnce(),
+    ) -> Result<i64, IncrError> {
         let (hash, shard) = self.locate(&key);
         let mut table = self.write_shard(shard);
         match table.slot(hash, &key) {
@@ -1041,6 +1123,7 @@ impl Dict {
                     // before the increment
                     self.expired(slot.key(), false);
                     slot.replace(Entry::new(Value::Int(delta)));
+                    log();
                     return Ok(delta);
                 }
                 let value = slot.value_mut();
@@ -1052,10 +1135,12 @@ impl Dict {
                 };
                 let next = current.checked_add(delta).ok_or(IncrError::Overflow)?;
                 *value = Value::Int(next);
+                log();
                 Ok(next)
             }
             Slot::Vacant(slot) => {
                 slot.insert(hash, key, Entry::new(Value::Int(delta)));
+                log();
                 Ok(delta)
             }
         }
@@ -1198,13 +1283,13 @@ mod tests {
             keys.iter().map(|k| dict.locate(k).1).collect();
         assert!(shards.contains(&0) && shards.contains(&(SHARDS - 1)));
         let pairs = keys.iter().zip(0..).map(|(k, i)| (k.clone(), i)).collect();
-        dict.set_many(pairs, Value::Int);
+        dict.set_many(pairs, Value::Int, || ());
         let mut values = Vec::new();
         dict.read_many(&keys, |value| values.push(value.cloned()));
         let expected: Vec<_> = (0..5_000).map(|i| Some(Value::Int(i))).collect();
         assert_eq!(values, expected);
         let mut removed = keys.clone();
-        dict.del_many(&mut removed);
+        dict.del_many(&mut removed, |_| ());
         assert_eq!(removed, keys);
         assert!(dict.is_empty());
     }
@@ -1357,16 +1442,16 @@ mod tests {
         dict.insert_expired(k.clone(), Value::Int(1));
         let far = 4_102_444_800_000;
         assert_eq!(
-            dict.expire(&k, far, ExpireOptions::default()),
+            dict.expire(&k, far, ExpireOptions::default(), |_| ()),
             ExpireResult::Missing
         );
         dict.insert_expired(k.clone(), Value::Int(1));
-        assert!(!dict.persist(&k));
+        assert!(!dict.persist(&k, || ()));
         assert_eq!(calls.lock().unwrap().len(), 2);
         // A time that has passed deletes a live key without calling the hook
         dict.set(k.clone(), Value::Int(1));
         assert_eq!(
-            dict.expire(&k, 1, ExpireOptions::default()),
+            dict.expire(&k, 1, ExpireOptions::default(), |_| ()),
             ExpireResult::Deleted
         );
         assert!(dict.is_empty());
@@ -1449,10 +1534,10 @@ mod tests {
         check_while_writing(&dict, &keys, all_same, || {
             for i in 0..20_000 {
                 let pairs = keys.iter().map(|k| (k.clone(), i)).collect();
-                dict.set_many(pairs, Value::Int);
+                dict.set_many(pairs, Value::Int, || ());
                 if i % 2 == 1 {
                     let mut removed = keys.to_vec();
-                    dict.del_many(&mut removed);
+                    dict.del_many(&mut removed, |_| ());
                     assert_eq!(removed.len(), 3);
                 }
             }
@@ -1470,21 +1555,22 @@ mod tests {
                 (a.clone(), Value::Int(3)),
             ],
             |v| v,
+            || (),
         );
         assert_eq!(dict.get(&a), Some(Value::Int(3)));
         assert_eq!(dict.len(), 2);
 
         let mut keys = vec![a.clone(), b.clone(), a.clone(), c.clone()];
-        dict.del_many(&mut keys);
+        dict.del_many(&mut keys, |_| ());
         assert_eq!(keys, [&a, &c]);
         assert!(dict.is_empty());
 
         // A single key does not go through `lock_keys`
         dict.set(a.clone(), Value::Int(1));
         let mut keys = vec![a.clone()];
-        dict.del_many(&mut keys);
+        dict.del_many(&mut keys, |_| ());
         assert_eq!(keys, [&a]);
-        dict.del_many(&mut keys);
+        dict.del_many(&mut keys, |_| ());
         assert!(keys.is_empty());
     }
 
@@ -1515,27 +1601,27 @@ mod tests {
             assert_eq!(volatile_by_scan(&dict), expected);
         };
 
-        dict.set_with(a.clone(), v(), at(future));
+        dict.set_with(a.clone(), v(), at(future), || ());
         check(1);
         dict.set(b.clone(), v());
-        dict.expire(&b, future, none);
+        dict.expire(&b, future, none, |_| ());
         check(2);
-        dict.persist(&a);
+        dict.persist(&a, || ());
         check(1);
-        dict.set_with(a.clone(), v(), keep);
+        dict.set_with(a.clone(), v(), keep, || ());
         check(1);
-        dict.expire(&a, future, none);
-        dict.set_with(a.clone(), v(), keep);
+        dict.expire(&a, future, none, |_| ());
+        dict.set_with(a.clone(), v(), keep, || ());
         check(2);
         dict.set(a.clone(), v());
         check(1);
         // An expiry moves with RENAME, within a shard and across shards
         dict.rename(b.clone(), c.clone());
         check(1);
-        dict.expire(&a, future, none);
+        dict.expire(&a, future, none, |_| ());
         dict.rename(c.clone(), a.clone());
         check(1);
-        dict.expire(&a, 1, none);
+        dict.expire(&a, 1, none, |_| ());
         check(0);
 
         // Expired keys removed when read, overwritten or incremented
@@ -1544,13 +1630,13 @@ mod tests {
         assert_eq!(dict.get(&a), None);
         check(0);
         dict.insert_expired(a.clone(), v());
-        dict.set_many(vec![(a.clone(), v()), (c.clone(), v())], |v| v);
+        dict.set_many(vec![(a.clone(), v()), (c.clone(), v())], |v| v, || ());
         check(0);
         dict.insert_expired(b.clone(), v());
         assert_eq!(dict.incr(b.clone()), Ok(1));
         check(0);
         dict.insert_expired(b.clone(), v());
-        assert!(dict.set_many_if_absent(vec![(b.clone(), v())], |v| v));
+        assert!(dict.set_many_if_absent(vec![(b.clone(), v())], |v| v, || ()));
         check(0);
 
         // GETEX, GETDEL and DEL
@@ -1561,9 +1647,10 @@ mod tests {
                 at: future,
                 absolute: false,
             }),
+            |_| (),
         );
         check(1);
-        dict.get_ex(&c, change(GetExChange::Persist));
+        dict.get_ex(&c, change(GetExChange::Persist), |_| ());
         check(0);
         dict.get_ex(
             &c,
@@ -1571,6 +1658,7 @@ mod tests {
                 at: future,
                 absolute: true,
             }),
+            |_| (),
         );
         dict.get_ex(
             &c,
@@ -1578,20 +1666,21 @@ mod tests {
                 at: 1,
                 absolute: true,
             }),
+            |_| (),
         );
         check(0);
-        dict.set_with(c.clone(), v(), at(future));
-        assert_eq!(dict.take(&c), Some(v()));
+        dict.set_with(c.clone(), v(), at(future), || ());
+        assert_eq!(dict.take(&c, || ()), Some(v()));
         check(0);
-        dict.set_with(c.clone(), v(), at(future));
+        dict.set_with(c.clone(), v(), at(future), || ());
         assert!(dict.del(&c));
-        dict.set_with(a.clone(), v(), at(future));
-        dict.set_with(c.clone(), v(), at(future));
+        dict.set_with(a.clone(), v(), at(future), || ());
+        dict.set_with(c.clone(), v(), at(future), || ());
         let mut keys = vec![a.clone(), c.clone()];
-        dict.del_many(&mut keys);
+        dict.del_many(&mut keys, |_| ());
         check(0);
 
-        dict.set_with(a.clone(), v(), at(future));
+        dict.set_with(a.clone(), v(), at(future), || ());
         dict.flush(false, || ());
         check(0);
     }
@@ -1613,7 +1702,7 @@ mod tests {
             dict.insert_expired(key(&format!("gone{i}")), Value::Int(i));
         }
         for i in 0..10 {
-            dict.set_with(key(&format!("later{i}")), Value::Int(i), later);
+            dict.set_with(key(&format!("later{i}")), Value::Int(i), later, || ());
             dict.set(key(&format!("plain{i}")), Value::Int(i));
         }
 

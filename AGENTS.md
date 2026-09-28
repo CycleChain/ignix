@@ -163,8 +163,10 @@ Bugünkü `main` için geçerlidir. Görevin konusu değilse düzeltmeye kalkma;
   `-ERR Protocol error: ...` alır ve bağlantı kapanır (Redis gibi). Hata metinleri Redis 7 ile
   aynıdır. Seçeneksiz `SET k v` sıcak yol olarak `Cmd::Set` kalır; seçenekli hâli `Cmd::SetWith`.
 - **AOF yalnızca yazılır:** açılışta geri yüklenmez. Kayıtlar ikili güvenlidir ve DEL de
-  yazılır, ama iş parçacıkları arasında AOF'a yazma sırası ile uygulama sırası aynı
-  olmayabilir (geri yükleme eklenirse ele alınmalı).
+  yazılır. Her kayıt, değişen anahtarların kilidi tutulurken `Dict`'in `log` geri çağrısından
+  gönderilir (`set_logged`, `del_many(.., log)`, ...; kodlama kilitten önce): bir anahtarın
+  kayıtları, değişikliklerin uygulandığı sıradadır. Yeni bir yazan komut da AOF kaydını bu
+  yoldan göndermeli; `tests/aof.rs`'teki eşzamanlı yeniden oynatma testi bunu denetler.
 - **Linux'a özgü kod macOS'ta derlenmez:** `net_uring.rs` macOS'ta denetlenemez (çapraz
   denetim de `libmimalloc-sys` yüzünden kalır).
 - **`.gitignore` tuzakları:** `*.txt`, `*.svg`, `*.log`, `*.aof` kalıpları dışlanır; bu

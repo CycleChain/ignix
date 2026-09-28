@@ -68,6 +68,19 @@ fn write_value(value: Option<&Value>, protocol: Protocol, out: &mut BytesMut) {
     }
 }
 
+/// An AOF record to send, with the AOF to send it to
+type Record<'a> = Option<(&'a AofHandle, Vec<u8>)>;
+
+/// Send `record`, if there is one. Commands encode their record before
+/// changing the dictionary and send it from the dictionary's `log` callback,
+/// while the changed keys are still locked, so that the records of a key are
+/// in the order its changes were applied.
+fn send(record: Record<'_>) {
+    if let Some((aof, record)) = record {
+        aof.write_owned(record);
+    }
+}
+
 /// Write the GET reply for `key`.
 ///
 /// Small values are copied straight from the dictionary, which avoids the
@@ -303,16 +316,23 @@ impl Shard {
     /// if the condition allows, logs the SET as a replay needs it, and
     /// returns the old value (if asked for) and whether the key was set
     fn set_with(&self, key: Bytes, value: Bytes, options: SetOptions) -> (Option<Value>, bool) {
-        let record = self.aof.as_ref().map(|_| match options.expiry {
+        let record = self.record(|| match options.expiry {
             SetExpiry::Clear => emit_aof_set(&key, &value),
             SetExpiry::Keep => emit_aof_set_keepttl(&key, &value),
             SetExpiry::At(at) => emit_aof_set_pxat(&key, &value, at),
         });
-        let (old, set) = self.dict.set_with(key, encode_value(value), options);
-        if let (Some(a), Some(record), true) = (&self.aof, record, set) {
-            a.write_owned(record);
-        }
-        (old, set)
+        self.dict
+            .set_with(key, encode_value(value), options, || send(record))
+    }
+
+    /// The AOF record `encode` gives, if there is an AOF, to [`send`]
+    fn record(&self, encode: impl FnOnce() -> Vec<u8>) -> Record<'_> {
+        self.aof.as_ref().map(|aof| (aof, encode()))
+    }
+
+    /// Send the record `encode` gives, if there is an AOF
+    fn log(&self, encode: impl FnOnce() -> Vec<u8>) {
+        send(self.record(encode));
     }
 
     /// Write the TTL family's reply for `key`: the time left, or the expiry
@@ -444,12 +464,15 @@ impl Shard {
     /// SET key value
     #[inline(always)]
     fn set(&self, k: Bytes, v: Bytes, out: &mut BytesMut) {
-        // Log to AOF if persistence is enabled, before moving k and v into
-        // the dictionary
-        if let Some(a) = &self.aof {
-            a.write_owned(emit_aof_set(&k, &v));
+        match &self.aof {
+            None => self.dict.set(k, encode_value(v)),
+            Some(aof) => {
+                // Encoded before k and v move into the dictionary
+                let record = emit_aof_set(&k, &v);
+                self.dict
+                    .set_logged(k, encode_value(v), || aof.write_owned(record));
+            }
         }
-        self.dict.set(k, encode_value(v));
         write_simple("OK", out);
     }
 
@@ -457,42 +480,32 @@ impl Shard {
     fn del(&self, mut keys: Vec<Bytes>, out: &mut BytesMut) {
         // Keep only the keys that were removed; a repeated key is removed
         // (and counted) once, like in Redis.
-        self.dict.del_many(&mut keys);
-        if let Some(a) = &self.aof {
-            if !keys.is_empty() {
-                a.write_owned(emit_aof_del(&keys));
-            }
-        }
+        self.dict
+            .del_many(&mut keys, |removed| self.log(|| emit_aof_del(removed)));
         write_integer(keys.len() as i64, out);
     }
 
     /// INCR key, or INCRBY key delta (also DECRBY and DECR)
     fn incr_by(&self, k: Bytes, delta: Option<i64>, out: &mut BytesMut) {
-        // Keep the key for the AOF record only when persistence is on.
-        let aof_key = self.aof.is_some().then(|| k.clone());
-        match self.dict.incr_by(k, delta.unwrap_or(1)) {
-            Ok(v) => {
-                // Log only successful increments
-                if let (Some(a), Some(key)) = (&self.aof, &aof_key) {
-                    a.write_owned(match delta {
-                        None => emit_aof_incr(key),
-                        Some(delta) => emit_aof_incrby(key, delta),
-                    });
-                }
-                write_integer(v, out);
-            }
+        // Sent only if the increment succeeds
+        let record = self.record(|| match delta {
+            None => emit_aof_incr(&k),
+            Some(delta) => emit_aof_incrby(&k, delta),
+        });
+        match self
+            .dict
+            .incr_by_logged(k, delta.unwrap_or(1), || send(record))
+        {
+            Ok(v) => write_integer(v, out),
             Err(e) => write_error(e.as_str(), out),
         }
     }
 
     /// MSET key value [key value ...]
     fn mset(&self, pairs: Vec<(Bytes, Bytes)>, out: &mut BytesMut) {
-        // Log all sets to AOF as a single operation
-        if let Some(a) = &self.aof {
-            a.write_owned(emit_aof_mset(&pairs));
-        }
-        // Set all key-value pairs at once
-        self.dict.set_many(pairs, encode_value);
+        // One record for all the pairs, set at once
+        let record = self.record(|| emit_aof_mset(&pairs));
+        self.dict.set_many(pairs, encode_value, || send(record));
         write_simple("OK", out);
     }
 
@@ -516,13 +529,10 @@ impl Shard {
 
             // RENAME oldkey newkey - rename a key
             Cmd::Rename(from, to) => {
-                // Encode the AOF record before the keys move into the map;
-                // it is only written if the rename succeeds.
-                let record = self.aof.as_ref().map(|_| emit_aof_rename(&from, &to));
-                if self.dict.rename(from, to) {
-                    if let (Some(a), Some(record)) = (&self.aof, record) {
-                        a.write_owned(record);
-                    }
+                // Encoded before the keys move into the map, sent only if the
+                // rename succeeds
+                let record = self.record(|| emit_aof_rename(&from, &to));
+                if self.dict.rename_logged(from, to, || send(record)) {
                     write_simple("OK", out);
                 } else {
                     write_error("ERR no such key", out);
@@ -612,16 +622,12 @@ impl Shard {
             // EXPIRE / PEXPIRE / EXPIREAT / PEXPIREAT, logged as PEXPIREAT, or
             // as DEL when the time has passed and the key was deleted
             Cmd::Expire { key, at, options } => {
-                let result = self.dict.expire(&key, at, options);
-                if let Some(a) = &self.aof {
-                    match result {
-                        ExpireResult::Set => a.write_owned(emit_aof_pexpireat(&key, at)),
-                        ExpireResult::Deleted => {
-                            a.write_owned(emit_aof_del(std::slice::from_ref(&key)))
-                        }
-                        ExpireResult::Missing | ExpireResult::Unchanged => {}
-                    }
-                }
+                let result = self.dict.expire(&key, at, options, |result| {
+                    self.log(|| match result {
+                        ExpireResult::Set => emit_aof_pexpireat(&key, at),
+                        _ => emit_aof_del(std::slice::from_ref(&key)),
+                    })
+                });
                 let changed = matches!(result, ExpireResult::Set | ExpireResult::Deleted);
                 write_integer(i64::from(changed), out);
             }
@@ -667,10 +673,9 @@ impl Shard {
 
             // GETDEL key, logged as DEL
             Cmd::GetDel(key) => {
-                let value = self.dict.take(&key);
-                if let (Some(a), Some(_)) = (&self.aof, &value) {
-                    a.write_owned(emit_aof_del(std::slice::from_ref(&key)));
-                }
+                let value = self.dict.take(&key, || {
+                    self.log(|| emit_aof_del(std::slice::from_ref(&key)))
+                });
                 write_value(value.as_ref(), session.protocol(), out);
             }
 
@@ -690,43 +695,36 @@ impl Shard {
                     let at = resolve_expiry(unit, time, "getex")?;
                     Ok(GetExChange::ExpireAt { at, absolute })
                 };
-                match self.dict.get_ex(&key, change) {
+                let log = |effect| {
+                    self.log(|| match effect {
+                        GetExEffect::ExpiresAt(at) => emit_aof_pexpireat(&key, at),
+                        GetExEffect::Persisted => emit_aof_persist(&key),
+                        _ => emit_aof_del(std::slice::from_ref(&key)),
+                    })
+                };
+                match self.dict.get_ex(&key, change, log) {
                     GetExResult::Missing => write_nil(session.protocol(), out),
                     GetExResult::Invalid(error) => write_error(&error, out),
-                    GetExResult::Done(value, effect) => {
-                        if let Some(a) = &self.aof {
-                            match effect {
-                                GetExEffect::ExpiresAt(at) => {
-                                    a.write_owned(emit_aof_pexpireat(&key, at))
-                                }
-                                GetExEffect::Persisted => a.write_owned(emit_aof_persist(&key)),
-                                GetExEffect::Deleted => {
-                                    a.write_owned(emit_aof_del(std::slice::from_ref(&key)))
-                                }
-                                GetExEffect::Unchanged => {}
-                            }
-                        }
-                        write_value(Some(&value), session.protocol(), out);
+                    GetExResult::Done(value, _) => {
+                        write_value(Some(&value), session.protocol(), out)
                     }
                 }
             }
 
             // MSETNX key value [key value ...], logged as MSET
             Cmd::MSetNx(pairs) => {
-                let record = self.aof.as_ref().map(|_| emit_aof_mset(&pairs));
-                let set = self.dict.set_many_if_absent(pairs, encode_value);
-                if let (Some(a), Some(record), true) = (&self.aof, record, set) {
-                    a.write_owned(record);
-                }
+                let record = self.record(|| emit_aof_mset(&pairs));
+                let set = self
+                    .dict
+                    .set_many_if_absent(pairs, encode_value, || send(record));
                 write_integer(i64::from(set), out);
             }
 
             // PERSIST key
             Cmd::Persist(key) => {
-                let removed = self.dict.persist(&key);
-                if let (Some(a), true) = (&self.aof, removed) {
-                    a.write_owned(emit_aof_persist(&key));
-                }
+                let removed = self
+                    .dict
+                    .persist(&key, || self.log(|| emit_aof_persist(&key)));
                 write_integer(i64::from(removed), out);
             }
 
