@@ -7,6 +7,7 @@
  */
 
 use crate::protocol::{write_error, Request, RequestParser};
+use crate::session::Session;
 use crate::shard::Shard;
 use anyhow::*;
 use bytes::{Buf, BytesMut};
@@ -149,7 +150,10 @@ struct Conn {
     wbuf: BytesMut,
     /// Parsed requests, reused between reads
     reqs: Vec<Request>,
-    /// Set after EOF or a protocol error: stop reading, flush `wbuf`, close
+    /// The client's connection state
+    session: Session,
+    /// Set after EOF, a protocol error or QUIT: stop reading, flush `wbuf`,
+    /// close
     closing: bool,
     /// Interest currently registered with the poller
     interest: Interest,
@@ -163,6 +167,7 @@ impl Conn {
             parser: RequestParser::new(),
             wbuf: BytesMut::new(),
             reqs: Vec::with_capacity(32),
+            session: Session::new(),
             closing: false,
             interest: Interest::READABLE,
         }
@@ -172,13 +177,15 @@ impl Conn {
 /// Execute every complete request in `rbuf` and queue the replies in order.
 ///
 /// Invalid commands get an error reply and the connection stays usable.
-/// Returns `false` after a protocol error: the requests before it have been
-/// executed, its error reply is queued after theirs, and the connection must
-/// be closed once `wbuf` is flushed (Redis behaves the same way). `parser`
-/// keeps the progress through a request that has not fully arrived; the
-/// caller only appends to `rbuf`.
+/// Returns `false` when the connection must be closed once `wbuf` is
+/// flushed, as Redis does: after a protocol error, whose error reply is
+/// queued after the replies of the requests before it, and after `QUIT`,
+/// whose reply is the last one (later requests are dropped). `parser` keeps
+/// the progress through a request that has not fully arrived; the caller
+/// only appends to `rbuf`.
 pub(crate) fn handle_input(
     shard: &Shard,
+    session: &mut Session,
     rbuf: &mut BytesMut,
     parser: &mut RequestParser,
     reqs: &mut Vec<Request>,
@@ -187,9 +194,17 @@ pub(crate) fn handle_input(
     let parsed = parser.parse(rbuf, reqs);
     for req in reqs.drain(..) {
         match req {
-            Request::Cmd(cmd) => shard.exec(cmd, wbuf),
+            Request::Cmd(cmd) => shard.exec_session(cmd, session, wbuf),
             Request::Invalid(message) => write_error(&message, wbuf),
         }
+        if session.is_closing() {
+            // Dropping the iterator drops the requests after QUIT
+            break;
+        }
+    }
+    if session.is_closing() {
+        parser.reset();
+        return false;
     }
     match parsed {
         Ok(()) => true,
@@ -356,6 +371,7 @@ fn drive(
         // half-close right away, and still read the replies.
         if !handle_input(
             shard,
+            &mut conn.session,
             &mut conn.rbuf,
             &mut conn.parser,
             &mut conn.reqs,
@@ -422,6 +438,55 @@ mod tests {
             "run_server must return an error when the address is in use"
         );
         drop(taken);
+    }
+
+    fn request(args: &[&[u8]]) -> Vec<u8> {
+        let mut out = format!("*{}\r\n", args.len()).into_bytes();
+        for arg in args {
+            out.extend_from_slice(format!("${}\r\n", arg.len()).as_bytes());
+            out.extend_from_slice(arg);
+            out.extend_from_slice(b"\r\n");
+        }
+        out
+    }
+
+    /// Run `input` through `handle_input` on a new connection; returns
+    /// whether the connection stays open and the replies.
+    fn run_input(shard: &Shard, input: &[u8]) -> (bool, Vec<u8>) {
+        let mut session = Session::new();
+        let mut rbuf = BytesMut::from(input);
+        let mut wbuf = BytesMut::new();
+        let open = handle_input(
+            shard,
+            &mut session,
+            &mut rbuf,
+            &mut RequestParser::new(),
+            &mut Vec::new(),
+            &mut wbuf,
+        );
+        (open, wbuf.to_vec())
+    }
+
+    #[test]
+    fn requests_after_quit_are_dropped() {
+        let shard = Shard::new(0, None);
+        let mut input = request(&[b"PING"]);
+        input.extend(request(&[b"QUIT"]));
+        input.extend(request(&[b"SET", b"k", b"v"]));
+        input.extend(request(&[b"PING"]));
+        assert_eq!(
+            run_input(&shard, &input),
+            (false, b"+PONG\r\n+OK\r\n".to_vec())
+        );
+        assert_eq!(shard.dict.get(b"k"), None);
+    }
+
+    #[test]
+    fn malformed_input_after_quit_gets_no_error_reply() {
+        let shard = Shard::new(0, None);
+        let mut input = request(&[b"QUIT"]);
+        input.extend_from_slice(b"*1\r\nX");
+        assert_eq!(run_input(&shard, &input), (false, b"+OK\r\n".to_vec()));
     }
 
     #[test]

@@ -52,6 +52,12 @@ pub enum Cmd {
     MGet(Vec<Bytes>),
     /// MSET key1 value1 key2 value2 ... - set multiple key-value pairs
     MSet(Vec<(Bytes, Bytes)>),
+    /// ECHO message - reply with `message`
+    Echo(Bytes),
+    /// QUIT - reply OK and close the connection, dropping later requests
+    Quit,
+    /// SELECT index - switch to database `index`; only database 0 exists
+    Select(i32),
 }
 
 /// Value types that can be stored in Ignix
@@ -339,6 +345,21 @@ fn command_from_frame(mut items: Vec<Bytes>) -> std::result::Result<Cmd, String>
         Kind::Rename => {
             let [from, to] = <[Bytes; 2]>::try_from(items).map_err(|_| arity_error())?;
             Cmd::Rename(from, to)
+        }
+        Kind::Echo => {
+            let [message] = <[Bytes; 1]>::try_from(items).map_err(|_| arity_error())?;
+            Cmd::Echo(message)
+        }
+        Kind::Quit => Cmd::Quit,
+        Kind::Select => {
+            let [index] = <[Bytes; 1]>::try_from(items).map_err(|_| arity_error())?;
+            let index = parse_canonical_i64(&index)
+                .ok_or_else(|| "ERR value is not an integer or out of range".to_string())?;
+            let index = i32::try_from(index).map_err(|_| {
+                "ERR value is out of range, value must between -2147483648 and 2147483647"
+                    .to_string()
+            })?;
+            Cmd::Select(index)
         }
     };
     Ok(cmd)

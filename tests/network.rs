@@ -192,6 +192,25 @@ fn requests_before_a_protocol_error_are_executed() {
 
 #[test]
 #[ignore = "requires a running ignix server on 127.0.0.1:7379"]
+fn quit_closes_the_connection_and_drops_the_rest_of_the_pipeline() {
+    let key = unique_key("after-quit");
+    let mut stream = connect();
+    let mut data = req(&[b"PING"]);
+    data.extend(req(&[b"QUIT"]));
+    data.extend(req(&[b"SET", key.as_bytes(), b"v"]));
+    data.extend(req(&[b"PING"]));
+    stream.write_all(&data).unwrap();
+    let mut reader = BufReader::new(stream);
+    assert_eq!(read_reply(&mut reader), b"+PONG\r\n");
+    assert_eq!(read_reply(&mut reader), b"+OK\r\n");
+    assert_eof(&mut reader);
+
+    let replies = roundtrip(&req(&[b"GET", key.as_bytes()]), 1);
+    assert_eq!(replies[0], b"$-1\r\n");
+}
+
+#[test]
+#[ignore = "requires a running ignix server on 127.0.0.1:7379"]
 fn empty_multibulk_gets_no_reply() {
     let mut data = b"*0\r\n".to_vec();
     data.extend(req(&[b"PING"]));

@@ -14,6 +14,7 @@ use crate::protocol::{
     fmt_i64, parse_canonical_i64, write_array_len, write_bulk, write_error, write_integer,
     write_null, write_simple, Cmd, Value,
 };
+use crate::session::Session;
 use crate::storage::Dict;
 use bytes::{Bytes, BytesMut};
 
@@ -123,14 +124,25 @@ impl Shard {
 
     /// Execute a Redis command and write response directly to buffer
     ///
-    /// This is the main entry point for command execution. It handles
-    /// all supported Redis commands, updates the storage, logs to AOF
-    /// if enabled, and writes the RESP response directly to the output buffer.
+    /// Runs the command like [`Shard::exec_session`] on a fresh session,
+    /// so commands that change the connection (`QUIT`) only reply.
     ///
     /// # Arguments
     /// * `cmd` - Parsed Redis command to execute
     /// * `out` - Buffer to write response to
     pub fn exec(&self, cmd: Cmd, out: &mut BytesMut) {
+        self.exec_session(cmd, &mut Session::default(), out)
+    }
+
+    /// Execute a command for the connection `session` belongs to
+    ///
+    /// This is the main entry point for command execution. It handles
+    /// all supported Redis commands, updates the storage and the session,
+    /// logs to AOF if enabled, and writes the RESP response directly to the
+    /// output buffer. After `QUIT`, [`Session::is_closing`] is true: the
+    /// server must send the replies and close the connection without
+    /// running any later request.
+    pub fn exec_session(&self, cmd: Cmd, session: &mut Session, out: &mut BytesMut) {
         match cmd {
             // PING [message] - connectivity test; echoes the message when given
             Cmd::Ping(None) => write_simple("PONG", out),
@@ -237,6 +249,19 @@ impl Shard {
 
                 write_simple("OK", out);
             }
+
+            // ECHO message
+            Cmd::Echo(message) => write_bulk(&message, out),
+
+            // QUIT - the connection closes once this reply is sent
+            Cmd::Quit => {
+                write_simple("OK", out);
+                session.close();
+            }
+
+            // SELECT index - there is a single database, number 0
+            Cmd::Select(0) => write_simple("OK", out),
+            Cmd::Select(_) => write_error("ERR DB index is out of range", out),
         }
     }
 }

@@ -37,10 +37,11 @@ Linux'ta geçer; güncel durum ve tuzaklar için aşağıdaki "Bilinen durum" b�
 ## Mimari
 
 İstek akışı: TCP bağlantısı → bağlantının okuma tamponu (`BytesMut`) → `net::handle_input`
-→ `protocol::parse_requests` → `Request::Cmd(cmd)` için `Shard::exec(&self, cmd, &mut out)`,
-`Request::Invalid(satır)` için `write_error` → `Dict` (parçalı anahtar alanı) ve veri değiştiren komutlarda
-`AofHandle` → yanıt `write_*` ile doğrudan `out`'a → soket. Çerçeve (protokol) hatasında
-hata yanıtı yazılır ve bağlantı, yanıtlar boşaltıldıktan sonra kapanır. İki arka uç da
+→ bağlantının `RequestParser`'ı → `Request::Cmd(cmd)` için
+`Shard::exec_session(cmd, &mut session, &mut out)`, `Request::Invalid(satır)` için `write_error`
+→ `Dict` (parçalı anahtar alanı) ve veri değiştiren komutlarda `AofHandle` → yanıt `write_*` ile
+doğrudan `out`'a → soket. Çerçeve (protokol) hatasında hata yanıtı yazılır ve bağlantı, yanıtlar
+boşaltıldıktan sonra kapanır; QUIT'ten sonra da öyle, ama sonraki istekler atılır. İki arka uç da
 `handle_input`'u paylaşır.
 
 - `src/net.rs` (varsayılan arka uç, mio): `run_shard`, `available_parallelism()` kadar iş
@@ -58,8 +59,13 @@ hata yanıtı yazılır ve bağlantı, yanıtlar boşaltıldıktan sonra kapanı
   `parse_requests` ve `Request`; ayırmasız yanıt yazıcıları (`write_simple`, `write_error`,
   `write_bulk`, `write_null`, `write_integer`, `write_array_len`); eski, `Vec<u8>` döndüren
   `resp_*`.
+- `src/commands.rs`: statik komut tablosu (`CommandSpec { name, arity, kind }`, tek listeden
+  `commands!` makrosuyla); `lookup` adı küçük harfe indirgenmiş bir `u128`'e paketleyip eşler.
+  Yeni komut önce buraya eklenir.
+- `src/session.rs`: `Session`, bağlantı başına durum (şimdilik QUIT'in kapanış bayrağı).
 - `src/shard.rs`: `Shard { id, dict, aof }`, 64 bayta hizalı (`test_shard_alignment` sınar);
-  komut semantiği `exec` içinde. Sunucuda tek bir `Arc<Shard>` paylaşılır.
+  komut semantiği `exec_session` içinde (`exec` yeni bir oturumla onu çağırır). Sunucuda tek
+  bir `Arc<Shard>` paylaşılır.
 - `src/storage.rs`: `Dict` = 1024 × `CachePadded<RwLock<hashbrown::HashMap<Bytes, Entry>>>`
   (anahtar bir kez hash'lenir, parça ve yuva aynı hash'ten; `Entry { value, expires_at }`);
   `get`, `set`, `del`, `rename`, `exists`, `len`, `clear`, `incr`/`incr_by` (parçanın yazma
@@ -75,8 +81,8 @@ hata yanıtı yazılır ve bağlantı, yanıtlar boşaltıldıktan sonra kapanı
 - `src/bin/ignix.rs`: giriş noktası; mimalloc global ayırıcı, `--backend=uring` argümanı, AOF
   (`ignix.aof` açılamazsa AOF'suz sürer).
 
-Desteklenen komutlar: PING, GET, SET, DEL, EXISTS, INCR, INCRBY, DECR, DECRBY, RENAME, MGET,
-MSET.
+Desteklenen komutlar: PING, ECHO, QUIT, SELECT (yalnızca 0), GET, SET, DEL, EXISTS, INCR,
+INCRBY, DECR, DECRBY, RENAME, MGET, MSET.
 
 ## Dizin haritası
 

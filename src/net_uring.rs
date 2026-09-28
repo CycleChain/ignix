@@ -14,6 +14,7 @@
 
 use crate::net::handle_input;
 use crate::protocol::{Request, RequestParser};
+use crate::session::Session;
 use crate::shard::Shard;
 use anyhow::Result;
 use bytes::{Buf, BytesMut};
@@ -52,7 +53,9 @@ struct Connection {
     /// Replies not written yet. Never modified while a write is in flight.
     write_buf: BytesMut,
     reqs: Vec<Request>,
-    /// Set after a protocol error: flush `write_buf`, then close.
+    /// The client's connection state
+    session: Session,
+    /// Set after a protocol error or QUIT: flush `write_buf`, then close.
     closing: bool,
 }
 
@@ -65,6 +68,7 @@ impl Connection {
             parser: RequestParser::new(),
             write_buf: BytesMut::new(),
             reqs: Vec::with_capacity(32),
+            session: Session::new(),
             closing: false,
         }
     }
@@ -196,6 +200,7 @@ pub fn run_shard(shard_id: usize, addr: SocketAddr, shard: Shard) -> Result<()> 
                             conn.read_buf.extend_from_slice(&conn.read_buffer[..n]);
                             if !handle_input(
                                 &shard,
+                                &mut conn.session,
                                 &mut conn.read_buf,
                                 &mut conn.parser,
                                 &mut conn.reqs,

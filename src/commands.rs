@@ -21,6 +21,9 @@ pub(crate) enum Kind {
     DecrBy,
     MGet,
     MSet,
+    Echo,
+    Quit,
+    Select,
 }
 
 /// The static description of a command
@@ -112,6 +115,9 @@ commands! {
     DECRBY = "decrby", 3, DecrBy;
     MGET = "mget", -2, MGet;
     MSET = "mset", -3, MSet;
+    ECHO = "echo", 2, Echo;
+    QUIT = "quit", -1, Quit;
+    SELECT = "select", 2, Select;
 }
 
 #[cfg(test)]

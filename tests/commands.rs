@@ -44,6 +44,39 @@ fn ping_with_message_echoes_it_as_bulk_string() {
 }
 
 #[test]
+fn echo_replies_with_its_argument() {
+    let s = shard();
+    assert_eq!(exec(&s, &[b"ECHO", b"hello"]), b"$5\r\nhello\r\n");
+    assert_eq!(exec(&s, &[b"ECHO", b""]), b"$0\r\n\r\n");
+    assert_eq!(exec(&s, &[b"ECHO"]), arity_error("echo"));
+    assert_eq!(exec(&s, &[b"ECHO", b"a", b"b"]), arity_error("echo"));
+}
+
+#[test]
+fn select_accepts_only_database_zero_with_redis_errors() {
+    let s = shard();
+    assert_eq!(exec(&s, &[b"SELECT", b"0"]), b"+OK\r\n");
+    let out_of_range = b"-ERR DB index is out of range\r\n";
+    assert_eq!(exec(&s, &[b"SELECT", b"1"]), out_of_range);
+    assert_eq!(exec(&s, &[b"SELECT", b"-1"]), out_of_range);
+    let not_an_integer = b"-ERR value is not an integer or out of range\r\n";
+    assert_eq!(exec(&s, &[b"SELECT", b"abc"]), not_an_integer);
+    assert_eq!(exec(&s, &[b"SELECT", b"01"]), not_an_integer);
+    assert_eq!(
+        exec(&s, &[b"SELECT", b"2147483648"]),
+        b"-ERR value is out of range, value must between -2147483648 and 2147483647\r\n"
+    );
+    assert_eq!(exec(&s, &[b"SELECT"]), arity_error("select"));
+}
+
+#[test]
+fn quit_replies_ok_and_takes_any_arguments() {
+    let s = shard();
+    assert_eq!(exec(&s, &[b"QUIT"]), b"+OK\r\n");
+    assert_eq!(exec(&s, &[b"QUIT", b"now"]), b"+OK\r\n");
+}
+
+#[test]
 fn get_with_extra_argument_is_an_arity_error() {
     let s = shard();
     exec(&s, &[b"SET", b"a", b"1"]);

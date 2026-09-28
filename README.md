@@ -72,6 +72,9 @@ world
 | Command | Description | Example |
 |---------|-------------|---------|
 | `PING [message]` | Test connectivity | `PING` → `+PONG`, `PING hi` → `$2\r\nhi` |
+| `ECHO message` | Reply with the message | `ECHO hi` → `$2\r\nhi` |
+| `SELECT index` | Select a database; only database 0 exists | `SELECT 0` → `+OK` |
+| `QUIT` | Reply, then close the connection; requests sent after it are dropped | `QUIT` → `+OK` |
 | `SET key value` | Set a value | `SET key value` → `+OK` |
 | `GET key` | Get a value | `GET key` → `$5\r\nvalue` |
 | `DEL key [key ...]` | Delete keys, reply with the number removed | `DEL a b` → `:2` |
@@ -294,7 +297,8 @@ Monitor AOF: `tail -f ignix.aof`
 
 ## 🐛 Known Limitations
 
-- Limited command set compared with Redis (no `KEYS`, `INFO`, `CLIENT`, `CONFIG`, `SELECT`, `QUIT`, ...).
+- Limited command set compared with Redis (no `KEYS`, `INFO`, `CLIENT`, `CONFIG`, ...).
+- A single database: `SELECT` accepts only index 0.
 - RESP2 only: no RESP3 or `HELLO`, and no inline commands (plain text lines such as `PING` typed into telnet).
 - No key expiry: `SET` options and `EXPIRE` are not implemented.
 - The AOF is write-only: it is not loaded on startup, so data does not survive a restart, and it is never compacted, so it grows with every write. In one of our benchmark sessions `ignix.aof` grew to 13.8 GB while Redis, which rewrites its AOF, used 2.3 GB.
